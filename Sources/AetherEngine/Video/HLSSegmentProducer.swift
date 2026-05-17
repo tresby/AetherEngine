@@ -250,11 +250,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
 
     /// How many segments the pump is allowed to race ahead of the
-    /// highest segment AVPlayer has actually fetched. With the
-    /// default `SegmentCache.capacity = 30` this leaves ~10 segments
-    /// of headroom behind the playhead for cheap short-range backward
-    /// scrubs without triggering a producer-restart.
-    private static let bufferAheadSegments = 20
+    /// highest segment AVPlayer has actually fetched. Matches the
+    /// SegmentCache's forwardWindow so the muxer never writes past
+    /// the cache's forward edge. Cut from 20 to 10 alongside the
+    /// SegmentCache window tightening — 4K HEVC at ~10 MB/seg made
+    /// the old buffer 200 MB on its own.
+    private static let bufferAheadSegments = 10
 
     /// Worker queue running the read → write_frame pump. One per
     /// producer instance; the queue is serial, no concurrent writes

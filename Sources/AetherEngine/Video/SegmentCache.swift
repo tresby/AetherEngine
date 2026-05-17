@@ -56,7 +56,13 @@ final class SegmentCache {
     /// it into the player's actual region.
     private var currentTargetIndex: Int = -1
 
-    init(forwardWindow: Int = 20, backwardWindow: Int = 15) {
+    // Tightened from (20, 15)=35 entries. At 4K HDR HEVC segment sizes
+    // (~10 MB/seg) the old window held 350 MB resident, which combined
+    // with AVPlayer's internal HLS buffer pushed long-form playback into
+    // memory-warning territory at ~6 min. (10, 5)=15 entries caps our
+    // contribution at ~150 MB while still giving the producer 40 s of
+    // forward runway and 20 s of cheap backward scrub.
+    init(forwardWindow: Int = 10, backwardWindow: Int = 5) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
     }
