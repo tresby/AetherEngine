@@ -48,6 +48,24 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var width: Int32 = 0
     private var height: Int32 = 0
 
+    /// True when the source's transfer characteristic indicates HDR
+    /// (PQ ST.2084 or HLG). Surfaced so the host can flip the
+    /// `SampleBufferRenderer` into HDR mode at load time.
+    private(set) var isHDR: Bool = false
+
+    /// Color attachments captured from the source's `codecpar` at
+    /// `open()` time and re-applied to every decoded CVPixelBuffer.
+    /// VTDecompressionSession should propagate these from the SPS
+    /// + hvcC by itself but it's been observed not to in practice,
+    /// and an HDR pixel buffer that ships without the
+    /// `kCVImageBufferColorPrimaries` / `kCVImageBufferTransferFunction`
+    /// / `kCVImageBufferYCbCrMatrix` attachments renders as
+    /// desaturated SDR on `AVSampleBufferDisplayLayer`. Setting
+    /// them ourselves is belt-and-suspenders.
+    private var colorPrimaries: CFString?
+    private var colorTransfer: CFString?
+    private var colorMatrix: CFString?
+
     /// Protects `session` from concurrent access between the demux
     /// thread (decode), the main thread (close/flush), and the
     /// VT callback (frame delivery).
@@ -138,6 +156,35 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let isHDRTransfer = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
             || codecpar.pointee.color_trc == AVCOL_TRC_ARIB_STD_B67
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
+        self.isHDR = isHDRTransfer
+
+        // Capture color metadata from codecpar so every decoded
+        // pixel buffer gets the right attachments. Mapping matches
+        // SoftwareVideoDecoder.attachColorSpace.
+        self.colorPrimaries = {
+            switch codecpar.pointee.color_primaries {
+            case AVCOL_PRI_BT709:       return kCVImageBufferColorPrimaries_ITU_R_709_2
+            case AVCOL_PRI_BT2020:      return kCVImageBufferColorPrimaries_ITU_R_2020
+            case AVCOL_PRI_SMPTE432:    return kCVImageBufferColorPrimaries_P3_D65
+            default:                    return nil
+            }
+        }()
+        self.colorTransfer = {
+            switch codecpar.pointee.color_trc {
+            case AVCOL_TRC_BT709:        return kCVImageBufferTransferFunction_ITU_R_709_2
+            case AVCOL_TRC_SMPTE2084:    return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+            case AVCOL_TRC_ARIB_STD_B67: return kCVImageBufferTransferFunction_ITU_R_2100_HLG
+            default:                     return nil
+            }
+        }()
+        self.colorMatrix = {
+            switch codecpar.pointee.color_space {
+            case AVCOL_SPC_BT709:       return kCVImageBufferYCbCrMatrix_ITU_R_709_2
+            case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL:
+                                        return kCVImageBufferYCbCrMatrix_ITU_R_2020
+            default:                    return nil
+            }
+        }()
         let pixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -366,6 +413,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if skipUntilPTS != nil, CMTimeCompare(pts, skipUntilPTS!) >= 0 {
             skipUntilPTS = nil
         }
+
+        // Attach color metadata so AVSampleBufferDisplayLayer renders
+        // with correct primaries / transfer / matrix. Without these,
+        // HDR PQ content shows up as desaturated SDR.
+        if let primaries = colorPrimaries {
+            CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
+        }
+        if let transfer = colorTransfer {
+            CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+        }
+        if let matrix = colorMatrix {
+            CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+        }
+
         onFrame?(imageBuffer, pts, nil)
     }
 }

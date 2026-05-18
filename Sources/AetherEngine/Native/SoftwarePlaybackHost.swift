@@ -174,6 +174,24 @@ final class SoftwarePlaybackHost {
             videoDecoder = SoftwareVideoDecoder()
         }
 
+        // Detect HDR transfer characteristic from the source codecpar
+        // and flip the display layer into HDR mode before any frames
+        // arrive. Without this `displayLayer.preferredDynamicRange`
+        // stays at `.standard` and AVSampleBufferDisplayLayer renders
+        // PQ / HLG content desaturated. Matches what AVPlayer's
+        // internal pipeline does implicitly via AVAsset metadata.
+        if let codecpar = vStream.pointee.codecpar {
+            let trc = codecpar.pointee.color_trc
+            let sourceIsHDR = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+            if sourceIsHDR {
+                renderer.setHDROutput(true)
+                EngineLog.emit(
+                    "[SWHost] HDR mode ON on display layer (transfer=\(trc.rawValue))",
+                    category: .engine
+                )
+            }
+        }
+
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
             // Decoder callback fires on the demux thread. SampleBufferRenderer
             // is internally locked + safe to call off-main; the engine's
