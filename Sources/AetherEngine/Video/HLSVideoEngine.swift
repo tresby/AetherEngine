@@ -218,6 +218,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     private var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
+    /// True when the source carries Dolby Vision (dvVariant != .none)
+    /// AND the engine is downgrading playback to plain HEVC because
+    /// `effectiveDvMode == false` (no DV display, or Match Content
+    /// disabled). In this state the muxer must strip type-62 NAL units
+    /// from every video packet before write_frame so AVPlayer's HEVC
+    /// parser never sees DV RPUs that it can't drive a display target
+    /// with. The flag is latched during `start()` so producer restarts
+    /// (backward / forward scrub) keep the same behaviour without
+    /// re-computing the routing decision.
+    private var producerStripDVRPU: Bool = false
+
     /// Per-frame fallback durations (in the respective source
     /// time_base) so the producer can backfill `pkt->duration` when
     /// the matroska demuxer doesn't supply per-block durations.
@@ -665,6 +676,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
             : nil
         let hdcpLevel: String? = (dvVariant != .none) ? "TYPE-1" : nil
 
+        // Latch the DV RPU strip decision before the producer is built.
+        // DV source + non-DV routing (auto-tonemap path) = strip; the
+        // RPU NALs would otherwise sit in every video packet for the
+        // entire session and AVPlayer's HEVC parser would still scan
+        // them per frame even though no display target consumes them.
+        // For DV source + DV mode (master playlist + effective DV
+        // engaged) the RPUs are needed and we must NOT strip.
+        self.producerStripDVRPU = (dvVariant != .none) && !effectiveDvMode
+        if self.producerStripDVRPU {
+            EngineLog.emit(
+                "[HLSVideoEngine] DV RPU strip ON (source=\(dvVariant), effectiveDvMode=false)",
+                category: .session
+            )
+        }
+
         // 5. Position the demuxer at the file's first packet so the
         //    producer's pump starts from byte zero. The cue prewarm
         //    above moved the cursor mid-file; libavformat's index is
@@ -969,6 +995,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         savedVideoConfig = nil
         savedAudioConfig = nil
         audioBridge = nil
+        producerStripDVRPU = false
         segmentPlan = []
         demuxer?.close()
         demuxer = nil
@@ -1015,8 +1042,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
             desiredVideoTfdt = segmentPlan[baseIndex].startPts - firstKeyframePts
+            // Rescale into the source audio TB (not the bridge encoder
+            // input TB). The producer subtracts this value from the
+            // first kept audio packet's dts to compute audioShiftPts,
+            // and that dts is ALWAYS in source audio TB. Pre-fix the
+            // rescale targeted bridge.inputTimeBase (1/48000), so for
+            // FLAC-bridged DTS sources the resulting shift was off by
+            // a factor of 48 and the log line showed
+            // `shift=-152485195` garbage. Stream-copy was unaffected
+            // since sourceTimeBase == inputTimeBase there; the bug was
+            // bridge-only and silent (bridge.feed re-stamps PTS
+            // independently via nextEncoderPTS so the shift's effect
+            // on output PTS is null, but the gate-target side of the
+            // calculation was inconsistent).
             desiredAudioTfdt = savedAudioConfig.map {
-                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.inputTimeBase)
+                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
             } ?? 0
         } else {
             videoTarget = Int64.min
@@ -1036,7 +1076,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoDts: videoTarget,
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
-            desiredFirstAudioTfdtPts: desiredAudioTfdt
+            desiredFirstAudioTfdtPts: desiredAudioTfdt,
+            stripDVRPU: producerStripDVRPU
         )
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()

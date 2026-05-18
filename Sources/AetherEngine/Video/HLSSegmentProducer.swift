@@ -174,6 +174,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
     private var loggedFirstVideoPktInfo = false
+    /// One-shot log latch for the DV RPU strip: the first packet where
+    /// `stripDVRPUFromHEVCPacket` actually removes bytes emits a single
+    /// log line so we can confirm the filter engaged. Subsequent strips
+    /// are silent to keep the log readable.
+    private var loggedFirstRPUStrip = false
 
     /// Scan-forward + dynamic-shift state. The static `restart*Target`
     /// fields are seeded from `plan[baseIndex]` for restart sessions
@@ -323,6 +328,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// reason to keep paying for it after detection.
     private var hdr10PlusDetected = false
 
+    /// When true, the pump scans every video packet's HEVC bitstream
+    /// and removes any NAL units with `nal_unit_type == 62`
+    /// (NAL_UNSPEC62), which is the type Dolby Vision RPU metadata
+    /// rides under for HEVC sources. Enabled by the engine for the
+    /// media-playlist routing path where AVPlayer is treating the
+    /// asset as plain HDR10 HEVC (sample-entry `hvc1`, dvVariant
+    /// `.none`); the RPUs would otherwise sit in the bitstream and
+    /// be parsed by AVPlayer's HEVC NAL scanner per frame even though
+    /// no display target consumes them. Disabled for the master-
+    /// playlist + DV-mode path where AVPlayer needs the RPUs to drive
+    /// dynamic tone-mapping.
+    ///
+    /// The strip is a no-op on non-DV HEVC sources (no type-62 NALs
+    /// exist), and trivial on H.264 / AV1 (parser exits the scan
+    /// loop on the first NAL header that doesn't fit the HEVC layout).
+    private let stripDVRPU: Bool
+
     // MARK: - Init
 
     init(
@@ -337,13 +359,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioFallbackDurationPts: Int64 = 0,
         restartTargetVideoDts: Int64 = Int64.min,
         desiredFirstVideoTfdtPts: Int64,
-        desiredFirstAudioTfdtPts: Int64 = 0
+        desiredFirstAudioTfdtPts: Int64 = 0,
+        stripDVRPU: Bool = false
     ) throws {
         self.demuxer = demuxer
         self.videoStreamIndex = videoStreamIndex
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
+        self.stripDVRPU = stripDVRPU
         self.sourceVideoTimeBase = video.timeBase
         self.videoFallbackDurationPts = videoFallbackDurationPts
         self.audioFallbackDurationPts = audioFallbackDurationPts
@@ -862,13 +886,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // the backfill condition (`prev.duration == 0`)
                 // never fires.
                 if isVideoPkt {
+                    if stripDVRPU {
+                        let delta = stripDVRPUFromHEVCPacket(packet)
+                        if delta < 0, !loggedFirstRPUStrip {
+                            loggedFirstRPUStrip = true
+                            EngineLog.emit(
+                                "[HLSSegmentProducer] DV RPU strip active: "
+                                + "first packet shrunk by \(-delta) B "
+                                + "(new size=\(packet.pointee.size) B)",
+                                category: .session
+                            )
+                        }
+                    }
                     if !loggedFirstVideoPktInfo {
                         loggedFirstVideoPktInfo = true
                         EngineLog.emit(
                             "[HLSSegmentProducer] first video pkt: "
                             + "dts=\(packet.pointee.dts) pts=\(packet.pointee.pts) "
-                            + "duration=\(packet.pointee.duration) "
-                            + "(fallback=\(videoFallbackDurationPts) in srcVideoTb)",
+                            + "duration=\(packet.pointee.duration) size=\(packet.pointee.size) "
+                            + "(fallback=\(videoFallbackDurationPts) in srcVideoTb, "
+                            + "stripDVRPU=\(stripDVRPU))",
                             category: .session
                         )
                     }
@@ -954,6 +991,81 @@ final class HLSSegmentProducer: @unchecked Sendable {
         didFinishFlag = true
         finishCondition.broadcast()
         finishCondition.unlock()
+    }
+
+    // MARK: - DV RPU filter
+
+    /// Rewrite a video packet's HEVC bitstream in place, dropping any
+    /// NAL units whose `nal_unit_type == 62` (NAL_UNSPEC62, the carrier
+    /// for Dolby Vision RPU metadata). Length-prefixed (ISOBMFF / fMP4)
+    /// NAL framing: 4-byte big-endian length + NAL bytes. The first
+    /// NAL byte's bits 1..6 (0-indexed from MSB) hold the type.
+    ///
+    /// Why in-place: a DV RPU NAL is typically a few hundred bytes; an
+    /// HEVC 4K HDR fragment is multi-megabyte. Removing the RPUs shrinks
+    /// the packet but doesn't change its order, and `memmove` shifts the
+    /// remaining bytes down past the removed gap. Final `packet.size`
+    /// is then re-written to the post-strip length. No reallocation
+    /// needed.
+    ///
+    /// Safety: `av_packet_make_writable` is called first so we never
+    /// mutate a buffer that's still ref-counted elsewhere (the FFmpeg
+    /// demuxer can hand out shared buffers across packets when CodecPrivate
+    /// holds parameter set data; matroska usually owns its block bytes
+    /// exclusively but the safety check is cheap).
+    ///
+    /// Returns the post-strip size delta (negative or zero).
+    @discardableResult
+    private func stripDVRPUFromHEVCPacket(_ packet: UnsafeMutablePointer<AVPacket>) -> Int {
+        let writableRet = av_packet_make_writable(packet)
+        guard writableRet >= 0, let dataPtr = packet.pointee.data else {
+            return 0
+        }
+        let inputSize = Int(packet.pointee.size)
+        guard inputSize >= 5 else { return 0 }
+
+        var readOff = 0
+        var writeOff = 0
+
+        while readOff + 4 <= inputSize {
+            let lenBytes = (Int(dataPtr[readOff]) << 24)
+                         | (Int(dataPtr[readOff + 1]) << 16)
+                         | (Int(dataPtr[readOff + 2]) << 8)
+                         |  Int(dataPtr[readOff + 3])
+            let nalStart = readOff + 4
+            let totalNalSize = 4 + lenBytes
+
+            // Malformed length or NAL extends past end. Bail; rewriting
+            // the remainder isn't safe. Keep what we've copied so far.
+            guard lenBytes > 0, nalStart + lenBytes <= inputSize else {
+                break
+            }
+
+            let nalHeader = dataPtr[nalStart]
+            let nalType = Int(nalHeader >> 1) & 0x3F
+
+            if nalType == 62 {
+                // Drop DV RPU NAL: advance read pointer, leave write
+                // pointer alone. The byte range gets overwritten by
+                // the next memmove.
+                readOff += totalNalSize
+                continue
+            }
+
+            if writeOff != readOff {
+                memmove(
+                    dataPtr.advanced(by: writeOff),
+                    dataPtr.advanced(by: readOff),
+                    totalNalSize
+                )
+            }
+            readOff += totalNalSize
+            writeOff += totalNalSize
+        }
+
+        let delta = writeOff - inputSize
+        packet.pointee.size = Int32(writeOff)
+        return delta
     }
 
     // MARK: - Look-behind finalize helpers
