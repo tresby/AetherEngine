@@ -317,7 +317,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
-        audioSourceStreamIndexOverride: Int32? = nil
+        audioSourceStreamIndexOverride: Int32? = nil,
+        initialPositionSeconds: Double? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -327,7 +328,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
+        self.initialPositionSeconds = initialPositionSeconds
     }
+
+    /// Resume position used to seed the sliding-window playlist so its
+    /// initial visible range covers the segment AVPlayer will seek to.
+    /// Without this seed, a resume at e.g. 4368 s lands AVPlayer on a
+    /// playlist that only lists segs 0-29, and the seek either fails
+    /// outright or stalls waiting for the playlist to grow past 4368 s.
+    private let initialPositionSeconds: Double?
 
     // MARK: - Public API
 
@@ -823,6 +832,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 7. Wire the provider, the server, and serve the URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
+        // Convert resume position (if any) to a segment index so the
+        // provider's sliding-window playlist starts with the resume
+        // segment already visible.
+        let initialIndex = Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
         let prov = VideoSegmentProvider(
             cache: segmentCache,
             segments: plan,
@@ -832,6 +845,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             videoRange: videoRange,
             frameRate: frameRate,
             hdcpLevel: hdcpLevel,
+            initialIndex: initialIndex,
             restartHandler: { [weak self] idx in
                 self?.restartProducer(at: idx)
             }
@@ -947,6 +961,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
             avioBytesFetched: demuxer?.avioBytesFetched ?? 0,
             audioFifoSamples: audioBridge?.fifoSampleCount ?? 0
         )
+    }
+
+    /// Bump the sliding-window playlist so segments covering `seconds`
+    /// are listed before AVPlayer issues the seek-driven segment fetch.
+    /// Called by `AetherEngine.seek(to:)`. No-op if the position
+    /// already falls inside the visible window or if the playlist has
+    /// already transitioned to VOD-with-ENDLIST.
+    public func extendVisibleWindow(toCoverSeconds seconds: Double) {
+        guard let prov = provider else { return }
+        let idx = Self.segmentIndex(forSeconds: seconds, plan: segmentPlan)
+        prov.extendVisibleWindow(toCover: idx)
+    }
+
+    /// Locate the segment that contains a given source-time offset.
+    /// Linear scan, fine for our 2k-segment scale on the engine's
+    /// rare-event paths (load + seek). Returns 0 if `seconds` is nil
+    /// or negative, last index if past the end.
+    fileprivate static func segmentIndex(forSeconds seconds: Double?, plan: [Segment]) -> Int {
+        guard let s = seconds, s > 0, !plan.isEmpty else { return 0 }
+        for (i, seg) in plan.enumerated() {
+            if s < seg.startSeconds + seg.durationSeconds {
+                return i
+            }
+        }
+        return plan.count - 1
     }
 
     public func stop() {
@@ -1561,6 +1600,42 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// resuming at the target.
     private static let forwardWaitWindow = 8
 
+    // MARK: - Sliding-window EVENT playlist state
+
+    /// Segments visible in /media.m3u8 are `[0, visibleHighWater]`.
+    /// EVENT playlists are append-only per RFC 8216 §6.2.1, so this
+    /// counter is monotonic over a session. Grows by `growthPerRefresh`
+    /// on each playlist build, plus explicit jumps from
+    /// `extendVisibleWindow(toCover:)` on seek.
+    ///
+    /// Initial value covers the resume position so AVPlayer's first
+    /// playlist read already contains the seg AVPlayer is about to
+    /// seek to; otherwise AVPlayer either refuses the seek or stalls
+    /// waiting for the playlist to grow past the requested time.
+    ///
+    /// AVPlayer fires CoreMediaErrorDomain -12888 ("Playlist File
+    /// unchanged") after 2 consecutive polls of an unchanged playlist
+    /// (target-duration / 2 cadence, ≈ 2 s for our 4 s segments).
+    /// Adding ≥ 1 segment per build keeps that check happy.
+    private let stateLock = NSLock()
+    private var visibleHighWater: Int
+    private var refreshCounter: Int = 0
+    private var endlistAdded: Bool = false
+
+    /// How many segments past the resume position the initial playlist
+    /// exposes. 30 × 4 s = 120 s of forward runway: enough to absorb
+    /// AVPlayer's preferredForwardBufferDuration plus the producer's
+    /// startup latency without AVPlayer hitting the end of the visible
+    /// playlist and stalling.
+    private static let initialFillSegments = 30
+
+    /// Segments appended per playlist refresh. Must be ≥ 1 so two
+    /// consecutive polls never see the same playlist (the
+    /// -12888 trigger). Picked > 1 so the visible window grows faster
+    /// than playback consumes it (1 seg per 4 s playback vs 2 segs per
+    /// ~2.5 s poll = ~3.2x ahead).
+    private static let growthPerRefresh = 2
+
     init(
         cache: SegmentCache,
         segments: [HLSVideoEngine.Segment],
@@ -1570,6 +1645,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         videoRange: HLSVideoRange,
         frameRate: Double?,
         hdcpLevel: String?,
+        initialIndex: Int = 0,
         restartHandler: ((Int) -> Void)? = nil
     ) {
         self.cache = cache
@@ -1581,6 +1657,49 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         self.frameRate = frameRate
         self.hdcpLevel = hdcpLevel
         self.restartHandler = restartHandler
+
+        let safeInitial = max(0, min(initialIndex, segments.count - 1))
+        let target = safeInitial + Self.initialFillSegments
+        self.visibleHighWater = min(segments.count - 1, max(Self.initialFillSegments, target))
+    }
+
+    // MARK: - Sliding-window operations
+
+    /// Extend the visible window so segment `index` is in the playlist.
+    /// Called from the engine's seek path before AVPlayer issues its
+    /// new segment fetch so the playlist already lists the target by
+    /// the time AVPlayer re-reads it. Idempotent and monotonic.
+    func extendVisibleWindow(toCover index: Int) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !endlistAdded else { return }
+        let target = min(segments.count - 1, index + Self.initialFillSegments)
+        if target > visibleHighWater {
+            visibleHighWater = target
+            if visibleHighWater >= segments.count - 1 {
+                endlistAdded = true
+            }
+        }
+    }
+
+    /// Snapshot of (visibleHighWater + 1, refreshCounter, endlistAdded)
+    /// captured atomically. HLSLocalServer calls this once at the top
+    /// of buildMediaPlaylist; the rest of that function uses the
+    /// snapshot so segmentCount can't drift mid-build.
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        refreshCounter += 1
+        if !endlistAdded {
+            let target = visibleHighWater + Self.growthPerRefresh
+            if target >= segments.count - 1 {
+                visibleHighWater = segments.count - 1
+                endlistAdded = true
+            } else {
+                visibleHighWater = target
+            }
+        }
+        return (visibleHighWater + 1, refreshCounter, endlistAdded)
     }
 
     // MARK: - HLSSegmentProvider
@@ -1592,6 +1711,14 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     func mediaSegment(at index: Int) -> Data? {
         guard index >= 0, index < segments.count else { return nil }
         let totalStart = DispatchTime.now()
+
+        // Defensive: if AVPlayer fetches a segment beyond the current
+        // visible window (e.g. via an internal seek path that bypassed
+        // the engine.seek hook), extend the window so the next playlist
+        // refresh includes it. Without this, AVPlayer could end up
+        // working off a stale view where it requests a seg that isn't
+        // "supposed to exist" yet.
+        extendVisibleWindow(toCover: index)
 
         // Declare AVPlayer's target FIRST so the cache window slides
         // to centre on `index` before any subsequent producer store
@@ -1659,27 +1786,31 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         return bytes
     }
 
-    var segmentCount: Int { segments.count }
+    var segmentCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return visibleHighWater + 1
+    }
 
     func segmentDuration(at index: Int) -> Double {
         guard index >= 0, index < segments.count else { return 0 }
         return segments[index].durationSeconds
     }
 
-    /// VOD per Apple HLS spec: every segment listed up-front with
-    /// `#EXT-X-ENDLIST`. AVPlayer treats VOD as cache-forever for
-    /// arbitrary backward seek; this is the 3 MB/sec RSS growth source
-    /// on long 4K HDR HEVC sessions and remains an open issue.
-    ///
-    /// EVENT was tested as the alternative: it bounded growth to
-    /// ~1.7 MB/sec but AVPlayer rejected the static playlist with
-    /// CoreMediaErrorDomain -12888 ("Playlist File unchanged for longer
-    /// than 1.5 * target duration") because EVENT playlists are required
-    /// by spec to grow over time. Reverted; a proper sliding-window
-    /// playlist (append a segment per refresh until all are listed,
-    /// then add ENDLIST) is the real fix and is bigger than a one-line
-    /// diagnostic switch.
-    var playlistType: HLSPlaylistType { .vod }
+    /// Sliding-window playlist: EVENT until the visible window reaches
+    /// the last source segment, then transitions to VOD (with ENDLIST)
+    /// for clean end-of-stream detection. AVPlayer caches EVENT
+    /// playlists conservatively (no arbitrary backward-seek
+    /// prefetch) which is the bounded-memory path; VOD caches
+    /// everything. Holding off ENDLIST for the whole session keeps the
+    /// session in the bounded-memory regime; the brief VOD-mode tail
+    /// after the playlist fully populates is short enough that it
+    /// can't OOM before the user reaches the end of content.
+    var playlistType: HLSPlaylistType {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return endlistAdded ? .vod : .event
+    }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {

@@ -698,7 +698,8 @@ public final class AetherEngine: ObservableObject {
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
-            audioSourceStreamIndexOverride: audioSourceStreamIndex
+            audioSourceStreamIndexOverride: audioSourceStreamIndex,
+            initialPositionSeconds: startPosition
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -886,6 +887,13 @@ public final class AetherEngine: ObservableObject {
         if let host = softwareHost {
             await host.seek(to: target)
         } else {
+            // Sliding-window EVENT playlist: ensure the seek target's
+            // segment is visible in the playlist before AVPlayer fetches
+            // it. Without this, a long forward seek can land AVPlayer
+            // on a segment that the playlist hasn't grown to expose
+            // yet — AVPlayer either fails the seek or stalls until the
+            // playlist's periodic refresh catches up.
+            nativeVideoSession?.extendVisibleWindow(toCoverSeconds: target)
             nativeHost?.seek(to: target)
         }
         currentTime = target

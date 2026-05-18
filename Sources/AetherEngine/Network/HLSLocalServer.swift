@@ -77,6 +77,17 @@ protocol HLSSegmentProvider: AnyObject {
     /// CLOSED-CAPTIONS attribute. Apple's reference DV samples set
     /// this to `NONE` when there's no in-band CC track.
     var masterClosedCaptions: String? { get }
+
+    /// Hook called by `HLSLocalServer.buildMediaPlaylist` at the top
+    /// of each playlist build. Returns the snapshot the playlist
+    /// should be built against: visible segment count, refresh
+    /// counter (for the byte-level "playlist changed" signal), and
+    /// whether the playlist should declare itself complete with
+    /// `#EXT-X-ENDLIST`. The video provider uses this to advance a
+    /// sliding-window EVENT playlist; the audio provider's default
+    /// implementation reports its current state without any side
+    /// effect.
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
 }
 
 extension HLSSegmentProvider {
@@ -89,6 +100,15 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
+
+    /// Default implementation for providers that don't run a
+    /// sliding-window playlist. Reports the current segmentCount,
+    /// a zero refresh counter (the byte-level change line is a
+    /// video-side concern), and trusts the static playlistType to
+    /// drive ENDLIST inclusion.
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
+        return (visibleCount: segmentCount, refreshCounter: 0, endlistAdded: false)
+    }
 }
 
 enum HLSPlaylistType {
@@ -416,7 +436,14 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private func buildMediaPlaylist() -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
-        let count = provider.segmentCount
+        // Atomic snapshot of visible-window state. The video provider
+        // uses this hook to advance its sliding window; capturing the
+        // snapshot once and reading from it prevents segmentCount /
+        // playlistType from drifting between read sites inside this
+        // build.
+        let snapshot = provider.notePlaylistBuild()
+        let count = snapshot.visibleCount
+        let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
 
         // Compute target duration as ceil of the longest segment.
         // Spec requires this be >= every EXTINF in the playlist.
@@ -431,28 +458,35 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXT-X-VERSION:7")
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
-        switch provider.playlistType {
-        case .vod:   lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-        case .event: lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+        if typeIsEvent {
+            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+            // Belt-and-suspenders byte-level change signal. Even if
+            // the segment list happens to be identical between two
+            // consecutive polls (e.g. AVPlayer polls faster than
+            // visibleHighWater advances, or the sliding window has
+            // plateaued near total), this custom tag still flips on
+            // every refresh so AVPlayer's "Playlist File unchanged"
+            // freshness check (CoreMediaErrorDomain -12888) can't fire
+            // on us. Tag names beginning with `X-` are reserved for
+            // custom use per RFC 8216 §4.2 and MUST be ignored by
+            // clients that don't recognise them.
+            lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
+        } else {
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         }
-        // EVENT playlists default to the live edge unless an explicit
-        // start point is declared. Without this, AVPlayer interprets
-        // a startPosition=nil load (replay-from-beginning button) as
-        // "start at the last segment" and the user lands ~10 s before
-        // the end. EXT-X-START:TIME-OFFSET=0,PRECISE=YES pins the
-        // default start to the playlist origin so caller-side seeks
-        // (resume position, replay) keep working the same way they
-        // did for VOD.
-        if provider.playlistType == .event {
-            lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
-        }
+        // EXT-X-START:TIME-OFFSET=0 pins the default start to the
+        // playlist origin so a replay-from-beginning load (the engine
+        // passes startPosition=nil) doesn't land the AVPlayer at the
+        // live edge of an EVENT playlist. Caller-side seeks still
+        // work because they're explicit AVPlayer time targets.
+        lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
         lines.append("#EXT-X-MAP:URI=\"init.mp4\"")
         for i in 0..<count {
             let dur = provider.segmentDuration(at: i)
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append("seg\(i).mp4")
         }
-        if provider.playlistType == .vod {
+        if snapshot.endlistAdded || !typeIsEvent {
             lines.append("#EXT-X-ENDLIST")
         }
         return lines.joined(separator: "\n") + "\n"
