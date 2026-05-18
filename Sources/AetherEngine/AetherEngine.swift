@@ -606,18 +606,17 @@ public final class AetherEngine: ObservableObject {
             useSoftwarePath = !VTCapabilityProbe.av1Available
         case AV_CODEC_ID_VP9:
             useSoftwarePath = true
-        case AV_CODEC_ID_HEVC:
-            // POC: route HEVC through the SoftwarePlaybackHost path
-            // (which now picks the VT-backed HardwareVideoDecoder
-            // for HEVC). Bypasses AVPlayer + its HLS-fMP4 stack
-            // entirely; goal is to measure whether RSS over a long
-            // 4K HDR HEVC session stays bounded when we own the
-            // decoder + IOSurface lifetime. Audio + subtitles +
-            // HDR display handshake all still need their own POC
-            // attention; this is just the video-pipeline switch.
-            useSoftwarePath = true
         default:
-            useSoftwarePath = false
+            // POC: HEVC can be forced through the VT-backed software
+            // host via `LoadOptions.forceSoftwareForHEVC = true` for
+            // memory diagnostics. Default routing stays on the native
+            // AVPlayer path because the long-form 4K HDR HEVC memory
+            // issue is being investigated as an HLS-fMP4 fragment
+            // problem first; if that path closes, the routing flag
+            // becomes the default true and the VT POC ships as the
+            // production HEVC path.
+            useSoftwarePath = options.forceSoftwareForHEVC
+                && detectedCodecID == AV_CODEC_ID_HEVC
         }
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
 

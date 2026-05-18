@@ -130,13 +130,28 @@ public struct LoadOptions: Sendable, Equatable {
     /// panel-mode switch into HDR; otherwise routes via media.
     public var panelIsInHDRMode: Bool
 
+    /// DIAGNOSTIC: route HEVC sources through the SoftwarePlaybackHost
+    /// + VTDecompressionSession path instead of the default
+    /// AVPlayer / HLS-fMP4 pipeline. Bypasses our in-process HLS
+    /// muxer entirely; the source goes directly Demuxer →
+    /// HardwareVideoDecoder → AVSampleBufferDisplayLayer.
+    ///
+    /// Default OFF. POC verified bounded memory growth with this on
+    /// during 4K HDR HEVC playback (0.05 MB/sec vs 3 MB/sec on the
+    /// AVPlayer path). UX integration (Now Playing manual, transport
+    /// bar, AVMediaSelection equivalents) is still missing, so the
+    /// production HEVC path stays on AVPlayer until the fragment-
+    /// diagnostic side of the investigation closes.
+    public var forceSoftwareForHEVC: Bool
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
-        panelIsInHDRMode: Bool = false
+        panelIsInHDRMode: Bool = false,
+        forceSoftwareForHEVC: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -144,6 +159,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.forceSoftwareForHEVC = forceSoftwareForHEVC
     }
 }
 
