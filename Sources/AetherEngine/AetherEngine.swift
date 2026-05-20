@@ -677,7 +677,25 @@ public final class AetherEngine: ObservableObject {
                 self.sourceTime = self.currentTime + seconds
             }
         }
-        let playbackURL = try session.start()
+        _ = try session.start()
+        // Use the AVAssetResourceLoader bypass for AVPlayer's byte
+        // fetches. Eliminates CFNetwork's loopback path which was the
+        // root cause of the long-form memory leak (Instruments-pinpoint
+        // 2026-05-20: `VM: libnetwork` 66 MiB persistent + ~10 MiB heap
+        // blocks per segment served). The HTTP server stays available
+        // for aetherctl development workflow but AVPlayer goes through
+        // the delegate.
+        let playbackURL: URL
+        let resourceLoaderDelegate: AVAssetResourceLoaderDelegate?
+        if let handle = session.resourceLoader() {
+            playbackURL = handle.url
+            resourceLoaderDelegate = handle.delegate
+        } else {
+            // Shouldn't happen — resourceLoader() only returns nil
+            // before start(), and we called start() above.
+            playbackURL = try session.start()
+            resourceLoaderDelegate = nil
+        }
         self.nativeVideoSession = session
 
         let host = NativeAVPlayerHost()
@@ -740,7 +758,10 @@ public final class AetherEngine: ObservableObject {
         // the suspected leak without affecting the HDR / DV mode where
         // the metadata is meaningful.
         let perFrameHDR = session.servingMasterPlaylist
-        host.load(url: playbackURL, startPosition: startPosition, perFrameHDR: perFrameHDR)
+        host.load(url: playbackURL,
+                  startPosition: startPosition,
+                  perFrameHDR: perFrameHDR,
+                  resourceLoaderDelegate: resourceLoaderDelegate)
     }
 
     /// Open a `SoftwarePlaybackHost` against the source and wire its
@@ -1535,6 +1556,7 @@ public final class AetherEngine: ObservableObject {
                 let srvSfMB = (stats?.serverSendfileBytesSent ?? 0) / 1024 / 1024
                 let pktAlive = stats?.packetsAlive ?? 0
                 let pktTotal = stats?.packetsTotalAllocs ?? 0
+                let rlBytesMB = (stats?.resourceLoaderBytesServed ?? 0) / 1024 / 1024
 
                 // VM breakdown so the leak source is visible at probe
                 // time: internal (Swift / libavformat heap) vs external
@@ -1571,6 +1593,7 @@ public final class AetherEngine: ObservableObject {
                     + "muxBytesMB=\(muxBytesMB) muxCuts=\(muxCuts) "
                     + "srvConns=\(srvConns) srvBytesMB=\(srvBytesMB) srvSfMB=\(srvSfMB) "
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
+                    + "rlBytesMB=\(rlBytesMB) "
                     + "subCues=\(cueCount) "
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "

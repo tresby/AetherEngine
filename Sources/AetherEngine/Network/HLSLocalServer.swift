@@ -846,7 +846,21 @@ final class HLSLocalServer: @unchecked Sendable {
     // MARK: - Playlist construction
 
     private func buildMasterPlaylist() -> String {
-        guard let provider = provider, let codecs = provider.masterCodecs else {
+        guard let provider = provider else { return "#EXTM3U\n" }
+        return Self.buildMasterPlaylistText(provider: provider)
+    }
+
+    private func buildMediaPlaylist() -> String {
+        guard let provider = provider else { return "#EXTM3U\n" }
+        return Self.buildMediaPlaylistText(provider: provider)
+    }
+
+    /// Public static playlist builders. Used by the
+    /// `EngineResourceLoaderDelegate` to generate the same playlist
+    /// text the HTTP server would have served, without needing a live
+    /// `HLSLocalServer` instance. Pure functions of the provider state.
+    static func buildMasterPlaylistText(provider: HLSSegmentProvider) -> String {
+        guard let codecs = provider.masterCodecs else {
             return "#EXTM3U\n"
         }
         var lines: [String] = []
@@ -889,8 +903,7 @@ final class HLSLocalServer: @unchecked Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    private func buildMediaPlaylist() -> String {
-        guard let provider = provider else { return "#EXTM3U\n" }
+    static func buildMediaPlaylistText(provider: HLSSegmentProvider) -> String {
         // Atomic snapshot of visible-window state. The video provider
         // uses this hook to advance its sliding window; capturing the
         // snapshot once and reading from it prevents segmentCount /

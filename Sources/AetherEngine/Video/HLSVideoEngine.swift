@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Libavformat
 import Libavcodec
@@ -210,6 +211,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var producer: HLSSegmentProducer?
     private var server: HLSLocalServer?
     private var provider: VideoSegmentProvider?
+
+    /// Resource loader delegate created lazily on first
+    /// `resourceLoader()` call. Lives as long as the engine session;
+    /// AVPlayer's AVURLAsset retains a strong reference through its
+    /// `resourceLoader.delegate` property. We hold our own strong ref
+    /// here so the delegate outlives any temporary host instance
+    /// recreation across an audio-track reload.
+    private var _resourceLoaderDelegate: EngineResourceLoaderDelegate?
 
     /// Detached Task that periodically recycles ONLY the source demuxer
     /// + its AVIOReader (frees matroska state + URLSession dispatch_data
@@ -951,6 +960,40 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return url
     }
 
+    /// Custom-scheme URL + delegate for AVPlayer to bypass CFNetwork
+    /// loopback. After `start()` succeeds (provider + producer are
+    /// alive, master/media routing decided), call this to obtain
+    /// the `(aether-engine://...)` URL + an `AVAssetResourceLoaderDelegate`
+    /// the host attaches to `AVURLAsset.resourceLoader`. AVPlayer
+    /// routes EVERY byte fetch through the delegate, never opens an
+    /// HTTP loopback connection.
+    ///
+    /// Cures the CFNetwork libnetwork + heap leak (Instruments
+    /// pinpoint, 2026-05-20) at the cost of AirPlay-out compatibility
+    /// (custom-scheme URLs are not AirPlayable). Caller should set
+    /// `allowsExternalPlayback = false` on the resulting AVPlayer.
+    ///
+    /// Returns nil if the engine hasn't been `start()`ed yet (no
+    /// provider available).
+    public func resourceLoader() -> (url: URL, delegate: AVAssetResourceLoaderDelegate)? {
+        guard let provider = self.provider else { return nil }
+        if _resourceLoaderDelegate == nil {
+            _resourceLoaderDelegate = EngineResourceLoaderDelegate(
+                provider: provider,
+                servingMasterPlaylist: servingMasterPlaylist
+            )
+        }
+        let url = EngineResourceLoaderDelegate.playbackURL(useMasterPlaylist: servingMasterPlaylist)
+        return (url: url, delegate: _resourceLoaderDelegate!)
+    }
+
+    /// Lifetime bytes the resource-loader delegate has served. Zero
+    /// when the delegate hasn't been constructed (= caller chose the
+    /// HTTP-loopback path). Surfaced in the engine memprobe.
+    public var resourceLoaderLifetimeBytes: Int {
+        _resourceLoaderDelegate?.lifetimeBytesServed ?? 0
+    }
+
     /// Resolved routing decision exposed for the host's AVPlayerItem
     /// configuration. `true` when `start()` chose the master playlist
     /// (HDR / DV signaling reaches AVPlayer); `false` for the media
@@ -1007,6 +1050,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         /// growth = a packet leak in one of our paths.
         public let packetsAlive: Int
         public let packetsTotalAllocs: Int
+        /// Bytes the resource-loader delegate has served to AVPlayer
+        /// (= bypass-CFNetwork path). Zero when the host is on the
+        /// legacy HTTP-loopback path. Confirms the new path is active.
+        public let resourceLoaderBytesServed: Int
     }
 
     /// Read the current pipeline counters. Returns zeros for any
@@ -1028,7 +1075,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             serverLifetimeBytesSent: server?.lifetimeBytesSent ?? 0,
             serverSendfileBytesSent: server?.lifetimeSendfileBytes ?? 0,
             packetsAlive: PacketBalanceTracker.alive,
-            packetsTotalAllocs: PacketBalanceTracker.totalAllocs
+            packetsTotalAllocs: PacketBalanceTracker.totalAllocs,
+            resourceLoaderBytesServed: resourceLoaderLifetimeBytes
         )
     }
 
@@ -1074,6 +1122,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         server?.stop()
         cache?.close()
         audioBridge?.close()
+        _resourceLoaderDelegate = nil
         provider = nil
         server = nil
         cache = nil
