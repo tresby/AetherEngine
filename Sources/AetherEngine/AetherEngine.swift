@@ -1590,6 +1590,21 @@ public final class AetherEngine: ObservableObject {
                 // One line per 30 s is cheap; the rest of EngineLog stays
                 // single-sink to avoid console spam.
                 print(line)
+
+                // Per-zone malloc breakdown on a second line so the
+                // existing memprobe parsers don't break. Tells us
+                // exactly which malloc zone is growing (= which
+                // subsystem is leaking). Big growers between samples
+                // are the culprit.
+                let zones = Self.mallocZoneBreakdown()
+                if !zones.isEmpty {
+                    let zoneStr = zones
+                        .map { "\($0.name):\($0.sizeMB)MB/\($0.blocks)" }
+                        .joined(separator: " ")
+                    let zoneLine = "[AetherEngine] memprobe zones t=\(elapsed)s \(zoneStr)"
+                    EngineLog.emit(zoneLine, category: .engine)
+                    print(zoneLine)
+                }
             }
         }
     }
@@ -1664,6 +1679,43 @@ public final class AetherEngine: ObservableObject {
         malloc_zone_statistics(nil, &stats)
         return (blocksInUse: Int(stats.blocks_in_use),
                 sizeInUseMB: Int(stats.size_in_use / 1024 / 1024))
+    }
+
+    /// Per-zone malloc breakdown — iterates every registered malloc
+    /// zone and reports its name, block count, and resident bytes.
+    /// Surfaced in the 30 s memprobe as a second log line so that
+    /// "which subsystem is leaking" is directly observable: a growing
+    /// `DefaultMallocZone` points at libc-level allocations (libavformat
+    /// internals, NSData backing, Foundation objects); a growing
+    /// `MallocHelperZone` points at Foundation; growing custom zones
+    /// (e.g. `QuartzCore` or library-private ones) point at decoder /
+    /// rendering buffers; etc.
+    ///
+    /// Filtered to zones with `>= 1 MB` in use so the line stays short
+    /// and the noise floor doesn't bury the signal. Sorted descending
+    /// by size so the biggest growers are read-order first.
+    static func mallocZoneBreakdown() -> [(name: String, blocks: Int, sizeMB: Int)] {
+        var zonesPtr: UnsafeMutablePointer<vm_address_t>?
+        var count: UInt32 = 0
+        let kr = malloc_get_all_zones(mach_task_self_, nil, &zonesPtr, &count)
+        guard kr == KERN_SUCCESS, let zones = zonesPtr, count > 0 else {
+            return []
+        }
+        var result: [(String, Int, Int)] = []
+        for i in 0..<Int(count) {
+            let addr = zones[i]
+            guard let zonePtr = UnsafeMutablePointer<malloc_zone_t>(bitPattern: UInt(addr)) else {
+                continue
+            }
+            let name = malloc_get_zone_name(zonePtr).map { String(cString: $0) } ?? "<unnamed>"
+            var stats = malloc_statistics_t()
+            malloc_zone_statistics(zonePtr, &stats)
+            let sizeMB = Int(stats.size_in_use / 1024 / 1024)
+            guard sizeMB >= 1 else { continue }
+            result.append((name, Int(stats.blocks_in_use), sizeMB))
+        }
+        result.sort { $0.2 > $1.2 }
+        return result
     }
 
     // MARK: - Decoder identity helpers
