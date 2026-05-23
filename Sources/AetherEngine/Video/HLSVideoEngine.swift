@@ -1810,6 +1810,18 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// TV against a local Jellyfin source.
     private let restartHandler: ((Int) -> Void)?
 
+    /// Last index passed to `restartHandler`, also used as the assumed
+    /// base index of the engine's currently-active producer. Used by
+    /// the empty-cache branch in `mediaSegment(at:)` to distinguish
+    /// between "producer just launched here, wait for it" (`abs(index
+    /// − lastRestartIndex) ≤ 2`) and "producer is far away from this
+    /// index, restart needed" (large diff). Initialised to 0 since
+    /// every session starts with an initial producer at baseIndex 0
+    /// or the host's resume target, with the engine updating this
+    /// after the first explicit restart it triggers via the public
+    /// `restartProducer(at:)` path.
+    private var lastRestartIndex: Int = 0
+
     /// Forward-distance threshold beyond which a fetch triggers a
     /// restart instead of waiting for the producer to catch up.
     /// 8 is the value that survives both failure modes:
@@ -2035,10 +2047,26 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
                 needsRestart = false
             }
         } else {
-            // Empty cache. Producer's plausible cold-start reach is
-            // ~3 segments; anything past that and we know we want a
-            // restart at the requested index rather than wait.
-            needsRestart = index > 2
+            // Empty cache. Two scenarios:
+            //  1. Cold start: producer just launched at lastRestartIndex,
+            //     hasn't written anything yet. AVPlayer's first GET for
+            //     a nearby segment should wait briefly while the producer
+            //     fills the cache (restarting would just churn the
+            //     producer we already have).
+            //  2. Big scrub after the cache window slid away: the
+            //     producer is far from `index` (different baseIndex)
+            //     and won't ever write into the requested region.
+            //     Restart is mandatory; waiting just times out.
+            //
+            // Discriminate on lastRestartIndex (the absolute segment
+            // index the engine's current producer was launched at):
+            // close to `index` means cold-start case → wait; far from
+            // it means scrub case → restart. The previous heuristic
+            // (`index > 2`) only handled cold-start from index 0 and
+            // missed Vincent's repro where the producer was at idx
+            // 1314 and AVPlayer requested seg-0 after a back-scrub,
+            // leaving AVPlayer to time out for 30 s and 404.
+            needsRestart = abs(index - lastRestartIndex) > 2
         }
 
         if needsRestart, let restart = restartHandler {
@@ -2046,6 +2074,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
                 "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty")), restarting producer",
                 category: .session
             )
+            lastRestartIndex = index
             restart(index)
         }
 
