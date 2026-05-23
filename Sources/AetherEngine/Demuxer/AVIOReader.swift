@@ -47,6 +47,74 @@ final class AVIOReader: @unchecked Sendable {
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
 
+    /// Final URL after the first request's redirect chain resolved.
+    /// Used for subsequent Range / probe fetches so we skip the proxy
+    /// → CDN redirect hop on every chunk. Nil until a request
+    /// completes with a 2xx/206 response whose `currentRequest.url`
+    /// differs from the caller-supplied `url`.
+    ///
+    /// Auth-expiry statuses (401/403/404/410) against the resolved
+    /// URL drop the cache and retry once against the original source
+    /// URL so the proxy can re-issue a fresh signed redirect. See
+    /// AetherEngine#12.
+    private let resolvedURLLock = NSLock()
+    private var _resolvedURL: URL?
+
+    /// URL to use for the next request: the cached resolved CDN URL
+    /// when available, otherwise the caller-provided source URL.
+    private func requestURL() -> URL {
+        resolvedURLLock.lock()
+        defer { resolvedURLLock.unlock() }
+        return _resolvedURL ?? url
+    }
+
+    /// Snapshot of the current cached resolved URL, or nil if none.
+    /// Used to distinguish "request hit the cached URL" from "request
+    /// hit the source URL" so the auth-expiry fallback only triggers
+    /// for the former.
+    private func cachedResolvedURL() -> URL? {
+        resolvedURLLock.lock()
+        defer { resolvedURLLock.unlock() }
+        return _resolvedURL
+    }
+
+    /// Cache the resolved URL after a successful response. Called from
+    /// the per-task delegates' `didReceive response` with the task's
+    /// `currentRequest.url` (the URL after the redirect chain). No-op
+    /// when the resolved URL equals the source URL (no redirect
+    /// happened) or matches an already-cached value.
+    private func recordResolvedURL(_ resolved: URL?) {
+        guard let resolved else { return }
+        resolvedURLLock.lock()
+        defer { resolvedURLLock.unlock() }
+        if resolved != url && resolved != _resolvedURL {
+            _resolvedURL = resolved
+            #if DEBUG
+            print("[AVIOReader] Cached resolved URL host=\(resolved.host ?? "?")")
+            #endif
+        }
+    }
+
+    /// Drop the cached resolved URL so the next request goes through
+    /// the source URL and re-resolves. Called when a request against
+    /// the cached URL returned an auth-expiry-like status.
+    private func invalidateResolvedURL() {
+        resolvedURLLock.lock()
+        defer { resolvedURLLock.unlock() }
+        if _resolvedURL != nil {
+            _resolvedURL = nil
+            #if DEBUG
+            print("[AVIOReader] Dropped resolved URL cache (expiry status)")
+            #endif
+        }
+    }
+
+    /// Status codes that mean "the cached signed URL has expired or
+    /// is no longer authoritative; retry against the source URL".
+    private static func isResolvedExpiryStatus(_ status: Int) -> Bool {
+        return status == 401 || status == 403 || status == 404 || status == 410
+    }
+
     /// Cumulative bytes returned by every `fetchChunk` (seekable mode)
     /// and `StreamingDelegate.didReceive` (streaming mode) since the
     /// reader was opened. Read by the engine's memory probe to compare
@@ -640,6 +708,9 @@ final class AVIOReader: @unchecked Sendable {
 
         let semaphore = DispatchSemaphore(value: 0)
         delegate.onCompletion = { semaphore.signal() }
+        delegate.onResolved = { [weak self] resolved in
+            self?.recordResolvedURL(resolved)
+        }
         task.resume()
 
         if semaphore.wait(timeout: .now() + .seconds(25)) == .timedOut {
@@ -692,8 +763,31 @@ final class AVIOReader: @unchecked Sendable {
     }
 
     private func fetchChunk(from offset: Int64, size: Int) -> Data? {
+        // First attempt: use the cached resolved CDN URL if we have
+        // one, otherwise the source URL. If the cached URL was used
+        // and returned an auth-expiry-like status, fall back to the
+        // source URL for one more attempt so the proxy can re-issue
+        // a signed redirect.
+        if let data = fetchChunkAttempt(from: offset, size: size, forceSource: false) {
+            return data
+        }
+        // Only retry against the source if the first attempt actually
+        // used a cached URL. Otherwise the second pass would just
+        // repeat the same request.
+        if cachedResolvedURL() != nil {
+            return fetchChunkAttempt(from: offset, size: size, forceSource: true)
+        }
+        return nil
+    }
+
+    /// Single fetch pass against either the cached resolved URL or
+    /// the source URL. Returns nil on any non-200/206 response,
+    /// dropping the cached URL when the failure looks like an expiry.
+    private func fetchChunkAttempt(from offset: Int64, size: Int, forceSource: Bool) -> Data? {
+        let usingCachedURL = !forceSource && cachedResolvedURL() != nil
+        let target = forceSource ? url : requestURL()
         let rangeEnd = offset + Int64(size) - 1
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: target)
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
         request.timeoutInterval = 15
         applyExtraHeaders(&request)
@@ -702,9 +796,14 @@ final class AVIOReader: @unchecked Sendable {
         for attempt in 0..<Self.maxRetries {
             do {
                 let (data, response) = try syncRequest(request)
-                if let http = response as? HTTPURLResponse,
-                   http.statusCode != 200 && http.statusCode != 206 {
-                    return nil
+                if let http = response as? HTTPURLResponse {
+                    let status = http.statusCode
+                    if status != 200 && status != 206 {
+                        if usingCachedURL && Self.isResolvedExpiryStatus(status) {
+                            invalidateResolvedURL()
+                        }
+                        return nil
+                    }
                 }
                 addBytesFetched(data.count)
                 return data
@@ -750,12 +849,15 @@ final class AVIOReader: @unchecked Sendable {
         // it to a fresh task on the shared session, wait on a
         // semaphore for completion, hand back our heap-allocated
         // body Data.
-        let delegate = ChunkFetchDelegate()
+        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
 
         let semaphore = DispatchSemaphore(value: 0)
         delegate.onCompletion = { semaphore.signal() }
+        delegate.onResolved = { [weak self] resolved in
+            self?.recordResolvedURL(resolved)
+        }
         task.resume()
 
         if semaphore.wait(timeout: .now() + .seconds(35)) == .timedOut {
@@ -784,10 +886,39 @@ final class AVIOReader: @unchecked Sendable {
 /// the mutable fields. Body access from the caller happens only after
 /// `onCompletion` fires + the semaphore signals.
 private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let extraHeaders: [String: String]
     var body = Data()
     var response: URLResponse?
     var error: Error?
     var onCompletion: (() -> Void)?
+    var onResolved: ((URL) -> Void)?
+
+    init(extraHeaders: [String: String]) {
+        self.extraHeaders = extraHeaders
+    }
+
+    /// Preserve the `Range` header + caller-supplied extra headers on
+    /// cross-host redirects. URLSession strips custom headers when a
+    /// redirect changes host; without this the CDN sees a plain GET
+    /// instead of a partial fetch and either streams the whole body
+    /// (busted memory) or 400s on proxies that require Range. See
+    /// the same hook on `ProbeDelegate` for the original incident.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var updated = request
+        if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
+            updated.setValue(originalRange, forHTTPHeaderField: "Range")
+        }
+        for (name, value) in extraHeaders {
+            updated.setValue(value, forHTTPHeaderField: name)
+        }
+        completionHandler(updated)
+    }
 
     func urlSession(
         _ session: URLSession,
@@ -801,6 +932,14 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         if let http = response as? HTTPURLResponse {
             let len = Int(http.expectedContentLength)
             if len > 0 { body.reserveCapacity(len) }
+            // Surface the post-redirect URL so the reader can cache
+            // it for subsequent range fetches. Only on success: a 4xx
+            // redirect target shouldn't poison the cache.
+            let status = http.statusCode
+            if status == 200 || status == 206,
+               let resolved = dataTask.currentRequest?.url {
+                onResolved?(resolved)
+            }
         }
         completionHandler(.allow)
     }
@@ -881,6 +1020,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
     let extraHeaders: [String: String]
     var totalSize: Int64?
     var onCompletion: (() -> Void)?
+    var onResolved: ((URL) -> Void)?
 
     init(extraHeaders: [String: String]) {
         self.extraHeaders = extraHeaders
@@ -924,7 +1064,15 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
     ) {
         defer { completionHandler(.cancel) }
         guard let http = response as? HTTPURLResponse else { return }
-        if http.statusCode == 206,
+        // Surface the post-redirect URL so the reader can cache it for
+        // subsequent range fetches. Only on success: a 4xx redirect
+        // target shouldn't poison the cache.
+        let status = http.statusCode
+        if (status == 206 || (200...299).contains(status)),
+           let resolved = dataTask.currentRequest?.url {
+            onResolved?(resolved)
+        }
+        if status == 206,
            let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
            let slash = contentRange.firstIndex(of: "/") {
             let totalString = contentRange[contentRange.index(after: slash)...]
@@ -933,7 +1081,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
                 return
             }
         }
-        if (200...299).contains(http.statusCode), http.expectedContentLength > 0 {
+        if (200...299).contains(status), http.expectedContentLength > 0 {
             totalSize = http.expectedContentLength
         }
     }
