@@ -76,6 +76,12 @@ public final class AetherEngine: ObservableObject {
     /// overlays and TestFlight badges; hosts should not switch on it.
     @Published public private(set) var playbackBackend: PlaybackBackend = .none
 
+    /// 1 Hz snapshot of live playback telemetry while the engine is
+    /// `.playing` or `.paused`. `nil` while idle. Driven by
+    /// `LiveTelemetrySampler`. The host's stats overlay subscribes to
+    /// this and renders into the Live + Engine Diagnostics sections.
+    @Published public private(set) var liveTelemetry: LiveTelemetry?
+
     /// Human-readable identity of the video decoder currently in use,
     /// suitable for a "stats for nerds" UI. Examples:
     /// - `"VideoToolbox HEVC (HW)"` for the native AVPlayer path on
@@ -246,6 +252,13 @@ public final class AetherEngine: ObservableObject {
     /// On macOS / aetherctl the line goes to stdout; on tvOS it goes to
     /// `EngineLog.handler` so the host's diagnostic overlay sees it too.
     private var memoryProbeTask: Task<Void, Never>?
+
+    /// 1 Hz live-telemetry sampler. Mirrors the lifecycle of
+    /// `memoryProbeTask`: started when the engine enters `.playing`
+    /// (load completes) and torn down in `stopInternal`. The sampler
+    /// holds a weak reference back to the engine so its retained task
+    /// can't keep `self` alive past teardown.
+    private var liveTelemetrySampler: LiveTelemetrySampler?
 
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
@@ -645,6 +658,7 @@ public final class AetherEngine: ObservableObject {
                 softwareHost?.play()
                 state = .playing
                 startMemoryProbe()
+                startLiveTelemetrySampler()
             } else {
                 // Native path: hand the probe Demuxer to loadNative.
                 // HLSVideoEngine.start() reuses it instead of running
@@ -684,6 +698,7 @@ public final class AetherEngine: ObservableObject {
                 nativeHost?.play()
                 state = .playing
                 startMemoryProbe()
+                startLiveTelemetrySampler()
             }
         } catch {
             state = .error("Failed to load: \(error.localizedDescription)")
@@ -1539,6 +1554,9 @@ public final class AetherEngine: ObservableObject {
         // leak the panel mode into the next playback.
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
+        liveTelemetrySampler?.stop()
+        liveTelemetrySampler = nil
+        liveTelemetry = nil
         nativeCancellables.removeAll()
         nativeHost?.tearDown()
         nativeHost = nil
@@ -1684,6 +1702,17 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Start the 1 Hz live-telemetry sampler. Cancels any prior sampler
+    /// so a fresh `load(url:)` cycle starts a clean timeline. Mirrors
+    /// `startMemoryProbe`'s lifecycle so the two diagnostic surfaces
+    /// share the same start + stop hooks.
+    private func startLiveTelemetrySampler() {
+        liveTelemetrySampler?.stop()
+        let sampler = LiveTelemetrySampler(engine: self)
+        liveTelemetrySampler = sampler
+        sampler.start()
+    }
+
     /// Resident memory footprint of the current process in MB, read via
     /// `mach_task_basic_info`. Returns 0 on error. Cheap to call (no
     /// allocations) and safe from any thread.
@@ -1754,6 +1783,71 @@ public final class AetherEngine: ObservableObject {
         malloc_zone_statistics(nil, &stats)
         return (blocksInUse: Int(stats.blocks_in_use),
                 sizeInUseMB: Int(stats.size_in_use / 1024 / 1024))
+    }
+
+    // MARK: - Live telemetry bridge
+
+    /// Apply a fresh `LiveTelemetry` snapshot to the `@Published` mirror.
+    /// Internal so `LiveTelemetrySampler` can write through despite the
+    /// `private(set)` on `liveTelemetry` from the public API surface.
+    func applyLiveTelemetry(_ snapshot: LiveTelemetry) {
+        liveTelemetry = snapshot
+    }
+
+
+    /// Bytes the active demuxer has fetched from the source. Mirrors
+    /// `Demuxer.avioBytesFetched` via HLSVideoEngine's existing
+    /// diagnostic surface. Used by `LiveTelemetrySampler` for instant
+    /// + average bitrate. Returns 0 on the SW path or pre-start.
+    var demuxerBytesFetched: Int64 {
+        nativeVideoSession?.demuxerBytesFetched ?? 0
+    }
+
+    /// Total resident bytes in the loopback HLS segment cache, or `nil`
+    /// when no native session is active.
+    var cachedBytes: Int64? {
+        guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
+        return Int64(bytes)
+    }
+
+    /// Lifetime count of frames the SW host has enqueued into its
+    /// AVSampleBufferDisplayLayer. Zero on the native path or pre-start.
+    var softwareHostFramesEnqueued: Int {
+        softwareHost?.framesEnqueued ?? 0
+    }
+
+    /// Number of producer restart sessions in the current session. Zero
+    /// on the SW path or pre-start.
+    var producerRestartCount: Int {
+        nativeVideoSession?.producerRestartCount ?? 0
+    }
+
+    /// Lifetime bytes emitted by the active MP4SegmentMuxer.
+    var muxedBytesLifetime: Int64 {
+        Int64(nativeVideoSession?.muxedBytesLifetime ?? 0)
+    }
+
+    /// Lifetime bytes the loopback HLS server has written to AVPlayer.
+    var serverBytesSentLifetime: Int64 {
+        Int64(nativeVideoSession?.serverLifetimeBytesSent ?? 0)
+    }
+
+    /// Number of HTTP requests served by the loopback HLS server.
+    var serverRequestCount: Int {
+        nativeVideoSession?.serverRequestCount ?? 0
+    }
+
+    /// Bytes currently held in `AudioBridge`'s FIFO + swr-delay buffers.
+    /// Zero when the bridge isn't live (stream-copy audio path or
+    /// video-only source).
+    var audioBridgeLiveBytes: Int {
+        nativeVideoSession?.audioBridgeLiveBytes ?? 0
+    }
+
+    /// Most recently measured audio/video gate gap in source-clock
+    /// milliseconds. 0 until the first audio gate opens.
+    var lastAVGapMs: Double {
+        nativeVideoSession?.lastAVGapMs ?? 0
     }
 
     // MARK: - Decoder identity helpers

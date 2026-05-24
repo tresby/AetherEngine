@@ -1149,6 +1149,39 @@ public final class HLSVideoEngine: @unchecked Sendable {
         public let serverRequestCount: Int
     }
 
+    // MARK: - Live telemetry forwarders
+
+    // Flat counters used by `LiveTelemetrySampler`. Each forwarder reads
+    // from the subsystem that owns the source-of-truth field (same source
+    // as `diagnosticStats()` above) but exposes it as a single getter so
+    // the sampler doesn't have to walk private subsystem pointers. All
+    // return zero when the relevant subsystem isn't built yet.
+
+    /// Bytes the active demuxer has fetched from the source. Mirrors
+    /// `Demuxer.avioBytesFetched`.
+    var demuxerBytesFetched: Int64 { demuxer?.avioBytesFetched ?? 0 }
+
+    /// Resident bytes in the loopback HLS segment cache.
+    var segmentCacheTotalBytes: Int { cache?.totalBytes ?? 0 }
+
+    /// Producer restart sessions in the current session.
+    var producerRestartCount: Int { producer?.restartCount ?? 0 }
+
+    /// Lifetime bytes emitted by the active MP4SegmentMuxer.
+    var muxedBytesLifetime: Int { producer?.muxerLifetimeFragmentBytes ?? 0 }
+
+    /// Lifetime bytes the loopback HLS server has written to AVPlayer.
+    var serverLifetimeBytesSent: Int { server?.lifetimeBytesSent ?? 0 }
+
+    /// HTTP requests served by the loopback HLS server.
+    var serverRequestCount: Int { server?.requestCount ?? 0 }
+
+    /// Bytes currently held in AudioBridge's FIFO + swr-delay buffers.
+    var audioBridgeLiveBytes: Int { audioBridge?.liveBytes.totalBytes ?? 0 }
+
+    /// Most recently measured audio/video gate gap in source-clock ms.
+    var lastAVGapMs: Double { producer?.lastAVGapMs ?? 0 }
+
     /// Read the current pipeline counters. Returns zeros for any
     /// sub-system that hasn't been constructed yet (pre-start or
     /// post-stop).
