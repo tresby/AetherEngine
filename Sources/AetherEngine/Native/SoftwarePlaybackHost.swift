@@ -35,6 +35,15 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Published state (mirrors NativeAVPlayerHost surface)
 
+    /// Frames successfully enqueued into the AVSampleBufferDisplayLayer.
+    /// Incremented each time `renderer.enqueue` is invoked. Read by the
+    /// engine's LiveTelemetrySampler at 1 Hz to compute observed FPS on
+    /// the software path. Atomic read via the existing class-internal
+    /// serialisation; the counter is single-writer (the decode pump) and
+    /// any reader sees a torn `Int` only on 32-bit platforms (tvOS is
+    /// 64-bit, so reads are atomic by ABI).
+    private(set) var framesEnqueued: Int = 0
+
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
@@ -197,6 +206,7 @@ final class SoftwarePlaybackHost {
             // is internally locked + safe to call off-main; the engine's
             // public state stays untouched here, only the layer's frame queue.
             self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            self?.framesEnqueued &+= 1
         }
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()
