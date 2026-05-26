@@ -295,6 +295,7 @@ final class HLSLocalServer: @unchecked Sendable {
     /// session instead of on every AVPlayer re-fetch.
     private var loggedMasterPlaylist = false
     private var loggedMediaPlaylist = false
+    private var loggedRequestHeaders = false
 
     /// Guards every mutable field above plus the listenFd. Reads
     /// from the public-facing computed properties take the lock too.
@@ -602,6 +603,21 @@ final class HLSLocalServer: @unchecked Sendable {
         let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
 
         EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
+        // Dump full request headers on first request per session.
+        // AVPlayer's HLS pipeline may send capability headers
+        // (Accept, Range, X-Playback-Session-Id) that influence its
+        // variant-filter decisions. Server returning a response that
+        // doesn't honour expected headers can trigger silent
+        // variant rejection without errorLog events.
+        stateLock.lock()
+        let dumpHeaders = !loggedRequestHeaders
+        if dumpHeaders { loggedRequestHeaders = true }
+        stateLock.unlock()
+        if dumpHeaders {
+            let allLines = text.components(separatedBy: "\r\n")
+            let headers = allLines.dropFirst().prefix(while: { !$0.isEmpty }).joined(separator: " | ")
+            EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer)
+        }
 
         switch normalizedPath {
         case "/master.m3u8":
@@ -628,8 +644,12 @@ final class HLSLocalServer: @unchecked Sendable {
             if firstTime { loggedMediaPlaylist = true }
             stateLock.unlock()
             if firstTime {
-                let head = body.split(separator: "\n").prefix(8).joined(separator: "\n")
+                let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
+                let head = lines.prefix(8).joined(separator: "\n")
+                let tail = lines.suffix(6).joined(separator: "\n")
                 EngineLog.emit("[HLSLocalServer] media.m3u8 head:\n\(head)",
+                               category: .hlsServer)
+                EngineLog.emit("[HLSLocalServer] media.m3u8 tail:\n\(tail)",
                                category: .hlsServer)
             }
             return send200(fd: fd, path: normalizedPath,

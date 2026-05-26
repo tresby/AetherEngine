@@ -228,6 +228,40 @@ final class NativeAVPlayerHost {
                 } else {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog dump: <nil>", category: .engine)
                 }
+                // Item-level state diagnostics. For HLS assets `asset.tracks`
+                // is documented empty, but `item.tracks` may contain the
+                // AVPlayerItemTrack array AVPlayer constructed from the
+                // playlist alone (before init.mp4 parse). presentationSize,
+                // seekableTimeRanges, and currentMediaSelection reveal
+                // what AVPlayer DID manage to extract from the playlist
+                // versus what it couldn't.
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks count=\(item.tracks.count)", category: .engine)
+                for (idx, itrack) in item.tracks.enumerated() {
+                    let mediaType = itrack.assetTrack?.mediaType.rawValue ?? "?"
+                    let fdesc = itrack.assetTrack?.formatDescriptions.first
+                    let fourCC: String
+                    if let cm = fdesc {
+                        // swiftlint:disable:next force_cast
+                        let cmDesc = cm as! CMFormatDescription
+                        let code = CMFormatDescriptionGetMediaSubType(cmDesc)
+                        let b: [UInt8] = [
+                            UInt8((code >> 24) & 0xff),
+                            UInt8((code >> 16) & 0xff),
+                            UInt8((code >> 8) & 0xff),
+                            UInt8(code & 0xff),
+                        ]
+                        fourCC = String(bytes: b.map { ($0 >= 0x20 && $0 < 0x7f) ? $0 : 0x2e }, encoding: .ascii) ?? "????"
+                    } else {
+                        fourCC = "<no fdesc>"
+                    }
+                    EngineLog.emit("[NativeAVPlayerHost] #\(sid)   item.tracks[\(idx)] mediaType=\(mediaType) fourCC=\(fourCC) enabled=\(itrack.isEnabled)", category: .engine)
+                }
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.presentationSize=\(item.presentationSize)", category: .engine)
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.seekableTimeRanges.count=\(item.seekableTimeRanges.count)", category: .engine)
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.loadedTimeRanges.count=\(item.loadedTimeRanges.count)", category: .engine)
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.canPlayFastForward=\(item.canPlayFastForward) canPlayFastReverse=\(item.canPlayFastReverse) canStepForward=\(item.canStepForward)", category: .engine)
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.duration=\(item.duration.seconds.isFinite ? String(format: "%.2f", item.duration.seconds) : "indef")", category: .engine)
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.appliesPerFrameHDRDisplayMetadata=\(item.appliesPerFrameHDRDisplayMetadata)", category: .engine)
             } else if item.status == .readyToPlay {
                 // For HLS sources `asset.tracks` returns empty
                 // synchronously — the tracks live on AVPlayerItem
