@@ -250,14 +250,15 @@ Sources/AetherEngine/
 ## aetherctl
 
 A standalone macOS CLI is shipped alongside the library for repro
-work without going through TestFlight + Apple TV. Three subcommands,
+work without going through TestFlight + Apple TV. Four subcommands,
 all operating on a media source URL (`file://` or `http(s)://`):
 
 ```bash
-swift run aetherctl probe <url>     # dump container + streams + duration, exit
-swift run aetherctl serve <url>     # park the engine's loopback HLS-fMP4 server
-swift run aetherctl validate <url>  # serve + run mediastreamvalidator, exit
-swift run aetherctl <url>           # alias for serve (backwards compat)
+swift run aetherctl probe <url>          # dump container + streams + duration, exit
+swift run aetherctl serve <url>          # park the engine's loopback HLS-fMP4 server
+swift run aetherctl validate <url>       # serve + run mediastreamvalidator, exit
+swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
+swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
 `probe` opens the demuxer, prints the codec / resolution / frame rate
@@ -280,6 +281,26 @@ open 'http://127.0.0.1:<port>/master.m3u8'   # macOS QuickTime
 `validate` is the same plus an inline `xcrun mediastreamvalidator`
 run against the loopback manifest, with the report printed and the
 engine torn down on completion.
+
+`swdecode` opens `SoftwareVideoDecoder` for the source's video stream,
+feeds up to N packets (default 100, override with `--frames N`),
+and reports counters plus first-frame metadata (pixel format,
+dimensions). Tests the SW-pipeline decode path end-to-end without
+needing a render layer. Useful for legacy codecs (MPEG-4 Part 2,
+MPEG-2, VC-1) and AV1 / VP9 on platforms where the native AVPlayer
+path doesn't accept them. Verdict distinguishes between three
+failure modes:
+
+- decoder open failed (FFmpegBuild gate or malformed extradata)
+- decoder opened but no frames produced (pixel-format conversion,
+  no IDR in window)
+- SW decode end-to-end healthy (if real playback still hangs, the
+  failure is downstream in `SoftwarePlaybackHost` frame-enqueue,
+  display-layer attach, or audio-clock sync)
+
+Backed by the public `AetherEngine.swDecodeProbe(url:maxPackets:options:)`
+static API returning `SoftwareDecodeProbeResult`. Hosts can use the
+same probe in their own diagnostic overlays.
 
 For repeatable runs, `Scripts/fetch-fixtures.sh` generates a small
 set of synthetic FFmpeg test clips in `./Fixtures/` (H.264 SDR,
