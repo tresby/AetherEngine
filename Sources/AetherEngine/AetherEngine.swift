@@ -1002,20 +1002,22 @@ public final class AetherEngine: ObservableObject {
             }
             .store(in: &nativeCancellables)
 
-        // appliesPerFrameHDRDisplayMetadata is only useful when AVPlayer
-        // can actually engage the HDR pipeline, which means the master
-        // playlist routed through. On the media-playlist path (panel
-        // locked SDR + match off) AVPlayer falls back to plain HEVC
-        // playback with display-side tone-mapping, and the per-frame
-        // HDR metadata pipeline has been observed accumulating memory
-        // at ~3 MB/sec on long DV 8.1 sessions (OOM after ~8 min on
-        // Apple TV). Skipping it for media-playlist sessions removes
-        // the suspected leak without affecting the HDR / DV mode where
-        // the metadata is meaningful.
-        let perFrameHDR = session.servingMasterPlaylist
+        // appliesPerFrameHDRDisplayMetadata = true unconditionally.
+        // The earlier `session.servingMasterPlaylist` gating was a
+        // speculative memory-leak mitigation (~3 MB/sec RSS growth on
+        // long DV 8.1 sessions, never measurement-validated). DrHurt #4
+        // 2026-05-26 correctly flagged that DV Profile 5 is pure DV with
+        // no HDR10 base layer — the per-frame DV RPU is what AVPlayer's
+        // tone-mapper needs to render anything at all on a non-DV panel
+        // routed via the media playlist (`dv5OnSdrLockedNonDVPanel`
+        // path). Setting the flag to false on that path was breaking
+        // P5 playback entirely. Apple's default for the property is
+        // also true (so setting it true explicitly is a no-op against
+        // an unset property anyway; we keep the explicit write so
+        // diagnostics surface the live value).
         host.load(url: playbackURL,
                   startPosition: startPosition,
-                  perFrameHDR: perFrameHDR)
+                  perFrameHDR: true)
     }
 
     /// Open a `SoftwarePlaybackHost` against the source and wire its
