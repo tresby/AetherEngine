@@ -971,32 +971,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     let den = sampleRate * Int64(audioTb.num)
                     return max(1, num / den)
                 }()
-                // Apple HLS Authoring Spec: EAC3 with JOC (Atmos via
-                // DD+) should be advertised as `ec+3`, plain EAC3 5.1
-                // / 7.1 as `ec-3`. Profile 30 is libavformat's JOC
-                // marker on the source codecpar. Advertising plain
-                // `ec-3` for a JOC track means the dec3 box says
-                // Atmos but the playlist says plain DD+, which makes
-                // AVPlayer's downstream routing logic inconsistent
-                // (the field experiment was JOC playing fine on Sonos
-                // even with `ec-3`, but matching the spec is the
-                // correct posture for the cases where it matters).
+                // EAC3 audio CODECS string. Always `ec-3` per RFC 6381
+                // (the canonical IANA-registered identifier for E-AC-3).
+                // JOC (Atmos via DD+) signaling stays intact through
+                // the `dec3` box in the fMP4 segment, which carries
+                // the JOC marker AVPlayer's downstream pipeline reads;
+                // the playlist CODECS string never needed `ec+3` to
+                // preserve Atmos passthrough.
                 //
-                // iOS exception: iOS AVPlayer strictly enforces
-                // RFC 6381 codec strings and silently drops the
-                // variant when the audio codec is anything other
-                // than `ec-3` — `ec+3` makes `asset.load(tracks)`
-                // return 0 and the item fails with `Cannot Open`
-                // (`AVFoundationErrorDomain -11848` / underlying
-                // `CoreMediaErrorDomain -15517`). JOC stays intact
-                // because the dec3 box still carries the marker;
-                // only the playlist string changes.
+                // The `ec+3` variant was previously emitted on macOS /
+                // tvOS for JOC sources based on an older (incorrect)
+                // reading of Apple's HLS Authoring Spec. iOS AVPlayer
+                // strictly enforced RFC 6381 and silently dropped any
+                // variant with `ec+3`, producing the diagnostic
+                // signature `AVFoundationErrorDomain -11848 /
+                // CoreMediaErrorDomain -15517 / errorLog 0 events`.
+                // tvOS 26.5 now enforces the same strictness (Vincent
+                // test 2026-05-26: DV5+Atmos source served as master
+                // with `CODECS="dvh1.05.06,ec+3"` got rejected with
+                // exactly that error pair on a non-DV HDR10 panel;
+                // same source via media playlist played cleanly).
+                // Real-world streaming services (Apple TV+, Netflix,
+                // Disney+) all ship `ec-3` for both JOC and non-JOC
+                // EAC3 tracks; Atmos clients read `dec3` to upgrade.
                 let isJOC = compat == .eac3 && acp.profile == 30
-                #if os(iOS)
                 audioHLSCodecs = compat.hlsCodecsString
-                #else
-                audioHLSCodecs = isJOC ? "ec+3" : compat.hlsCodecsString
-                #endif
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
                     + "\(isJOC ? "[JOC=Atmos] " : "")"
