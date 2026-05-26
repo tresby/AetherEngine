@@ -249,7 +249,6 @@ final class MP4SegmentMuxer {
         sessionDir: URL,
         video: VideoConfig,
         audio: AudioConfig?,
-        targetSegmentDurationSeconds: Double,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -377,7 +376,6 @@ final class MP4SegmentMuxer {
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
         av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov", 0)
-        _ = targetSegmentDurationSeconds  // currently unused — frag_custom drives cuts
 
         let ret = avformat_write_header(ctx, &opts)
         guard ret >= 0 else {

@@ -572,7 +572,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
-                targetSegmentDurationSeconds: targetSegmentDurationSeconds,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if !self.initCaptured {

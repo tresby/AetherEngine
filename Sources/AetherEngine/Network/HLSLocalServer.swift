@@ -5,16 +5,11 @@ import Foundation
 
 /// Source of HLS segment bytes for `HLSLocalServer`.
 ///
-/// Two production implementations exist:
-///   - `BufferedSegmentProvider` (built into `HLSLocalServer`) for the
-///     live audio passthrough case where segments are pushed in via
-///     `setInitSegment` / `addMediaSegment` and held in memory until
-///     the session ends.
-///   - The video path's lazy on-demand provider (Phase 4) that
-///     synthesises each segment when AVPlayer fetches it, never
-///     holding more than one or two in memory at a time. Necessary
-///     because a 2h 4K video at 6 s / 10 MB segments would otherwise
-///     require ~120 GB of resident memory.
+/// The production implementation is the video path's lazy on-demand
+/// provider that synthesises each segment when AVPlayer fetches it,
+/// never holding more than one or two in memory at a time. Necessary
+/// because a 2h 4K video at 6 s / 10 MB segments would otherwise
+/// require ~120 GB of resident memory.
 protocol HLSSegmentProvider: AnyObject {
     /// Init segment bytes (`ftyp` + empty `moov`). Returns nil when
     /// the muxer hasn't produced one yet (live-audio bring-up).
@@ -28,10 +23,10 @@ protocol HLSSegmentProvider: AnyObject {
 
     /// File URL for media segment `index` when the segment is backed
     /// by a real file on disk (the cache adopt path). Returns nil for
-    /// providers that hold segments only in memory (BufferedSegmentProvider
-    /// audio path) or when the segment isn't yet available. Lets the
-    /// server bypass Foundation's `Data(contentsOf:)` entirely and
-    /// stream the file straight to the socket via `sendfile(2)`.
+    /// providers that hold segments only in memory or when the segment
+    /// isn't yet available. Lets the server bypass Foundation's
+    /// `Data(contentsOf:)` entirely and stream the file straight to
+    /// the socket via `sendfile(2)`.
     func mediaSegmentURL(at index: Int) -> URL?
 
     /// Number of segments currently known. May grow over time for
@@ -91,10 +86,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// should be built against: visible segment count, refresh
     /// counter (for the byte-level "playlist changed" signal), and
     /// whether the playlist should declare itself complete with
-    /// `#EXT-X-ENDLIST`. The video provider uses this to advance a
-    /// sliding-window EVENT playlist; the audio provider's default
-    /// implementation reports its current state without any side
-    /// effect.
+    /// `#EXT-X-ENDLIST`. Used by the video provider to advance a
+    /// sliding-window EVENT playlist.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
 }
 
@@ -180,16 +173,12 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Provider
 
-    /// External provider, set via `init(provider:)`. Mutually
-    /// exclusive with `bufferedProvider`.
+    /// Provider set via `init(provider:)`. Held weakly; the producer
+    /// owns its own lifetime and the server outlives it on teardown.
     private weak var externalProvider: HLSSegmentProvider?
-    /// Built-in buffered provider for the legacy audio path. Lives
-    /// behind `setInitSegment` / `addMediaSegment`. Nil when an
-    /// external provider is supplied.
-    private var bufferedProvider: BufferedSegmentProvider?
 
     private var provider: HLSSegmentProvider? {
-        externalProvider ?? bufferedProvider
+        externalProvider
     }
 
     // MARK: - Public state
@@ -314,24 +303,18 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Init
 
-    init() {
-        self.bufferedProvider = BufferedSegmentProvider()
-        self.subResourceBaseURL = nil
-    }
-
     /// Base URL for sub-resource URLs (init.mp4 / segXX.mp4) in the
     /// generated playlist. When set to e.g. `aether-engine://engine/`,
     /// the playlist emits absolute custom-scheme URLs that AVPlayer
     /// routes through the AVAssetResourceLoader delegate, bypassing
     /// CFNetwork entirely for the heavy segment payloads. When nil,
     /// the playlist emits relative URLs (`init.mp4`, `seg0.mp4`) which
-    /// AVPlayer resolves against the playlist's own URL — used by the
+    /// AVPlayer resolves against the playlist's own URL, used by the
     /// `aetherctl` CLI workflow where everything goes over HTTP.
     private let subResourceBaseURL: URL?
 
     init(provider: HLSSegmentProvider, subResourceBaseURL: URL? = nil) {
         self.externalProvider = provider
-        self.bufferedProvider = nil
         self.subResourceBaseURL = subResourceBaseURL
     }
 
@@ -418,7 +401,6 @@ final class HLSLocalServer: @unchecked Sendable {
         loggedMediaPlaylist = false
         let clients = clientFds
         clientFds.removeAll()
-        bufferedProvider?.clear()
         seg0FetchTime = nil
         stateLock.unlock()
 
@@ -430,16 +412,6 @@ final class HLSLocalServer: @unchecked Sendable {
         for fd in clients {
             close(fd)
         }
-    }
-
-    // MARK: - Buffered-provider passthrough (legacy audio API)
-
-    func setInitSegment(_ data: Data) {
-        bufferedProvider?.setInitSegment(data)
-    }
-
-    func addMediaSegment(_ data: Data, duration: Double) {
-        bufferedProvider?.addMediaSegment(data, duration: duration)
     }
 
     // MARK: - Accept loop
@@ -1037,63 +1009,3 @@ enum HLSLocalServerError: Error, CustomStringConvertible {
     }
 }
 
-// MARK: - Buffered Segment Provider (for the legacy audio path)
-
-/// In-memory provider that backs the `HLSLocalServer` when no
-/// external provider is supplied. The audio engine's segments are
-/// small (~16 KB at 0.5 s each) so holding them all in memory is
-/// fine for the duration of a session. The video path uses a
-/// different (lazy) provider that never holds more than one or two
-/// segments at a time.
-private final class BufferedSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
-    private let lock = NSLock()
-    private var initData: Data?
-    private var segments: [Data] = []
-    private var perSegmentDuration: Double = 2.048
-
-    func setInitSegment(_ data: Data) {
-        lock.lock()
-        initData = data
-        lock.unlock()
-    }
-
-    func addMediaSegment(_ data: Data, duration: Double) {
-        lock.lock()
-        segments.append(data)
-        perSegmentDuration = duration
-        lock.unlock()
-    }
-
-    func clear() {
-        lock.lock()
-        initData = nil
-        segments.removeAll()
-        lock.unlock()
-    }
-
-    func initSegment() -> Data? {
-        lock.lock()
-        defer { lock.unlock() }
-        return initData
-    }
-
-    func mediaSegment(at index: Int) -> Data? {
-        lock.lock()
-        defer { lock.unlock() }
-        return (index >= 0 && index < segments.count) ? segments[index] : nil
-    }
-
-    var segmentCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return segments.count
-    }
-
-    func segmentDuration(at index: Int) -> Double {
-        lock.lock()
-        defer { lock.unlock() }
-        return perSegmentDuration
-    }
-
-    var playlistType: HLSPlaylistType { .event }
-}
