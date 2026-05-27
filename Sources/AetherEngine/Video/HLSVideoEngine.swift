@@ -2294,10 +2294,31 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         // producer relocates to where AVPlayer is actually fetching.
         // Tolerance of 2 matches the empty-cache branch's heuristic
         // for "near the producer's launch point, just wait."
+        //
+        // Pruned-gap guard: the cache once held `index` but
+        // `pruneOutsideWindow` evicted it (typical case: AVPlayer
+        // jumped past `index` on a forward skip so the producer
+        // wrote it but AVPlayer never fetched it, then a back-scrub
+        // re-centred the window and the next slide pruned `index`
+        // out from under us). `indexRange()` reports only currently-
+        // resident entries — once the high end is pruned, the
+        // range-based branch sees `r.1 < index <= r.1 + window`,
+        // hits the else-clause, and concludes "producer is about
+        // to write this; backpressure-wait." But the producer is
+        // already past `index` and won't backfill without a restart.
+        // `highestStoredIndex` is monotonic across prunes so it
+        // remembers the producer's true high-water and catches the
+        // case. Concrete repro: 110-segment episode, AVPlayer jumped
+        // 8→12, then back-scrubbed to 0, then played seg-0..seg-10
+        // from cache (seg-11..seg-24 pruned by the seg-0 declareTarget),
+        // requested seg-11, hit the else-branch, waited 30 s, and
+        // 404'd because the current producer was past seg-24.
         let range = cache.indexRange()
+        let highWater = cache.highestStoredIndex
         let staleBelowProducer = index < lastRestartIndex - 2
+        let producerPassedAndPruned = highWater > index
         let needsRestart: Bool
-        if staleBelowProducer {
+        if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
         } else if let r = range {
             if index < r.0 {

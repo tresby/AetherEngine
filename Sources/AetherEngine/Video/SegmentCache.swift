@@ -75,6 +75,17 @@ final class SegmentCache {
     /// have to stat every file in the session directory on each tick.
     private var _totalBytes: Int = 0
 
+    /// Highest segment index ever written into this cache, monotonic
+    /// over the session. Updated by `store` and `adopt`, NOT
+    /// decremented by `pruneOutsideWindow` — its purpose is to
+    /// remember "the producer once wrote this far" after eviction
+    /// has erased that signal from `indexRange()`. Used by
+    /// `VideoSegmentProvider` to recognise gaps below the producer's
+    /// write head and force a restart instead of waiting for a
+    /// segment the current producer will never backfill. Reset by
+    /// `close()`.
+    private var _highestStoredIndex: Int = -1
+
     /// (10, 20)=30 entries. At 4K HDR HEVC segment sizes (~10 MB/seg)
     /// this holds ~300 MB on disk: 10 forward, 20 backward. The
     /// asymmetric weighting toward backward is intentional. The
@@ -169,6 +180,7 @@ final class SegmentCache {
             }
             entries[index] = fileURL
             _totalBytes += data.count
+            if index > _highestStoredIndex { _highestStoredIndex = index }
         }
         pruneOutsideWindow()
         condition.broadcast()
@@ -211,6 +223,7 @@ final class SegmentCache {
             }
             entries[index] = fileURL
             _totalBytes += byteCount
+            if index > _highestStoredIndex { _highestStoredIndex = index }
         }
         pruneOutsideWindow()
         condition.broadcast()
@@ -223,6 +236,7 @@ final class SegmentCache {
         entries.removeAll(keepingCapacity: false)
         initSegment = nil
         _totalBytes = 0
+        _highestStoredIndex = -1
         condition.broadcast()
         condition.unlock()
 
@@ -353,6 +367,20 @@ final class SegmentCache {
         guard !entries.isEmpty else { return nil }
         let keys = entries.keys
         return (keys.min()!, keys.max()!)
+    }
+
+    /// Highest absolute segment index ever stored by the producer
+    /// during this session, monotonic across pruning. Returns -1
+    /// before the producer's first store. `indexRange()` reports
+    /// only currently-resident entries and loses this signal once
+    /// `pruneOutsideWindow` evicts the high end of the window; the
+    /// restart-decision logic needs the "did the producer ever write
+    /// past `index`?" question answered to detect prune-created gaps
+    /// that no amount of waiting will backfill.
+    var highestStoredIndex: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _highestStoredIndex
     }
 
     var count: Int {
