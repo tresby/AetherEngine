@@ -42,6 +42,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Dolby Atmos | EAC3+JOC stream-copied through the HLS-fMP4 wrapper, played back by AVPlayer with Dolby MAT 2.0 unwrap downstream. TrueHD-MAT object metadata is not preserved through the bridge in either mode (FFmpeg's EAC3 encoder doesn't produce JOC, which is the Dolby-licensed Atmos-in-EAC3 extension).        |
 | Surround    | 5.1 / 7.1 with correct `AudioChannelLayout` preserved through the wrapper                                                   |
 | Subtitles   | SubRip / ASS / SSA / WebVTT / mov_text streamed inline; PGS / HDMV PGS / DVB / DVD rendered as `CGImage` with normalised position; sidecar `.srt` / `.ass` / `.vtt` URLs decoded via short-lived context |
+| Frames      | Still-image extraction off-playback via `FrameExtractor`: `thumbnail` (nearest keyframe, downscaled, fast, for scrub previews / Recents) and `snapshot` (frame-accurate, full resolution, for user stills), both as `CGImage`. Isolated FFmpeg decode context, bounded LRU cache, idle-close lifecycle |
 | Seek        | Producer teardown + restart for backward / far-forward scrubs; short-range forward scrubs ride the cached segment window    |
 | Streaming   | HTTP Range + chunked delegate reads via `URLSession`                                                                        |
 | Live        | Scaffold-level: `LoadOptions.isLive` opts the session in; engine publishes `@Published var isLive` for hosts, ignores `seek()`. H.264 / HEVC inside MPEG-TS routes through the native AVPlayer pipeline; MPEG-2 / MPEG-4 / VC-1 / VP8 / VP9 inside MPEG-TS routes through the SW pipeline. Sliding-window segment eviction for unbounded sessions is not yet implemented (long native-path sessions will accumulate cached segments) |
@@ -105,6 +106,14 @@ player.clearSubtitle()
 player.$subtitleCues                           // [SubtitleCue], body is .text(String) or .image(SubtitleImage)
 player.$isSubtitleActive                       // host mirror gate
 player.$isLoadingSubtitles                     // sidecar fetch + decode in progress
+
+// Still frames, off-playback (scrub preview, snapshot, Recents thumbnail)
+let frames = player.makeFrameExtractor()           // for the currently loaded URL, or nil
+// or, for an arbitrary item: FrameExtractor(url:httpHeaders:)
+await frames?.prewarm()                            // open the decode context ahead of a scrub
+let thumb = await frames?.thumbnail(at: 612.0)     // nearest keyframe, downscaled (maxWidth: 320)
+let still = await frames?.snapshot(at: 612.0)      // frame-accurate, full resolution
+await frames?.shutdown()                           // prompt teardown (else idle-closes after 10 s)
 ```
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
@@ -242,6 +251,28 @@ A single packet that carries multiple rects (PGS often emits signs/songs at the 
 
 The host stays in charge of the actual paint: text styling, overlay layout, fade transitions, position scaling against the on-screen video rect.
 
+## Frame extraction
+
+`FrameExtractor` produces still `CGImage`s from a media URL through an FFmpeg decode context that is fully isolated from playback. It never touches the playback pipeline, the HLS loopback server, or the engine's shared state, so a scrub-preview decode can't perturb the frame on screen. Two modes share one decode core:
+
+- **`thumbnail(at:maxWidth:)`**: seeks to the nearest keyframe, no forward decode, downscaled to `maxWidth` (default 320). Cheap and fast; built for scrub previews and Recents lists.
+- **`snapshot(at:maxSize:)`**: decodes forward to the exact PTS, full or `maxSize`-clamped resolution. Built for user-triggered stills.
+
+```swift
+// For the currently-playing item:
+let frames = engine.makeFrameExtractor()           // nil if nothing is loaded
+
+// For an arbitrary item (e.g. a Recents row), construct directly:
+let frames = FrameExtractor(url: url, httpHeaders: headers)
+
+await frames.prewarm()                             // optional: hide cold-start at gesture begin
+let preview = await frames.thumbnail(at: 612.0)    // CGImage?, nearest keyframe
+let still   = await frames.snapshot(at: 612.0)     // CGImage?, frame-accurate
+await frames.shutdown()                            // prompt teardown of the decode context
+```
+
+`FrameExtractor` is an `actor`. Blocking FFmpeg work runs on a dedicated serial queue, never on the cooperative thread pool. The decode context opens lazily on first use; a superseded request (the common case during an active scrub) cancels the in-flight decode so the latest position wins. Results land in a bounded LRU cache (snapshots and thumbnails kept in separate stores, thumbnails bucketed by second). After 10 s idle the context closes and the cache drops automatically; the next request reopens lazily. `shutdown()` is the explicit, permanent teardown: it awaits release of the FFmpeg demuxer / codec / sws resources and refuses further work. The engine does not retain the extractor returned by `makeFrameExtractor()`; the caller owns its lifecycle.
+
 ## Architecture
 
 ```
@@ -269,6 +300,12 @@ Sources/AetherEngine/
 ├── Display/
 │   ├── DisplayCriteriaController.swift      AVDisplayManager content-rate / dynamic-range hints (native path)
 │   └── FrameRateSnap.swift                  Snap to standard rates (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
+├── FrameExtractor/
+│   ├── AetherEngine+FrameExtractor.swift    makeFrameExtractor() convenience for the currently loaded URL
+│   ├── FrameExtractor.swift                 Off-playback still extraction actor: serial decode queue, cancel-supersede, idle-close
+│   ├── FrameDecodeContext.swift             Isolated FFmpeg demux + decode + sws_scale → CGImage (thumbnail / snapshot)
+│   ├── FrameCache.swift                     Bounded LRU: mode-isolated stores, second-bucketed thumbnails
+│   └── FrameTypes.swift                     FrameMode (.thumbnail / .snapshot)
 ├── Native/
 │   ├── NativeAVPlayerHost.swift             Native path: AVPlayer host bound to the loopback HLS-fMP4 URL
 │   └── SoftwarePlaybackHost.swift           SW path: demux loop + decoders + renderer + synchronizer orchestration
@@ -299,7 +336,7 @@ Sources/AetherEngine/
 ## aetherctl
 
 A standalone macOS CLI is shipped alongside the library for repro
-work without going through TestFlight + Apple TV. Four subcommands,
+work without going through TestFlight + Apple TV. Five subcommands,
 all operating on a media source URL (`file://` or `http(s)://`):
 
 ```bash
@@ -307,6 +344,7 @@ swift run aetherctl probe <url>          # dump container + streams + duration, 
 swift run aetherctl serve <url>          # park the engine's loopback HLS-fMP4 server
 swift run aetherctl validate <url>       # serve + run mediastreamvalidator, exit
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
+swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
@@ -350,6 +388,21 @@ failure modes:
 Backed by the public `AetherEngine.swDecodeProbe(url:maxPackets:options:)`
 static API returning `SoftwareDecodeProbeResult`. Hosts can use the
 same probe in their own diagnostic overlays.
+
+`extract` opens a `FrameExtractor` against the source and pulls a
+still frame. Thumbnail mode (default) snaps to the nearest keyframe
+and downscales to `--width` (default 320); `--snapshot` decodes
+frame-accurately at full resolution. `--at <sec>` sets the seek
+position (default 60.0). The first frame is written to
+`/tmp/aetherctl-extract-<mode>.png`. `--loops N` repeats the
+extraction across eight cycling positions, which pairs with
+`leaks --atExit` to validate the decode-context teardown is clean:
+
+```bash
+swift run aetherctl extract --at 612 --snapshot <url>          # frame-accurate still
+swift run aetherctl extract --width 480 <url>                  # keyframe thumbnail
+leaks --atExit -- .build/debug/aetherctl extract --loops 8 <url>   # leak sweep
+```
 
 For repeatable runs, `Scripts/fetch-fixtures.sh` generates a small
 set of synthetic FFmpeg test clips in `./Fixtures/` (H.264 SDR,
