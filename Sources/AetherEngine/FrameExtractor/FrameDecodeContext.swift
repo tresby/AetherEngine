@@ -68,7 +68,7 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     private func openInternal() throws {
         let demuxer = Demuxer()
-        try demuxer.open(url: url, extraHeaders: httpHeaders)
+        try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction)
         self.demuxer = demuxer
 
         let videoIdx = demuxer.videoStreamIndex
@@ -104,6 +104,15 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+
+        // Still extraction never needs deblocked output or full-rate decode
+        // quality; skip the loop filter and enable the fast/inaccurate decode
+        // path to cut per-frame CPU on big HEVC/AV1 keyframes.
+        // AV_CODEC_FLAG2_FAST is a C #define (1 << 0) and does not bridge
+        // directly to Swift, so we define it locally.
+        let AV_CODEC_FLAG2_FAST_VALUE: Int32 = 1 << 0
+        ctx.pointee.skip_loop_filter = AVDISCARD_ALL
+        ctx.pointee.flags2 |= AV_CODEC_FLAG2_FAST_VALUE
 
         var opts: OpaquePointer?
         // Software decode is actually forced by the get_format callback
@@ -144,6 +153,11 @@ final class FrameDecodeContext: @unchecked Sendable {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
 
         avcodec_flush_buffers(ctx)
+
+        // thumbnail wants only the seeked-to keyframe; snapshot must decode
+        // forward through non-key frames to reach the exact PTS.
+        ctx.pointee.skip_frame = (mode == .thumbnail) ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT
+
         demuxer.seek(to: seconds)
 
         guard timeBase.num > 0 else { return nil }
