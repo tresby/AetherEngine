@@ -12,6 +12,14 @@ the public-API contract.
 
 _Nothing yet._
 
+## [2.1.2] — 2026-06-01
+
+Playback fix. Head-of-stream A/V sync. No public API change, existing 2.1.x callers are unaffected.
+
+- **Audio no longer leads video at file start.** On a fresh play (`baseIndex 0`) the producer snapped the first audio packet onto the video's `tfdt` (desired 0), which subtracted the audio track's intrinsic start offset from every audio packet. On sources whose first full audio frame lands well past video frame 0 (Cars: EAC3 first frame at +256 ms) this pulled the whole audio track that far ahead of the picture for the entire session (reported as a 256 ms A/V offset in the stats overlay). Head-of-stream now derives the audio shift from the video's origin shift, so both streams undergo one shared transform and their true source-time relationship is preserved by construction. Resume and scrub sessions were unaffected and keep the existing gate-on-video snap.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/2.1.2))
+
 ## [2.1.1] — 2026-05-31
 
 `FrameExtractor` quality pass. Internal only, no public API change, existing 2.1.0 callers are unaffected.
