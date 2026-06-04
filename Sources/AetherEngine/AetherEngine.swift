@@ -1265,7 +1265,9 @@ public final class AetherEngine: ObservableObject {
     // MARK: - Transport
 
     public func play() {
-        if let host = softwareHost {
+        if let host = audioHost {
+            host.play()
+        } else if let host = softwareHost {
             host.play()
         } else {
             nativeHost?.play()
@@ -1276,7 +1278,9 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
-        if let host = softwareHost {
+        if let host = audioHost {
+            host.pause()
+        } else if let host = softwareHost {
             host.pause()
         } else {
             nativeHost?.pause()
@@ -1304,7 +1308,11 @@ public final class AetherEngine: ObservableObject {
         // has no AVPlayer and no competing transport owner, so its `state`
         // is authoritative.
         let isPlaying: Bool
-        if softwareHost != nil {
+        if audioHost != nil {
+            // Audio host has no competing transport owner, so `state` is
+            // authoritative (same reasoning as the software host).
+            isPlaying = (state == .playing)
+        } else if softwareHost != nil {
             isPlaying = (state == .playing)
         } else if let nativeHost {
             isPlaying = nativeHost.isEffectivelyPlaying
@@ -1335,7 +1343,9 @@ public final class AetherEngine: ObservableObject {
         }
         let target = max(0, min(seconds, duration))
         state = .seeking
-        if let host = softwareHost {
+        if let host = audioHost {
+            await host.seek(to: target)
+        } else if let host = softwareHost {
             await host.seek(to: target)
         } else {
             // Sliding-window EVENT playlist: ensure the seek target's
@@ -1407,8 +1417,9 @@ public final class AetherEngine: ObservableObject {
 
     /// Set playback volume (0.0 = mute, 1.0 = full).
     public var volume: Float {
-        get { softwareHost?.volume ?? nativeHost?.avPlayer.volume ?? 1.0 }
+        get { audioHost?.volume ?? softwareHost?.volume ?? nativeHost?.avPlayer.volume ?? 1.0 }
         set {
+            audioHost?.volume = newValue
             softwareHost?.volume = newValue
             nativeHost?.avPlayer.volume = newValue
         }
@@ -1419,7 +1430,9 @@ public final class AetherEngine: ObservableObject {
     /// rate goes through the synchronizer and audio plays at the
     /// changed rate without pitch correction.
     public func setRate(_ rate: Float) {
-        if let host = softwareHost {
+        if let host = audioHost {
+            host.setRate(rate)
+        } else if let host = softwareHost {
             host.setRate(rate)
         } else {
             nativeHost?.setRate(rate)
