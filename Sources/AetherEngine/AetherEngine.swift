@@ -1873,6 +1873,14 @@ public final class AetherEngine: ObservableObject {
         Int(Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
     }
 
+    /// Decide whether a load should use the audio-only path. Pure and
+    /// `nonisolated` so it is unit-testable without a `@MainActor`
+    /// engine instance. The audio path is taken when the host explicitly
+    /// requested it OR the probe found no video stream.
+    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, hasVideoStream: Bool) -> Bool {
+        audioOnlyRequested || !hasVideoStream
+    }
+
     /// - Parameter resetDisplayCriteria: When `true` (default), release
     ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
     ///   returns to its default mode. Used by `load()` and the public
