@@ -365,42 +365,57 @@ private func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
 /// decode -> AVSampleBufferAudioRenderer works end-to-end on macOS.
 private func runAudio(url: URL, seconds playSeconds: Double) -> Int32 {
     print("aetherctl audio: \(url.absoluteString) (play \(playSeconds)s)")
-    return runBlocking {
-        let engine: AetherEngine
-        do {
-            engine = try await MainActor.run { try AetherEngine() }
-        } catch {
-            print("engine init failed: \(error.localizedDescription)")
-            return Int32(1)
-        }
-        do {
-            try await engine.load(url: url, options: LoadOptions(audioOnly: true))
-        } catch {
-            print("load failed: \(error.localizedDescription)")
-            return Int32(1)
-        }
-        let backend = await MainActor.run { engine.playbackBackend }
-        let dur = await MainActor.run { engine.duration }
-        print("backend=\(backend.rawValue) duration=\(String(format: "%.1f", dur))s")
-        guard backend == .audio else {
-            print("FAIL: expected backend .audio, got \(backend.rawValue)")
-            return Int32(1)
-        }
-        let ticks = max(1, Int(playSeconds))
-        for _ in 0..<ticks {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            let t = await MainActor.run { engine.currentTime }
-            print(String(format: "  t=%.2fs", t))
-        }
-        let finalTime = await MainActor.run { engine.currentTime }
-        await MainActor.run { engine.stop() }
-        if finalTime <= 0.5 {
-            print("FAIL: clock did not advance (t=\(finalTime)); decode or render path is silent")
-            return Int32(1)
-        }
-        print("OK: audio path advanced the clock to \(String(format: "%.2f", finalTime))s")
-        return Int32(0)
+    // AetherEngine is @MainActor, so it must be driven on the main thread
+    // under a live run loop, NOT through the main-thread-blocking
+    // `runBlocking` semaphore: that would deadlock the instant the engine
+    // needs the main actor (the main thread would be parked on the
+    // semaphore and could never service the MainActor executor). Running
+    // CFRunLoopRun keeps the main actor executor AND the
+    // Timer.publish(on: .main) clock mirror alive while the @MainActor
+    // task drives playback, then the task stops the run loop when done.
+    let box = UncheckedBox<Int32?>(nil)
+    Task { @MainActor in
+        box.value = await audioSmokeTest(url: url, seconds: playSeconds)
+        CFRunLoopStop(CFRunLoopGetMain())
     }
+    CFRunLoopRun()
+    return box.value ?? 1
+}
+
+@MainActor
+private func audioSmokeTest(url: URL, seconds playSeconds: Double) async -> Int32 {
+    let engine: AetherEngine
+    do {
+        engine = try AetherEngine()
+    } catch {
+        print("engine init failed: \(error.localizedDescription)")
+        return 1
+    }
+    do {
+        try await engine.load(url: url, options: LoadOptions(audioOnly: true))
+    } catch {
+        print("load failed: \(error.localizedDescription)")
+        return 1
+    }
+    let backend = engine.playbackBackend
+    print("backend=\(backend.rawValue) duration=\(String(format: "%.1f", engine.duration))s")
+    guard backend == .audio else {
+        print("FAIL: expected backend .audio, got \(backend.rawValue)")
+        return 1
+    }
+    let ticks = max(1, Int(playSeconds))
+    for _ in 0..<ticks {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        print(String(format: "  t=%.2fs", engine.currentTime))
+    }
+    let finalTime = engine.currentTime
+    engine.stop()
+    if finalTime <= 0.5 {
+        print("FAIL: clock did not advance (t=\(finalTime)); decode or render path is silent")
+        return 1
+    }
+    print("OK: audio path advanced the clock to \(String(format: "%.2f", finalTime))s")
+    return 0
 }
 
 // MARK: - extract
