@@ -47,6 +47,7 @@ private func printUsage() {
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
+      aetherctl audio <url>
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -104,6 +105,13 @@ private func printUsage() {
                 frame-accurately at full resolution. Use --loops N
                 with `leaks --atExit` to detect memory leaks.
                 Writes the first frame to /tmp/aetherctl-extract-<mode>.png.
+
+      audio     Load a source through the engine's audio-only path
+                (LoadOptions.audioOnly=true), play for ~10 seconds,
+                print the synchronizer clock once a second, and report
+                OK if the clock advanced or FAIL if it stayed silent.
+                Smoke-tests the FFmpeg decode -> AVSampleBufferAudioRenderer
+                pipeline end-to-end on macOS without a display layer.
     """)
 }
 
@@ -350,6 +358,51 @@ private func runSWDecode(url: URL, maxPackets: Int) -> Int32 {
     return 0
 }
 
+// MARK: - audio
+
+/// Load a source through the engine's audio-only path and play it,
+/// printing the synchronizer clock once a second. Confirms FFmpeg
+/// decode -> AVSampleBufferAudioRenderer works end-to-end on macOS.
+private func runAudio(url: URL, seconds playSeconds: Double) -> Int32 {
+    print("aetherctl audio: \(url.absoluteString) (play \(playSeconds)s)")
+    return runBlocking {
+        let engine: AetherEngine
+        do {
+            engine = try await MainActor.run { try AetherEngine() }
+        } catch {
+            print("engine init failed: \(error.localizedDescription)")
+            return Int32(1)
+        }
+        do {
+            try await engine.load(url: url, options: LoadOptions(audioOnly: true))
+        } catch {
+            print("load failed: \(error.localizedDescription)")
+            return Int32(1)
+        }
+        let backend = await MainActor.run { engine.playbackBackend }
+        let dur = await MainActor.run { engine.duration }
+        print("backend=\(backend.rawValue) duration=\(String(format: "%.1f", dur))s")
+        guard backend == .audio else {
+            print("FAIL: expected backend .audio, got \(backend.rawValue)")
+            return Int32(1)
+        }
+        let ticks = max(1, Int(playSeconds))
+        for _ in 0..<ticks {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let t = await MainActor.run { engine.currentTime }
+            print(String(format: "  t=%.2fs", t))
+        }
+        let finalTime = await MainActor.run { engine.currentTime }
+        await MainActor.run { engine.stop() }
+        if finalTime <= 0.5 {
+            print("FAIL: clock did not advance (t=\(finalTime)); decode or render path is silent")
+            return Int32(1)
+        }
+        print("OK: audio path advanced the clock to \(String(format: "%.2f", finalTime))s")
+        return Int32(0)
+    }
+}
+
 // MARK: - extract
 
 /// Drive an async actor call to completion from the synchronous CLI.
@@ -475,7 +528,7 @@ private func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double
 }
 
 // Subcommand path: explicit subcommand + flags + url.
-if ["probe", "serve", "validate", "swdecode", "extract"].contains(first) {
+if ["probe", "serve", "validate", "swdecode", "extract", "audio"].contains(first) {
     var rest = Array(args.dropFirst(2))
     let noDV = takeFlag("--no-dv", from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
@@ -508,6 +561,8 @@ if ["probe", "serve", "validate", "swdecode", "extract"].contains(first) {
             loops: extractLoops,
             maxWidth: extractWidth
         ))
+    case "audio":
+        exit(runAudio(url: url, seconds: 10))
     default:
         printUsage()
         exit(64)
