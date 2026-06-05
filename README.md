@@ -5,9 +5,9 @@
 <h1 align="center">AetherEngine</h1>
 
 <p align="center">
-  <b>A video player engine for Apple platforms.</b><br>
+  <b>A media player engine for Apple platforms.</b><br>
   FFmpeg demuxes. VideoToolbox decodes. AVPlayer handles Dolby Atmos.<br>
-  You ship the UI.
+  Video, or a lean audio-only path with system Now-Playing. You ship the UI.
 </p>
 
 <p align="center">
@@ -45,6 +45,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Audio       | AAC, AC3, EAC3, FLAC, MP2, MP3, Opus, Vorbis, TrueHD, MLP, DTS, DTS-HD MA, ALAC, PCM. Codecs that stream-copy into fMP4 (AAC, AC3, EAC3, FLAC, ALAC) pass through losslessly. Non-streamable codecs route through `AudioBridge` in one of two modes (`AudioBridgeMode`): `.surroundCompat` (default, EAC3 at 128 kbps per channel — 256 kbps stereo, 768 kbps 5.1 — lossy but surround works on every modern soundbar via the bitstream tunnel) or `.lossless` (FLAC up to 7.1, lossless, needs an AVR that accepts multichannel LPCM over HDMI). |
 | Dolby Atmos | EAC3+JOC stream-copied through the HLS-fMP4 wrapper, played back by AVPlayer with Dolby MAT 2.0 unwrap downstream. TrueHD-MAT object metadata is not preserved through the bridge in either mode (FFmpeg's EAC3 encoder doesn't produce JOC, which is the Dolby-licensed Atmos-in-EAC3 extension).        |
 | Surround    | 5.1 / 7.1 with correct `AudioChannelLayout` preserved through the wrapper                                                   |
+| Audio-only  | `LoadOptions.audioOnly` routes a source into a lean audio pipeline (no loopback server, no display layer, no video producer). Native-first: whitelisted codecs hand the URL straight to a bare `AVPlayer`, the rest decode through FFmpeg into `AVSampleBufferAudioRenderer`. Persistent per-player `MPNowPlayingSession` on tvOS / iOS keeps the system Now-Playing overlay live across a background pause |
 | Subtitles   | SubRip / ASS / SSA / WebVTT / mov_text streamed inline; PGS / HDMV PGS / DVB / DVD rendered as `CGImage` with normalised position; sidecar `.srt` / `.ass` / `.vtt` URLs decoded via short-lived context |
 | Frames      | Still-image extraction off-playback via `FrameExtractor`: `thumbnail` (nearest keyframe, downscaled, fast, for scrub previews / Recents) and `snapshot` (frame-accurate, full resolution, for user stills), both as `CGImage`. Isolated FFmpeg decode context, bounded LRU cache, idle-close lifecycle |
 | Seek        | Producer teardown + restart for backward / far-forward scrubs; short-range forward scrubs ride the cached segment window    |
@@ -79,6 +80,10 @@ try await player.load(
     )
 )
 try await player.reloadAtCurrentPosition()  // background reopen, preserves options
+try await player.load(
+    url: trackURL,
+    options: .init(audioOnly: true)         // lean audio path, system Now-Playing (tvOS / iOS)
+)
 
 player.play()
 player.pause()
@@ -187,7 +192,7 @@ until the panel reaches the target mode or 5 s timeout, then
 
 ## Playback pipeline
 
-AetherEngine has two playback pipelines, picked once at `load(url:)` based on the source's video codec:
+AetherEngine has three playback pipelines, picked once at `load(url:)`: the audio-only path when `LoadOptions.audioOnly` is set, otherwise the native or software video path based on the source's video codec:
 
 **Native AVPlayer pipeline (default).** Demux the source with libavformat, re-mux the elementary streams on the fly into HLS-fMP4, serve them from a local HTTP server on `127.0.0.1:<port>`, point `AVPlayer` at the playlist. Apple's stack does all decode, all HDR / Dolby Vision signaling over HDMI, all audio routing. This is the path for HEVC and H.264, which is what AVPlayer's HLS-fMP4 pipeline reliably accepts. Atmos passthrough, DV HDMI handshake, HDR10 / HDR10+ system-side tone-mapping all live on this path.
 
@@ -216,6 +221,16 @@ Source URL ──► Demuxer ──┬─► SoftwareVideoDecoder (dav1d) ──
 ```
 
 AV1+DV (Profile 10.0 / 10.1 / 10.4) routes through the native path on hardware-AV1 hosts via the `dav1` / `av01` track type plus the source's `dvvC` box. AV1+Atmos is genuinely rare in the wild (mastering still runs in HEVC overwhelmingly), so the SW pipeline's lack of Atmos passthrough is a theoretical limitation rather than a real one. The dispatch happens once at load time; hosts see a unified `@Published` state surface either way.
+
+**Audio-only pipeline (music, podcasts, audiobooks).** When the host sets `LoadOptions.audioOnly`, the engine skips the video machinery entirely: no HLS loopback server, no segment producer, no display layer. Decode is native-first. Codecs on the `avPlayerCanDecodeAudio` whitelist hand the source URL straight to a bare `AVPlayer` (`AudioAVPlayerHost`); everything else demuxes through libavformat and decodes through libavcodec into an `AVSampleBufferAudioRenderer` (`AudioPlaybackHost`). Transport (`play` / `pause` / `seek`) routes to the active host, and `stopInternal` tears it down for a clean handoff back to the video path on the next load.
+
+```
+audioOnly == true
+   ├─ whitelisted codec ──► AVPlayer (AudioAVPlayerHost) ──► AVR / speakers
+   └─ otherwise          ──► Demuxer ──► AudioDecoder ──► AVSampleBufferAudioRenderer ──► AVR / speakers
+```
+
+On tvOS and iOS the AVPlayer audio host owns a persistent per-player `MPNowPlayingSession` (exposed via `audioNowPlayingSession`) so the system Now-Playing overlay stays bound to the app across a background pause, auto-publishes now-playing info from the player, and carries `externalMetadata`. The host survives across tracks and does not pause when the app backgrounds. All of this is gated `#if os(tvOS) || os(iOS)`; on macOS the path compiles and plays without the system session (a macOS host drives Now-Playing through the shared centers itself).
 
 Why HLS-fMP4 for the native path instead of feeding `AVPlayer` the source URL directly: AVPlayer's progressive-download path won't accept arbitrary MKV containers, and even for MP4 sources it's brittle around Dolby Vision sample-description quirks and EAC3 `dec3` box variants. The HLS-fMP4 wrapper is the most permissive surface AVPlayer exposes; libavformat's `hls` muxer produces bytes byte-identical to `ffmpeg -f hls -hls_segment_type fmp4`, which is what Apple's HLS spec is defined against.
 
