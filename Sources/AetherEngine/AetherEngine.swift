@@ -1300,6 +1300,9 @@ public final class AetherEngine: ObservableObject {
         let host = AudioAVPlayerHost()
         self.audioAVPlayerHost = host
         self.playlistShiftSeconds = 0
+        // Apply any metadata the host app pre-staged so the new AVPlayerItem
+        // carries it (the session auto-publishes it to Now-Playing).
+        host.setExternalMetadata(pendingExternalMetadata)
 
         audioNativeCancellables.removeAll()
         host.$currentTime
@@ -1536,6 +1539,7 @@ public final class AetherEngine: ObservableObject {
     public func setExternalMetadata(_ items: [AVMetadataItem]) {
         pendingExternalMetadata = items
         nativeHost?.setExternalMetadata(items)
+        audioAVPlayerHost?.setExternalMetadata(items)
     }
 
     /// Set playback volume (0.0 = mute, 1.0 = full).

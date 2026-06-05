@@ -2,6 +2,9 @@ import Foundation
 import AVFoundation
 import Combine
 import MediaPlayer
+#if canImport(AVKit)
+import AVKit
+#endif
 
 /// Native audio-only playback host: hands the source URL directly to an
 /// AVPlayer (no HLS, no loopback, no display layer). Used for audio whose
@@ -66,11 +69,25 @@ final class AudioAVPlayerHost {
     /// reaches readyToPlay, then cleared.
     private var pendingSeek: Double?
 
+    /// Now-playing metadata (title / artist / album / artwork as
+    /// AVMetadataItems) applied to each loaded AVPlayerItem's
+    /// externalMetadata. With the session's automaticallyPublishesNowPlaying-
+    /// Info, this is how the metadata reaches the system Now-Playing surface.
+    private var pendingExternalMetadata: [AVMetadataItem] = []
+
     // MARK: - Init
 
     init() {
         #if os(tvOS) || os(iOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
+        // Let the session derive playback state (play/pause), elapsed time,
+        // and duration DIRECTLY from the AVPlayer. This is the piece that
+        // makes the system know the real play/pause state, so the Siri
+        // Remote play/pause button and the system Now-Playing UI work
+        // WITHOUT the private set-playback-state entitlement. Title / artist
+        // / artwork are supplied separately via the AVPlayerItem's
+        // externalMetadata (set by the host app per track).
+        nowPlayingSession.automaticallyPublishesNowPlayingInfo = true
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
@@ -89,6 +106,12 @@ final class AudioAVPlayerHost {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
         let item = AVPlayerItem(asset: asset)
+        // AVPlayerItem.externalMetadata is unavailable on macOS (the package
+        // builds there for tests/aetherctl). Music now-playing is a device
+        // concern anyway.
+        #if !os(macOS)
+        item.externalMetadata = pendingExternalMetadata
+        #endif
         playerItem = item
 
         failureMessage = nil
@@ -209,6 +232,16 @@ final class AudioAVPlayerHost {
     }
 
     // MARK: - Transport
+
+    /// Set the now-playing metadata applied to the current and subsequent
+    /// AVPlayerItems' `externalMetadata`. The session's auto-publishing then
+    /// surfaces it to the system Now-Playing UI.
+    func setExternalMetadata(_ items: [AVMetadataItem]) {
+        pendingExternalMetadata = items
+        #if !os(macOS)
+        playerItem?.externalMetadata = items
+        #endif
+    }
 
     func play() {
         avPlayer.play()
