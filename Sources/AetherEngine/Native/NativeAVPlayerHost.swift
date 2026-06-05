@@ -280,6 +280,12 @@ final class NativeAVPlayerHost {
                 // count after the route renegotiates against the
                 // loaded asset.
                 Self.dumpPlayerItemTracks(item, sid: sid)
+                // Re-assert the multichannel audio session against the
+                // now-live route BEFORE dumping it, so the dump reflects
+                // the post-reassert capability. Fixes 5.1 EAC3 / AC3
+                // downmix-to-stereo when tvOS "Continuous Audio
+                // Connection" is off (issue #24).
+                Self.reassertMultichannelAudioSession(item, sid: sid)
                 Self.dumpAudioRoute(sid: sid)
                 Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
                 Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
@@ -793,6 +799,80 @@ final class NativeAVPlayerHost {
             + "passthrough.",
             category: .session
         )
+        #endif
+    }
+
+    /// Re-assert the multichannel audio session against the now-live
+    /// playback route once an asset with a > 2-channel audio track
+    /// reaches readyToPlay.
+    ///
+    /// The engine configures the session exactly once, at process init
+    /// (`AetherEngine.init`). The engine is a process-wide singleton
+    /// created at app launch, so when tvOS "Continuous Audio
+    /// Connection" is disabled the HDMI audio link is in its idle
+    /// stereo-PCM state at that moment: `maximumOutputNumberOfChannels`
+    /// reads 2, the `setPreferredOutputNumberOfChannels` multichannel
+    /// hint is skipped, and the session activates against a stereo
+    /// route. With continuous-audio on the link reports 32 at launch,
+    /// the hint lands, and passthrough works — which is why the bug is
+    /// invisible in that mode (issue #24).
+    ///
+    /// Direct-play AVPlayer apps avoid this because they activate their
+    /// session per playback, so the route negotiates against the live
+    /// multichannel asset. We replicate that here: at readyToPlay the
+    /// asset's `dec3` / `dac3` is parsed and AVPlayer knows the track
+    /// is 5.1 / 7.1, so a deactivate / reactivate cycle forces the
+    /// route to renegotiate off the stereo idle state and the fresh
+    /// `maximumOutputNumberOfChannels` lets the multichannel hint land.
+    ///
+    /// Gated on a > 2-channel audio track so the stereo path and the
+    /// Atmos path (EAC3 + JOC reports 2 channels over its MAT carrier,
+    /// `ch=2` is the correct passthrough state) are left untouched. The
+    /// before / after channel counts are logged so a device run can
+    /// confirm the route actually woke from 2 to the source count.
+    private static func reassertMultichannelAudioSession(_ item: AVPlayerItem, sid: Int) {
+        #if os(iOS) || os(tvOS)
+        var trackChannels: Int = 0
+        for itemTrack in item.tracks {
+            guard let assetTrack = itemTrack.assetTrack else { continue }
+            guard assetTrack.mediaType == .audio else { continue }
+            guard let fmt = assetTrack.formatDescriptions.first else { continue }
+            let cm = fmt as! CMFormatDescription
+            if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(cm) {
+                trackChannels = max(trackChannels, Int(asbdPtr.pointee.mChannelsPerFrame))
+            }
+        }
+        guard trackChannels > 2 else { return }
+
+        let session = AVAudioSession.sharedInstance()
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) audioReassert BEFORE track=\(trackChannels)ch "
+            + "max=\(session.maximumOutputNumberOfChannels) out=\(session.outputNumberOfChannels) "
+            + "pref=\(session.preferredOutputNumberOfChannels)",
+            category: .engine)
+        do {
+            try session.setSupportsMultichannelContent(true)
+            // Deactivate / reactivate so the HDMI route renegotiates
+            // against the loaded multichannel asset rather than the
+            // stereo idle route latched at process launch. The player is
+            // ready but not yet playing at this point, so the cycle is
+            // inaudible.
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            try session.setActive(true)
+            let maxCh = session.maximumOutputNumberOfChannels
+            if maxCh > 2 {
+                try session.setPreferredOutputNumberOfChannels(maxCh)
+            }
+        } catch {
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) audioReassert error: \(error)",
+                category: .engine)
+        }
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) audioReassert AFTER "
+            + "max=\(session.maximumOutputNumberOfChannels) out=\(session.outputNumberOfChannels) "
+            + "pref=\(session.preferredOutputNumberOfChannels)",
+            category: .engine)
         #endif
     }
 
