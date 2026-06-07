@@ -410,11 +410,12 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
     }
 
     func makeIndependentReader() -> IOReader? {
-        // A file source supports independent cursors: a fresh handle over the
-        // same path. forwardOnly is preserved so a forward-only clone still
-        // refuses seeks. (In-memory clones also fall back to a file-backed
-        // reader here, which is fine since the test files exist on disk.)
-        return try? FileHandleIOReader(path: path, inMemory: false, forwardOnly: forwardOnly)
+        // A forward-only source cannot serve a second cursor (the concurrent
+        // features seek the clone), so report no clone, matching a real
+        // forward-only reader. A seekable file source clones to a fresh handle
+        // over the same path with an independent cursor.
+        if forwardOnly { return nil }
+        return try? FileHandleIOReader(path: path, inMemory: false, forwardOnly: false)
     }
 
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {

@@ -2052,9 +2052,11 @@ public final class AetherEngine: ObservableObject {
     /// re-seeks on `engine.seek` so scrubs surface cues at the new
     /// position immediately.
     public func selectSubtitleTrack(index: Int) {
+        guard let url = loadedURL else { return }
         // Embedded-subtitle selection runs a side demuxer concurrently with
         // playback. For custom sources the side demuxer needs an independent
-        // second cursor; if the reader cannot clone, no-op.
+        // second cursor; if the reader cannot clone, no-op. Mint the clone
+        // after the loadedURL guard so it is never leaked on an early return.
         var customClone: IOReader? = nil
         if isCustomSource {
             guard let clone = customReader?.makeIndependentReader() else { return }
@@ -2063,8 +2065,6 @@ public final class AetherEngine: ObservableObject {
         cancelSidecarTask()
         embeddedSubtitleTask?.cancel()
         embeddedSubtitleTask = nil
-
-        guard let url = loadedURL else { return }
 
         isSubtitleActive = true
         subtitleCues = []
