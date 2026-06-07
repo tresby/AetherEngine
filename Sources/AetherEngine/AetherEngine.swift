@@ -781,12 +781,11 @@ public final class AetherEngine: ObservableObject {
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
             probedDefaultAudioIndex = probe.audioStreamIndex
-            // probe.close() deferred: ownership transfers to
-            // `loadNative` (native dispatch) which hands it to
-            // HLSVideoEngine for reuse, or we close it explicitly in
-            // the software dispatch branch below since SW path opens
-            // its own Demuxer. On the error path probe was never
-            // opened, so close is a no-op.
+            // probe.close() deferred: ownership transfers to `loadNative`
+            // (native dispatch) or `loadSoftware` (software dispatch). Both
+            // adopt the probe demuxer for reuse, or open fresh only if the
+            // probe failed. On the error path probe was never opened, so
+            // close is a no-op.
         } catch {
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
         }
@@ -967,12 +966,9 @@ public final class AetherEngine: ObservableObject {
 
         do {
             if useSoftwarePath {
-                // SW path opens its own Demuxer inside
-                // SoftwarePlaybackHost.load — no reuse here. Close the
-                // probe so it doesn't linger as a parallel open
-                // AVFormatContext + AVIOReader for the entire SW
-                // playback session.
-                if probeOpened { probe.close() }
+                // SW path now REUSES the probe demuxer (single open). Do not
+                // close it here; loadSoftware adopts it (or opens fresh only
+                // if the probe failed). One open AVFormatContext total.
                 // A native->native reload may have preserved the previous
                 // AVPlayer host (issue #15), but this source routes to the
                 // software path. Release it now: the SW pipeline renders
@@ -987,7 +983,8 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
-                    audioSourceStreamIndex: audioSourceStreamIndex
+                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    preopenedDemuxer: probeOpened ? probe : nil
                 )
                 playbackBackend = .software
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -1265,7 +1262,8 @@ public final class AetherEngine: ObservableObject {
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
         startPosition: Double?,
-        audioSourceStreamIndex: Int32?
+        audioSourceStreamIndex: Int32?,
+        preopenedDemuxer: Demuxer?
     ) async throws {
         activateRendererAudioSession()
         let host = SoftwarePlaybackHost()
@@ -1309,14 +1307,22 @@ public final class AetherEngine: ObservableObject {
             }
             .store(in: &softwareCancellables)
 
-        // Detach the host's load (its body is synchronous despite the
-        // `async` signature — a @MainActor caller awaiting it doesn't
-        // yield to the runloop). Mirrors the same pattern applied to
-        // the probe and to `session.start()`.
-        try await Task.detached(priority: .userInitiated) { [host] in
+        // Reuse the probe demuxer when present (no second avformat_open_input;
+        // also what makes forward-only sources work here, no seek(0) reopen).
+        // Fall back to a fresh open only when the probe failed to open.
+        // The (possibly blocking) open stays detached so the @MainActor
+        // runloop keeps ticking, matching the probe / session.start pattern.
+        try await Task.detached(priority: .userInitiated) {
+            [host, preopenedDemuxer, url, sourceHTTPHeaders] in
+            let dem: Demuxer
+            if let pre = preopenedDemuxer {
+                dem = pre
+            } else {
+                dem = Demuxer()
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
+            }
             try await host.load(
-                url: url,
-                sourceHTTPHeaders: sourceHTTPHeaders,
+                demuxer: dem,
                 startPosition: startPosition,
                 audioSourceStreamIndex: audioSourceStreamIndex
             )
@@ -1794,7 +1800,8 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
                     startPosition: resumeAt > 1 ? resumeAt : nil,
-                    audioSourceStreamIndex: audioStreamIndex
+                    audioSourceStreamIndex: audioStreamIndex,
+                    preopenedDemuxer: nil
                 )
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .software
