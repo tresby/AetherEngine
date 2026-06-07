@@ -152,6 +152,17 @@ public final class AetherEngine: ObservableObject {
     /// state into the next VOD load.
     @Published public private(set) var isLive: Bool = false
 
+    /// Largest session-relative time reached on a live source (seconds since
+    /// first frame). Meaningful only while `isLive`. 0 otherwise.
+    @Published public private(set) var liveEdgeTime: Double = 0
+    /// DVR-seekable span on the session timeline, or nil when DVR is disabled
+    /// or the source is not live.
+    @Published public private(set) var seekableLiveRange: ClosedRange<Double>? = nil
+    /// True when playback is at / near the live edge.
+    @Published public private(set) var isAtLiveEdge: Bool = false
+    /// Seconds the playhead trails the live edge. 0 at the edge.
+    @Published public private(set) var behindLiveSeconds: Double = 0
+
     // MARK: - Output
 
     /// How the AVPlayer surface fills its container layer. Mirrors
@@ -315,6 +326,12 @@ public final class AetherEngine: ObservableObject {
     /// holds a weak reference back to the engine so its retained task
     /// can't keep `self` alive past teardown.
     private var liveTelemetrySampler: LiveTelemetrySampler?
+
+    /// DVR window tracker for live sources. Non-nil while a live session with
+    /// `dvrWindowSeconds != nil` is active. Managed by the live producer path
+    /// (not yet wired in this revision); the published surfaces above reflect
+    /// its state once that path lands.
+    private var liveWindow: LiveWindow?
 
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
@@ -1726,6 +1743,13 @@ public final class AetherEngine: ObservableObject {
     @available(*, deprecated, renamed: "seek(to:)")
     public func seek(toSourceTime seconds: Double) async {
         await seek(to: seconds)
+    }
+
+    /// Seek to the current live edge. No-op when not live. (Full effect once the
+    /// live producer + DVR seek land later; harmless stub until then.)
+    public func seekToLiveEdge() async {
+        guard isLive, let w = liveWindow else { return }
+        await seek(to: w.edgeTime)
     }
 
     public func stop() {
