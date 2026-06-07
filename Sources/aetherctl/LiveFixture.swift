@@ -114,6 +114,36 @@ final class LiveFixture: @unchecked Sendable {
     /// Size of the one-shot forward jump, in 90 kHz ticks. +1000 s default
     /// (1000 * 90000), well beyond the discontinuity-detection threshold.
     var discontinuityJumpTicks: Int64 = 1000 * 90_000
+
+    /// When true, the serve loop releases bytes at roughly the source's
+    /// natural rate (~1 wall-clock second of media per wall-clock second)
+    /// instead of as fast as the socket drains. This matches a genuine 1x
+    /// live broadcast: the producer / AVPlayer cannot race ahead of real
+    /// time, so the live-edge / behind-live dynamics reflect a real feed.
+    ///
+    /// Pacing is coarse by design: the serve loop tracks how many media
+    /// seconds it has emitted (derived from `loopPeriodTicks`, the 90 kHz
+    /// span the seed covers per loop, plus an intra-loop fraction by packet
+    /// index) and sleeps whenever the emitted media-time gets more than
+    /// `pacingLeadSeconds` ahead of the wall clock. It holds the long-run
+    /// average rate at 1x; it does not attempt per-packet PCR precision.
+    /// Default false: non-paced behaviour is unchanged.
+    var paced = false
+    /// How far ahead of the wall clock the emitter is allowed to run before
+    /// it sleeps. A small lead keeps a startup burst (so the engine can fill
+    /// its initial buffer) without letting the producer race minutes ahead.
+    var pacingLeadSeconds: Double = 2.0
+    /// Media seconds served as fast as the socket drains BEFORE the 1x gate
+    /// engages. A real client joining a live channel already has a DVR
+    /// back-buffer and several published segments to start from; without a
+    /// preroll the producer cannot finalize its first segment before
+    /// AVPlayer's initial-buffering stall timer (1.5 * EXT-X-TARGETDURATION)
+    /// fires, and playback dies with CoreMedia -12888 at the very first
+    /// frame. The preroll lets the producer establish a normal live window,
+    /// after which pacing clamps the feed to 1x so the behind-live / edge
+    /// dynamics reflect a genuine real-time broadcast. 30 s comfortably
+    /// covers a 60 s DVR window's worth of startup plus AVPlayer warm-up.
+    var pacingPrerollSeconds: Double = 30.0
     /// Latched true (by a timer scheduled at connection start) once the
     /// discontinuity window has elapsed, so the serve loop starts adding
     /// `discontinuityJumpTicks` to every subsequent packet. A timer-driven
@@ -398,13 +428,58 @@ final class LiveFixture: @unchecked Sendable {
         // each iteration, so the serve loop allocates nothing steady-state.
         var scratch = [UInt8](repeating: 0, count: LiveFixture.tsPacketSize)
 
+        // Real-time pacing state. `loopPeriodSeconds` is the media duration the
+        // seed covers per loop pass (the 90 kHz span / 90000). `serveStart` is
+        // this connection's wall-clock zero. Each packet, we estimate how many
+        // media seconds have been emitted (whole loops + intra-loop fraction by
+        // packet index) and, if paced, sleep until the wall clock catches up to
+        // within `pacingLeadSeconds`.
+        let loopPeriodSeconds = Double(loopPeriodTicks) / 90_000.0
+        let packetsPerLoop = max(1, seedPackets.count)
+        // Wall-clock zero for the 1x gate. Set when the preroll window has been
+        // fully emitted (the preroll itself is served as fast as the socket
+        // drains), so pacing measures media-beyond-preroll against wall-time-
+        // since-preroll rather than against the burst.
+        var pacingClockStart: Date? = nil
+
         while true {
             stateLock.lock()
             let stopping = shouldStop
             stateLock.unlock()
             if stopping { return }
 
-            for packet in seedPackets {
+            for (packetIndex, packet) in seedPackets.enumerated() {
+                // Real-time gate: hold the average emit rate at ~1x. Sleep in
+                // coarse slices whenever the emitted media-time runs more than
+                // `pacingLeadSeconds` ahead of wall-clock elapsed. Coarse on
+                // purpose (no per-packet sleep): we only re-check + nap when the
+                // lead is exceeded, which keeps overhead negligible while still
+                // holding the long-run rate.
+                if paced {
+                    let emittedMedia = Double(loopIndex) * loopPeriodSeconds
+                        + (Double(packetIndex) / Double(packetsPerLoop)) * loopPeriodSeconds
+                    // Serve the preroll window unpaced so the producer can
+                    // establish a live window before the 1x clamp engages. Once
+                    // past it, gate media-beyond-preroll against wall-time-since-
+                    // preroll, holding the long-run rate at ~1x.
+                    if emittedMedia > pacingPrerollSeconds {
+                        if pacingClockStart == nil { pacingClockStart = Date() }
+                        let mediaPastPreroll = emittedMedia - pacingPrerollSeconds
+                        while paced {
+                            stateLock.lock()
+                            let stopNow = shouldStop
+                            stateLock.unlock()
+                            if stopNow { return }
+                            let wall = Date().timeIntervalSince(pacingClockStart!)
+                            let lead = mediaPastPreroll - wall
+                            if lead <= pacingLeadSeconds { break }
+                            // Nap off the excess lead (cap each nap so stop() is
+                            // honoured promptly), then re-evaluate.
+                            let nap = min(lead - pacingLeadSeconds, 0.25)
+                            usleep(useconds_t(max(0.005, nap) * 1_000_000))
+                        }
+                    }
+                }
                 // Poll the armed flag per packet (not just per seed-loop pass):
                 // the serve loop spends most of its time parked in a back-
                 // pressured `send` mid-pass, so an outer-loop-only check would

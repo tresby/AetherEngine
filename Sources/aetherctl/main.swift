@@ -84,7 +84,7 @@ private func printUsage() {
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl <url>             (alias for `serve`)
 
@@ -748,6 +748,139 @@ private func audioSmokeTest(url: URL, seconds playSeconds: Double) async -> Int3
     return 0
 }
 
+// MARK: - high-bitrate seed generation
+
+/// Ensure a high-bitrate (~22 Mbps) 1080p H.264 MPEG-TS seed exists at
+/// `path`, generating it with ffmpeg if absent. A realistic ~20+ Mbps video
+/// bitrate is what makes AVPlayer's retain-everything memory behaviour show
+/// up clearly in resident_size over a multi-minute run; the prior ~0.5 MB/s
+/// synthetic seed was far too small to reproduce it. H.264 routes through the
+/// NATIVE AVPlayer path, which is exactly what we want to stress for the
+/// B4-gating retention question. Returns true if the seed exists (or was
+/// generated) and looks like a non-trivial TS file; false on any failure.
+private func ensureHighBitrateSeed(path: String) -> Bool {
+    let fm = FileManager.default
+    if fm.fileExists(atPath: path) {
+        let size = (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+        // A real ~22 Mbps x 10 s clip is ~25 MB; anything tiny is suspect.
+        if size > 5_000_000 {
+            print("high-bitrate seed present: \(path) (\(size) bytes, \(String(format: "%.1f", Double(size) / 1_048_576.0)) MB)")
+            return true
+        }
+        print("high-bitrate seed at \(path) is only \(size) bytes; regenerating")
+    }
+
+    // Resolve an ffmpeg binary. Homebrew install path first, then PATH.
+    let ffmpegCandidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+    guard let ffmpeg = ffmpegCandidates.first(where: { fm.isExecutableFile(atPath: $0) }) else {
+        print("ERROR: ffmpeg not found on \(ffmpegCandidates). Install it (brew install ffmpeg) to generate the high-bitrate seed.")
+        return false
+    }
+
+    // Ensure the parent directory exists.
+    let dir = (path as NSString).deletingLastPathComponent
+    if !dir.isEmpty {
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+
+    print("generating high-bitrate seed via ffmpeg (\(ffmpeg)) -> \(path) ...")
+
+    // The seed is a CHEAP intro spliced in front of a HIGH-BITRATE body, both
+    // 1080p H.264 with a matching 5 s closed GOP (-g 150 at 30 fps). Why the
+    // two-stage shape:
+    //
+    //  - The live producer cuts a segment at the first keyframe >= its ~4 s
+    //    target, so a 5 s GOP yields clean 5 s segments and the served playlist
+    //    advertises an EXT-X-TARGETDURATION that matches them.
+    //  - At startup the producer's FIRST segment must be demuxed + remuxed +
+    //    published before AVPlayer's initial-buffering stall timer fires (the
+    //    manifest is empty / target=1 until then; AVPlayer demands an update
+    //    within 1.5 * target = ~1.5 s). A high-bitrate first segment is ~12-14 MB
+    //    and its remux exceeds that window on the loopback path, so AVPlayer
+    //    dies with CoreMedia -12888 ("Playlist File unchanged...") at the very
+    //    first frame, every time. A ~1.5 Mbps, 6 s intro makes seg-0 small
+    //    enough to publish well within the window, AVPlayer starts, and the
+    //    producer then races into the 22 Mbps body (it reads far faster than 1x
+    //    once AVPlayer is healthy and pulling).
+    //  - The 22 Mbps, 24 s body is the part that stresses AVPlayer retention:
+    //    firmly high-bitrate (~44x the old ~0.5 MB/s synthetic seed), so a
+    //    93%-retain leak over a multi-minute unpaced run is unmistakable in
+    //    resident_size. H.264 routes through the NATIVE AVPlayer path.
+    //
+    // The two TS files are byte-concatenated (raw MPEG-TS is concatenable; the
+    // demuxer absorbs the splice). LiveFixture loops the whole seed, so the
+    // cheap intro recurs once per ~30 s loop, which is harmless.
+    let tmp = NSTemporaryDirectory()
+    let introPath = (tmp as NSString).appendingPathComponent("aetherctl-seed-intro.ts")
+    let bodyPath  = (tmp as NSString).appendingPathComponent("aetherctl-seed-body.ts")
+
+    func runFFmpeg(_ args: [String], label: String) -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpeg)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch {
+            print("ERROR: failed to launch ffmpeg (\(label)): \(error.localizedDescription)")
+            return false
+        }
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            print("ERROR: ffmpeg (\(label)) exited \(proc.terminationStatus). Output tail:")
+            if let text = String(data: out, encoding: .utf8) { print(String(text.suffix(2000))) }
+            return false
+        }
+        return true
+    }
+
+    let introArgs = [
+        "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-c:v", "libx264", "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3M",
+        "-g", "150", "-keyint_min", "150", "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-muxrate", "2M", "-f", "mpegts", introPath, "-y"
+    ]
+    let bodyArgs = [
+        "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=24",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=24",
+        "-c:v", "libx264", "-b:v", "22M", "-maxrate", "22M", "-bufsize", "44M",
+        "-g", "150", "-keyint_min", "150", "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-muxrate", "24M", "-f", "mpegts", bodyPath, "-y"
+    ]
+    guard runFFmpeg(introArgs, label: "intro"), runFFmpeg(bodyArgs, label: "body") else {
+        return false
+    }
+
+    // Byte-concatenate intro + body into the seed.
+    guard let introData = try? Data(contentsOf: URL(fileURLWithPath: introPath)),
+          let bodyData  = try? Data(contentsOf: URL(fileURLWithPath: bodyPath)) else {
+        print("ERROR: could not read generated intro/body TS files")
+        return false
+    }
+    var combined = introData
+    combined.append(bodyData)
+    do {
+        try combined.write(to: URL(fileURLWithPath: path))
+    } catch {
+        print("ERROR: could not write combined seed to \(path): \(error.localizedDescription)")
+        return false
+    }
+    try? fm.removeItem(atPath: introPath)
+    try? fm.removeItem(atPath: bodyPath)
+
+    let size = (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+    guard size > 5_000_000 else {
+        print("ERROR: generated seed at \(path) is only \(size) bytes; ffmpeg may have failed silently.")
+        return false
+    }
+    print("generated high-bitrate seed: \(path) (\(size) bytes, \(String(format: "%.1f", Double(size) / 1_048_576.0)) MB; ~1.5 Mbps 6 s intro + 22 Mbps 24 s body)")
+    return true
+}
+
 // MARK: - live
 
 /// Start a `LiveFixture` (endless MPEG-TS over loopback), load it into a
@@ -767,7 +900,8 @@ private func runLive(
     rewindTest: Bool = false,
     forceSoftware: Bool = false,
     dropAfter: Double? = nil,
-    discontinuityAt: Double? = nil
+    discontinuityAt: Double? = nil,
+    realtime: Bool = false
 ) -> Int32 {
     EngineLog.handler = { print($0) }
 
@@ -798,6 +932,10 @@ private func runLive(
     }
     fixture.dropAfterSeconds = dropAfter
     fixture.discontinuityAfterSeconds = discontinuityAt
+    fixture.paced = realtime
+    if realtime {
+        print("aetherctl live: --realtime set, pacing fixture output at ~1x")
+    }
 
     let liveURL: URL
     do {
@@ -1039,10 +1177,32 @@ private func liveRewindTest(url: URL, seconds playSeconds: Double,
                  "\(engine.state)", "\(engine.isLive)", dvrWindow, engine.currentTime))
 
     // Warm up for ~40s so the DVR window has enough history to rewind into.
+    // Sample behindLiveSeconds every ~4s during this NORMAL playback phase and
+    // collect the series: on a 1x (--realtime) feed it should stay roughly
+    // stable and small, not the continuously-growing ~30-40s racing-ahead
+    // artifact a fast (unpaced) fixture produces.
     let warmup = max(playSeconds, 40.0)
-    for _ in 0..<Int(warmup) {
+    var normalBehindSamples: [Double] = []
+    print("  NORMAL_PLAYBACK behindLiveSeconds series (every ~4s, 1x feed):")
+    for i in 0..<Int(warmup) {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
+        if i % 4 == 0 || i == Int(warmup) - 1 {
+            let b = engine.behindLiveSeconds
+            normalBehindSamples.append(b)
+            print(String(format: "    +%2ds  t=%.2f  edge=%.2f  behind=%.2f",
+                         i + 1, engine.currentTime, engine.liveEdgeTime, b))
+        }
     }
+    // Stability of the normal-playback behind series: max - min over the
+    // samples taken after a short settle (skip the first sample, which can be
+    // mid warm-up). A 1x feed holds behind in a narrow band; a racing feed
+    // ramps it monotonically.
+    let settled = normalBehindSamples.count > 1 ? Array(normalBehindSamples.dropFirst()) : normalBehindSamples
+    let normalMin = settled.min() ?? 0
+    let normalMax = settled.max() ?? 0
+    let normalSpread = normalMax - normalMin
+    print(String(format: "  NORMAL_PLAYBACK behind: min=%.2f max=%.2f spread=%.2f (stable if spread small and max not ~30-40)",
+                 normalMin, normalMax, normalSpread))
     print(String(format: "  pre-rewind edge=%.2fs t=%.2fs behind=%.2fs range=%@",
                  engine.liveEdgeTime, engine.currentTime, engine.behindLiveSeconds,
                  engine.seekableLiveRange.map { "\($0.lowerBound)...\($0.upperBound)" } ?? "nil"))
@@ -1091,11 +1251,20 @@ private func liveRewindTest(url: URL, seconds playSeconds: Double,
 
     engine.stop()
 
-    if rewindPass && atEdge {
-        print("VERDICT: native DVR rewind+return OK")
+    // Normal-playback stability gate: on a 1x feed the behind series should sit
+    // in a narrow band well below the racing-ahead ~30-40s artifact. Generous
+    // bound: spread <= 15s and max < 30s. Informational, but folded into the
+    // PASS/FAIL so the "behind is stable at 1x" claim is checked, not asserted.
+    let normalStable = normalSpread <= 15.0 && normalMax < 30.0
+    print(String(format: "  NORMAL_STABLE: %@ (spread=%.2f max=%.2f)",
+                 normalStable ? "PASS" : "FAIL", normalSpread, normalMax))
+
+    if rewindPass && atEdge && normalStable {
+        print("VERDICT: native DVR rewind+return OK; behind stable at 1x")
         return 0
     }
-    print("VERDICT: native DVR rewind+return FAIL")
+    print(String(format: "VERDICT: native DVR rewind+return FAIL (rewind=%@ return=%@ normalStable=%@)",
+                 "\(rewindPass)", "\(atEdge)", "\(normalStable)"))
     return 1
 }
 
@@ -1621,6 +1790,17 @@ if first == "live" {
     // monotonically (simulating a program boundary). The engine must keep
     // playing and keep the session timeline monotonic.
     let discontinuityAt = takeDoubleFlag("--discontinuity-at", from: &rest)
+    // --realtime paces the fixture output at ~1x wall-clock so the producer /
+    // AVPlayer cannot race ahead of real time, matching a genuine live feed.
+    // Default (absent): serve as fast as the socket drains (today's behaviour).
+    let realtime = takeFlag("--realtime", from: &rest)
+    // --gen-highbitrate-seed: ensure a ~22 Mbps 1080p H.264 MPEG-TS seed exists
+    // in Fixtures/user/ (generating it with ffmpeg if absent) and exit. Used to
+    // prep the RSS-retention measurement seed. Honours --seed for the path.
+    if takeFlag("--gen-highbitrate-seed", from: &rest) {
+        let path = seed ?? "Fixtures/user/highbitrate-1080p.ts"
+        exit(ensureHighBitrateSeed(path: path) ? 0 : 1)
+    }
     // --sliding is accepted-and-ignored for backward compat: sliding is now
     // the unconditional behaviour for a live session, so the flag is a no-op.
     _ = takeFlag("--sliding", from: &rest)
@@ -1628,7 +1808,7 @@ if first == "live" {
                  serveOnly: serveOnly, measureRSS: measureRSS,
                  reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
-                 discontinuityAt: discontinuityAt))
+                 discontinuityAt: discontinuityAt, realtime: realtime))
 }
 
 // Subcommand path: explicit subcommand + flags + url.
