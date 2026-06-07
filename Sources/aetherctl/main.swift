@@ -84,7 +84,7 @@ private func printUsage() {
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw]
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -763,9 +763,19 @@ private func runLive(
     serveOnly: Bool,
     measureRSS: Bool,
     reportCacheBytes: Bool,
-    rewindTest: Bool = false
+    rewindTest: Bool = false,
+    forceSoftware: Bool = false
 ) -> Int32 {
     EngineLog.handler = { print($0) }
+
+    // TEST-ONLY: force the live source through SoftwarePlaybackHost so the
+    // H.264 fixture exercises the SW live + DVR path. Cleared on the way
+    // out so it never bleeds into a subsequent invocation in-process.
+    AetherEngine.setForceSoftwarePathForTesting(forceSoftware)
+    if forceSoftware {
+        print("aetherctl live: --sw set, forcing SoftwarePlaybackHost routing")
+    }
+    defer { AetherEngine.setForceSoftwarePathForTesting(false) }
 
     // Resolve the seed relative to the repo root (CWD under `swift run`).
     let resolvedSeed = seedPath ?? "Fixtures/user/h264-ts-sample.ts"
@@ -1166,12 +1176,17 @@ if first == "live" {
     let measureRSS = takeFlag("--measure-rss", from: &rest)
     let reportCacheBytes = takeFlag("--report-cache-bytes", from: &rest)
     let rewindTest = takeFlag("--rewind-test", from: &rest)
+    // --sw forces the live source through SoftwarePlaybackHost regardless
+    // of codec (TEST-ONLY routing override). Lets the H.264 fixture
+    // exercise the SW live + DVR path end-to-end.
+    let forceSW = takeFlag("--sw", from: &rest)
     // --sliding is accepted-and-ignored for backward compat: sliding is now
     // the unconditional behaviour for a live session, so the flag is a no-op.
     _ = takeFlag("--sliding", from: &rest)
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
                  serveOnly: serveOnly, measureRSS: measureRSS,
-                 reportCacheBytes: reportCacheBytes, rewindTest: rewindTest))
+                 reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
+                 forceSoftware: forceSW))
 }
 
 // Subcommand path: explicit subcommand + flags + url.

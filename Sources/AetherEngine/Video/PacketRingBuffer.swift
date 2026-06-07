@@ -27,6 +27,7 @@ final class PacketRingBuffer {
     struct Packet {
         let pts: Double
         let isKeyframe: Bool
+        let isVideo: Bool
         let bytes: Data
     }
 
@@ -35,6 +36,7 @@ final class PacketRingBuffer {
     private struct Entry {
         let pts: Double
         let isKeyframe: Bool
+        let isVideo: Bool
         let fileURL: URL
         let byteCount: Int
     }
@@ -95,12 +97,17 @@ final class PacketRingBuffer {
     /// - Parameters:
     ///   - pts: Presentation timestamp in seconds.
     ///   - isKeyframe: Whether this packet starts a decodable group.
+    ///     Only ever true for video keyframes; audio packets pass false.
+    ///   - isVideo: Whether the packet belongs to the video stream. The
+    ///     reseed path replays both video and audio, and a video
+    ///     non-keyframe is otherwise indistinguishable from an audio
+    ///     packet, so the stream identity is recorded here for routing.
     ///   - bytes: Raw compressed packet bytes.
-    func append(pts: Double, isKeyframe: Bool, bytes: Data) throws {
+    func append(pts: Double, isKeyframe: Bool, isVideo: Bool, bytes: Data) throws {
         // Write to disk outside the lock so we don't block readers.
         let fileURL = scratch.appendingPathComponent("pkt-\(nextCounter()).bin")
         try bytes.write(to: fileURL, options: [.atomic])
-        let entry = Entry(pts: pts, isKeyframe: isKeyframe, fileURL: fileURL, byteCount: bytes.count)
+        let entry = Entry(pts: pts, isKeyframe: isKeyframe, isVideo: isVideo, fileURL: fileURL, byteCount: bytes.count)
 
         lock.lock()
         defer {
@@ -133,7 +140,7 @@ final class PacketRingBuffer {
 
         return try slice.map { entry in
             let data = try Data(contentsOf: entry.fileURL, options: [.alwaysMapped, .uncached])
-            return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, bytes: data)
+            return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: data)
         }
     }
 
