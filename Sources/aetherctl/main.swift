@@ -28,6 +28,41 @@ import ImageIO
 import UniformTypeIdentifiers
 import AetherEngine
 
+// MARK: - RSS / footprint samplers (keeper for regression tracking)
+
+/// Physical footprint in bytes from task_vm_info. This is the
+/// jetsam-relevant metric on tvOS: it counts compressed + uncompressed
+/// memory the process actually occupies, unlike resident_size which
+/// can include kernel-shared pages. Returns -1 on failure.
+func physFootprintBytes() -> Int64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+    )
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? Int64(info.phys_footprint) : -1
+}
+
+/// Resident memory in bytes from mach_task_basic_info. Secondary
+/// metric: includes kernel-shared pages, so it's noisier than
+/// phys_footprint but historically what `ps RSS` reports.
+func residentBytes() -> Int64 {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<mach_task_basic_info>.size
+    ) / 4
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? Int64(info.resident_size) : -1
+}
+
 // Disable stdout buffering so `swift run aetherctl ... > log.txt` or
 // `2>&1 | grep` pipelines see engine prints in real time. Swift's
 // `print()` block-buffers when stdout isn't a tty, which masked the
@@ -49,7 +84,7 @@ private func printUsage() {
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--sliding]
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -124,6 +159,11 @@ private func printUsage() {
                 overrides the seed .ts (default
                 Fixtures/user/h264-ts-sample.ts). --dvr-window is parsed
                 but unused in this build (a later task wires it up).
+                --measure-rss prints phys_footprint + resident_size every
+                30 s (spike measurement harness, kept for regression
+                tracking). --sliding enables the throwaway
+                sliding-window prototype behind
+                HLSVideoEngine._liveSlidingPrototype.
     """)
 }
 
@@ -714,13 +754,27 @@ private func audioSmokeTest(url: URL, seconds playSeconds: Double) async -> Int3
 /// `dvrWindow` is parsed from `--dvr-window` but unused in this task:
 /// `LoadOptions` does not yet have a `dvrWindowSeconds` property (a later
 /// task adds it). Accepted now so the flag is stable.
-private func runLive(seconds playSeconds: Double, seed seedPath: String?, dvrWindow: Double?, serveOnly: Bool) -> Int32 {
+private func runLive(
+    seconds playSeconds: Double,
+    seed seedPath: String?,
+    dvrWindow: Double?,
+    serveOnly: Bool,
+    measureRSS: Bool,
+    sliding: Bool
+) -> Int32 {
     EngineLog.handler = { print($0) }
+
+    // Flip the throwaway prototype flag before building the engine.
+    if sliding {
+        HLSVideoEngine._liveSlidingPrototype = true
+        print("aetherctl live: sliding-window prototype ENABLED")
+    }
 
     // Resolve the seed relative to the repo root (CWD under `swift run`).
     let resolvedSeed = seedPath ?? "Fixtures/user/h264-ts-sample.ts"
     print("aetherctl live: seed=\(resolvedSeed) seconds=\(playSeconds)" +
-          (dvrWindow.map { " dvr-window=\($0) (parsed, unused this task)" } ?? ""))
+          (dvrWindow.map { " dvr-window=\($0) (parsed, unused this task)" } ?? "") +
+          (measureRSS ? " measure-rss=true" : ""))
 
     let fixture: LiveFixture
     do {
@@ -762,7 +816,7 @@ private func runLive(seconds playSeconds: Double, seed seedPath: String?, dvrWin
 
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds)
+        box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds, measureRSS: measureRSS)
         fixture.stop()
         CFRunLoopStop(CFRunLoopGetMain())
     }
@@ -771,7 +825,7 @@ private func runLive(seconds playSeconds: Double, seed seedPath: String?, dvrWin
 }
 
 @MainActor
-private func liveSmokeTest(url: URL, seconds playSeconds: Double) async -> Int32 {
+private func liveSmokeTest(url: URL, seconds playSeconds: Double, measureRSS: Bool = false) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -801,11 +855,30 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double) async -> Int32
     print(String(format: "  post-load state=%@ isLive=%@ t=%.2fs",
                  "\(engine.state)", "\(engine.isLive)", engine.currentTime))
 
+    if measureRSS {
+        print("RSS_HEADER: elapsed_s  phys_footprint_mb  resident_mb")
+    }
+
+    let startTime = Date()
+    var lastRSSTick: Double = 0
+
     let ticks = max(1, Int(playSeconds))
-    for _ in 0..<ticks {
+    for tick in 0..<ticks {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let elapsed = Date().timeIntervalSince(startTime)
         print(String(format: "  state=%@ isLive=%@ t=%.2fs",
                      "\(engine.state)", "\(engine.isLive)", engine.currentTime))
+        // Print RSS sample every 30 s when --measure-rss is set.
+        if measureRSS && (elapsed - lastRSSTick >= 30.0 || tick == ticks - 1) {
+            let phys = physFootprintBytes()
+            let res  = residentBytes()
+            let physMB = phys >= 0 ? Double(phys) / 1_048_576.0 : -1
+            let resMB  = res  >= 0 ? Double(res)  / 1_048_576.0 : -1
+            print(String(format: "RSS_SAMPLE: elapsed=%.0fs  phys=%.1fMB  resident=%.1fMB",
+                         elapsed, physMB, resMB))
+            lastRSSTick = elapsed
+        }
+        _ = tick // suppress unused-var warning
     }
 
     let finalState = engine.state
@@ -972,7 +1045,10 @@ if first == "live" {
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let seed = takeStringFlag("--seed", from: &rest)
     let serveOnly = takeFlag("--serve-only", from: &rest)
-    exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow, serveOnly: serveOnly))
+    let measureRSS = takeFlag("--measure-rss", from: &rest)
+    let sliding = takeFlag("--sliding", from: &rest)
+    exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
+                 serveOnly: serveOnly, measureRSS: measureRSS, sliding: sliding))
 }
 
 // Subcommand path: explicit subcommand + flags + url.

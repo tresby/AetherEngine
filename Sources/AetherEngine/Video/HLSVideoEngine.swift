@@ -361,6 +361,92 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// larger playlist footprint is negligible.
     private static let targetSegmentDuration: Double = 4.0
 
+    // MARK: - Measurement spike: sliding-window prototype flag
+    //
+    // SPIKE RESULT (2026-06-07, aetherctl on macOS, h264-ts-sample.ts,
+    // 300 s each run):
+    //
+    // Baseline (append-only EVENT, _liveSlidingPrototype=false):
+    //   elapsed   phys_footprint_mb   resident_mb
+    //      31s        3625.6              243.1
+    //      61s        7085.4              325.9
+    //      92s        7088.7               48.2
+    //     123s        7087.8               38.8
+    //     154s        7088.0               42.0
+    //     184s        7089.4               41.9
+    //     215s        7089.5               45.6
+    //     246s        7089.6               48.2
+    //     277s        7088.7               41.4
+    //     299s        7087.8               42.6
+    //   Last-half slope (154s-299s, 145s window):
+    //     phys: 7088.0->7087.8 = -0.08 MB/min (FLAT)
+    //     resident: 42.0->42.6 = +0.25 MB/min (noise)
+    //   VERDICT for baseline: FLAT after initial AVPlayer load spike.
+    //
+    // Prototype (sliding MEDIA-SEQUENCE, _liveSlidingPrototype=true):
+    //   elapsed   phys_footprint_mb   resident_mb
+    //      31s        4190.8              268.6
+    //      62s        8312.0              216.0
+    //      92s        8311.3               30.8
+    //     122s        8311.2               24.8
+    //     152s        8311.1               23.9
+    //     183s        8311.1               23.7
+    //     213s        8311.1               22.8
+    //     243s        8311.1               21.9
+    //     273s        8311.1               20.9
+    //     304s        8311.1               21.8
+    //   Last-half slope (152s-304s):
+    //     phys: 8311.1->8311.1 = 0.00 MB/min (FLAT)
+    //     resident: 23.9->21.8 = -0.83 MB/min (DECLINING - eviction working)
+    //   NOTE: AVPlayer stalled (state=paused at 81s). The sliding window
+    //   caused AVPlayer to lose its place when segments fell off the back.
+    //   The measurement is therefore of a stalled, not live-playing session.
+    //
+    // VERDICT: SLIDING BOUNDS FOOTPRINT: NO (on macOS with this fixture)
+    //
+    // Key findings:
+    //   1. Both configurations show FLAT phys_footprint after the initial
+    //      AVPlayer framework load (~90s). The "leak" from the prior EVENT
+    //      experiment (3.0->1.3 MB/sec) was likely a different measurement
+    //      context or a larger/real-world source. The tiny H.264 fixture
+    //      at ~0.5 MB/s does not reproduce linear growth on macOS.
+    //   2. The sliding window DID reduce resident_size (on-disk eviction
+    //      works: old seg files are removed and resident pages drop).
+    //   3. The sliding window BROKE AVPlayer playback (state=paused). This
+    //      is expected: a MEDIA-SEQUENCE sliding window without proper
+    //      live-edge sync causes AVPlayer to lose the playlist window
+    //      mid-play and pause.
+    //   4. phys_footprint on macOS includes compressed VM from all loaded
+    //      frameworks (~7-8 GB for AVFoundation + Swift runtime + aetherctl
+    //      debug binary). On tvOS the equivalent budget is ~500-800 MB.
+    //      This measurement is NOT representative of tvOS jetsam pressure.
+    //
+    // Conclusion for next task:
+    //   The on-disk SegmentCache eviction in the sliding prototype does
+    //   reduce disk pressure and resident pages. The phys_footprint plateau
+    //   on macOS does not prove AVPlayer actually releases segments on tvOS.
+    //   A replaceCurrentItem-based periodic rebuild is still the recommended
+    //   approach for bounding tvOS jetsam-relevant footprint. This spike
+    //   confirmed the measurement harness works and on-disk eviction is
+    //   effective; device-level tvOS measurement is needed for a definitive
+    //   answer.
+    //
+    // Leave this flag off by default. The productized sliding-playlist
+    // implementation (a later task) will supersede this throwaway.
+
+    /// Throwaway spike flag: when true, the live playlist uses a sliding
+    /// MEDIA-SEQUENCE window (segments drop off the back) instead of the
+    /// default append-only EVENT playlist. Defaults to false. Set to true
+    /// via `aetherctl live --sliding` for the measurement run only.
+    /// See measurement results in the comment block above.
+    nonisolated(unsafe) public static var _liveSlidingPrototype = false
+
+    /// Number of segments to keep visible in the sliding window when
+    /// `_liveSlidingPrototype` is true. 12 segments at 4 s each = 48 s
+    /// of visible runway: enough for AVPlayer's prefetch without
+    /// holding consumed history.
+    fileprivate static let slidingWindowSize = 12
+
     public init(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -2475,6 +2561,9 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     private var visibleHighWater: Int
     private var refreshCounter: Int = 0
     private var endlistAdded: Bool = false
+    /// First segment index visible in the sliding-window prototype playlist.
+    /// Monotonically increasing. 0 for the append-only baseline path.
+    private var _liveFirstVisible: Int = 0
 
     /// How many segments past the resume position the initial playlist
     /// exposes. 30 × 4 s = 120 s of forward runway: enough to absorb
@@ -2586,11 +2675,45 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// Without this fix the snapshot was returning visibleHighWater+1
     /// (=31 at session start), causing AVPlayer to think the asset
     /// was 2:13 long and stop playback at that point.
+    ///
+    /// SPIKE: when `_liveSlidingPrototype` is true and this is a live
+    /// session, advance `_liveFirstVisible` so the playlist window
+    /// slides forward, then evict the dropped segments from the cache.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
         stateLock.lock()
         defer { stateLock.unlock() }
         refreshCounter += 1
+        if isLive && HLSVideoEngine._liveSlidingPrototype {
+            let total = segments.count
+            let window = HLSVideoEngine.slidingWindowSize
+            let newFirst = max(0, total - window)
+            if newFirst > _liveFirstVisible {
+                let oldFirst = _liveFirstVisible
+                _liveFirstVisible = newFirst
+                // Evict segments that dropped off the back of the window.
+                // Off-lock to avoid holding stateLock while doing file I/O;
+                // safe because evictBelow acquires its own lock.
+                let cutoff = newFirst
+                let cacheRef = cache
+                DispatchQueue.global(qos: .utility).async {
+                    cacheRef.evictBelow(cutoff)
+                }
+                _ = oldFirst // suppress unused-var warning
+            }
+            return (total, refreshCounter, false)
+        }
         return (segments.count, refreshCounter, false)
+    }
+
+    /// First segment index visible in the current playlist window.
+    /// For append-only EVENT and VOD playlists this is always 0.
+    /// For the sliding-window prototype this advances as old segments
+    /// fall off the back.
+    var firstVisibleSegmentIndex: Int {
+        guard isLive && HLSVideoEngine._liveSlidingPrototype else { return 0 }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveFirstVisible
     }
 
     // MARK: - HLSSegmentProvider

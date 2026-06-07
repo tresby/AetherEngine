@@ -337,6 +337,22 @@ final class SegmentCache {
         return currentTargetIndex >= target
     }
 
+    /// Evict all on-disk segments with index < `cutoff`. Called by the
+    /// sliding-window prototype path in `VideoSegmentProvider` when the
+    /// playlist's first-visible index advances. Crude: ignores the
+    /// backwardWindow guard to let the playlist and disk stay in sync.
+    /// This is throwaway spike code; the productized sliding playlist
+    /// will integrate eviction into `pruneOutsideWindow`.
+    func evictBelow(_ cutoff: Int) {
+        condition.lock()
+        defer { condition.unlock() }
+        for (k, url) in entries where k < cutoff {
+            _totalBytes -= byteSize(of: url)
+            entries.removeValue(forKey: k)
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     /// Broadcast on the cache's condition variable without changing
     /// any state. Used by `HLSSegmentProducer.stop()` so any pump
     /// currently parked in `awaitFetchHighWater` returns immediately.

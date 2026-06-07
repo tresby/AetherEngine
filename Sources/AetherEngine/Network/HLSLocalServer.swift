@@ -89,6 +89,13 @@ protocol HLSSegmentProvider: AnyObject {
     /// `#EXT-X-ENDLIST`. Used by the video provider to advance a
     /// sliding-window EVENT playlist.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
+
+    /// First segment index visible in the current playlist window.
+    /// For append-only (EVENT) and VOD playlists this is always 0.
+    /// For the sliding-window prototype this advances as old segments
+    /// fall off the back. Used by `buildMediaPlaylistText` to emit
+    /// `#EXT-X-MEDIA-SEQUENCE` and to list only [firstVisible, visibleCount).
+    var firstVisibleSegmentIndex: Int { get }
 }
 
 extension HLSSegmentProvider {
@@ -96,6 +103,9 @@ extension HLSSegmentProvider {
     /// disk override to return the file URL so the server can use
     /// the `sendfile(2)` fast path.
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+
+    /// Default: append-only / VOD playlists always start at segment 0.
+    var firstVisibleSegmentIndex: Int { 0 }
 
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
@@ -931,12 +941,13 @@ final class HLSLocalServer: @unchecked Sendable {
         // build.
         let snapshot = provider.notePlaylistBuild()
         let count = snapshot.visibleCount
+        let firstVisible = provider.firstVisibleSegmentIndex
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
 
         // Compute target duration as ceil of the longest segment.
         // Spec requires this be >= every EXTINF in the playlist.
         var maxDuration: Double = 0
-        for i in 0..<count {
+        for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
         let targetDuration = Int(ceil(max(1.0, maxDuration)))
@@ -945,7 +956,7 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
-        lines.append("#EXT-X-MEDIA-SEQUENCE:0")
+        lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
         if typeIsEvent {
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
@@ -979,7 +990,7 @@ final class HLSLocalServer: @unchecked Sendable {
             segURI = { idx in "seg\(idx).mp4" }
         }
         lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
-        for i in 0..<count {
+        for i in firstVisible..<count {
             let dur = provider.segmentDuration(at: i)
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append(segURI(i))
