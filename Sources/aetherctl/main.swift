@@ -449,6 +449,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
 /// end-to-end on both the native path (seekable reader) and the software
 /// path (seekable or forward-only).
 private func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool) -> Int32 {
+    EngineLog.handler = { print($0) }
     var modeDesc: String
     switch (inMemory, forwardOnly) {
     case (true, true):   modeDesc = "in-memory + forward-only"

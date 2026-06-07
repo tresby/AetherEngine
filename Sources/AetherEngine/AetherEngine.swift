@@ -885,9 +885,10 @@ public final class AetherEngine: ObservableObject {
         // 1.5 Audio-only fast path. When the host asked for audio-only
         //     or the probe found no video stream, route to the lean
         //     AudioPlaybackHost and return before the display-criteria
-        //     handshake and the video dispatch below ever run. The probe
-        //     opened its own AVFormatContext; close it since the audio
-        //     host opens its own Demuxer.
+        //     handshake and the video dispatch below ever run. The native
+        //     (AVPlayer) audio sub-branch reopens the URL itself, so it
+        //     closes the probe; the FFmpeg sub-branch reuses the probe
+        //     demuxer (required for custom sources, which have no URL).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, hasVideoStream: hasVideoStream) {
             // Read the chosen audio stream's codec before closing the probe
@@ -1016,7 +1017,7 @@ public final class AetherEngine: ObservableObject {
         //
         //    Everything else (HEVC / H.264) goes through the native
         //    path unconditionally.
-        let useSoftwarePath: Bool
+        var useSoftwarePath: Bool
         switch detectedCodecID {
         case AV_CODEC_ID_AV1:
             useSoftwarePath = !VTCapabilityProbe.av1Available
@@ -1028,6 +1029,13 @@ public final class AetherEngine: ObservableObject {
             useSoftwarePath = true
         default:
             useSoftwarePath = false
+        }
+        // Forward-only custom sources cannot serve the native path's seeks
+        // (cue prewarm, segment seeks). The software path reads strictly
+        // forward and decodes every codec, so route them there regardless.
+        if isCustomSource && !probe.isSourceSeekable {
+            useSoftwarePath = true
+            EngineLog.emit("[AetherEngine] custom source is forward-only, forcing software path", category: .engine)
         }
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
 

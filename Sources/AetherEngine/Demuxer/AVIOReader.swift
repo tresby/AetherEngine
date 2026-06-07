@@ -150,6 +150,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// True when the source is a live stream (no Content-Length).
     private var isStreaming: Bool { fileSize <= 0 }
 
+    /// URL-backed sources are treated as seekable (HTTP Range / file seek).
+    var isSeekable: Bool { true }
+
     private(set) var context: UnsafeMutablePointer<AVIOContext>?
     private var buffer: UnsafeMutablePointer<UInt8>?
 

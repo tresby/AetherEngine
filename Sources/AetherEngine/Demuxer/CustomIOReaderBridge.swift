@@ -20,6 +20,7 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     private(set) var context: UnsafeMutablePointer<AVIOContext>?
     private var isClosed = false
     private var isFullyClosed = false
+    private(set) var isSeekable: Bool = true
 
     /// The custom reader owns its own I/O accounting; the memory probe only
     /// meaningfully tracks network bytes, so report 0 here.
@@ -50,6 +51,12 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
             throw AVIOReaderError.allocationFailed
         }
         context = ctx
+
+        // Probe seekability before any reads: SEEK_SET to 0 is a no-op for a
+        // seekable reader (returns >= 0) and is refused by a forward-only one
+        // (returns negative). Whence 0 == SEEK_SET. Safe here because the
+        // reader is fresh at position 0; FFmpeg has not read anything yet.
+        isSeekable = reader.seek(offset: 0, whence: 0) >= 0
     }
 
     func markClosed() {

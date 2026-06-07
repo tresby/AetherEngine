@@ -12,6 +12,11 @@ protocol AVIOProvider: AnyObject {
     /// readers that do not track network I/O may report 0.
     var cumulativeBytesFetched: Int64 { get }
 
+    /// Whether the underlying source supports repositioning (SEEK_SET/CUR/END).
+    /// Used by the engine to keep forward-only sources off the seeking native
+    /// path. URL-backed readers report true.
+    var isSeekable: Bool { get }
+
     /// Allocate the `AVIOContext` and begin sourcing bytes.
     func open() throws
 

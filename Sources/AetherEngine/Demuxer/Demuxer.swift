@@ -66,6 +66,12 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.cumulativeBytesFetched ?? 0
     }
 
+    /// Whether the opened source supports seeking. Forward-only custom
+    /// sources report false; URL sources and unopened demuxers report true.
+    var isSourceSeekable: Bool {
+        avioProvider?.isSeekable ?? true
+    }
+
     /// Open a media URL and probe its streams.
     ///
     /// `extraHeaders` are attached to every HTTP request the AVIO
