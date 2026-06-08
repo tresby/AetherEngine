@@ -1285,14 +1285,15 @@ public final class AetherEngine: ObservableObject {
                 if value > 0 { self?.duration = value }
             }
             .store(in: &nativeCancellables)
-        host.$isReady
-            .sink { [weak self] ready in
-                guard let self = self else { return }
-                if ready, self.state == .loading {
-                    self.state = .paused
-                }
-            }
-            .store(in: &nativeCancellables)
+        // Intentionally do NOT flip to .paused on readiness for this path.
+        // The live autostart has already called host.play(), so readyToPlay
+        // is just a waypoint to .playing: the AVPlayer item is ready but is
+        // still filling its initial buffer (the Jellyfin live transcode
+        // spin-up can leave it in waitingToPlay for ~10 s AFTER readiness).
+        // Flipping to .paused here would drop the host's loading spinner and
+        // show a black 'paused' frame for that whole window. The
+        // timeControlStatus sink below instead holds .loading until AVPlayer
+        // actually renders, then flips to .playing.
         host.$failureMessage
             .compactMap { $0 }
             .sink { [weak self] msg in self?.state = .error(msg) }
@@ -1301,15 +1302,33 @@ public final class AetherEngine: ObservableObject {
             .filter { $0 }
             .sink { [weak self] _ in self?.state = .idle }
             .store(in: &nativeCancellables)
+        // Drive the host's loading/playing UI off AVPlayer's REAL transport
+        // state. Critical for live: the stream stays in .loading (spinner up)
+        // through the whole transcode spin-up + initial buffer, and only
+        // reaches .playing when AVPlayer genuinely starts rendering. Setting
+        // state = .playing eagerly at load() time (as a prior revision did)
+        // dropped the spinner immediately and showed a ~10 s black screen
+        // while AVPlayer was still in waitingToPlay.
         host.$timeControlStatus
             .sink { [weak self] status in
                 guard let self = self else { return }
-                guard self.state == .playing || self.state == .paused else { return }
+                // .error / .idle are terminal; don't resurrect them.
+                if case .error = self.state { return }
+                if self.state == .idle { return }
                 switch status {
-                case .paused:
-                    if self.state != .paused { self.state = .paused }
-                case .playing, .waitingToPlayAtSpecifiedRate:
+                case .playing:
                     if self.state != .playing { self.state = .playing }
+                case .waitingToPlayAtSpecifiedRate:
+                    // Bringing the stream up, or a mid-playback rebuffer.
+                    // Hold .loading so the spinner shows during startup; once
+                    // playback has begun the host treats .loading as a no-op
+                    // for the full-screen spinner (hasStartedPlaying gate).
+                    if self.state != .playing { self.state = .loading }
+                case .paused:
+                    // Only an explicit pause after playback began. The
+                    // transient pre-roll paused at load (state == .loading)
+                    // must not be mistaken for a user pause.
+                    if self.state == .playing { self.state = .paused }
                 @unknown default:
                     break
                 }
@@ -1339,8 +1358,12 @@ public final class AetherEngine: ObservableObject {
         // `waitingToPlayAtSpecifiedRate`, buffers the first segments, then
         // plays. Without this the item loads to `readyToPlay` but stays at
         // `timeControlStatus == .paused` (one frame, never advances).
+        //
+        // State is left at .loading (set by load() before dispatch). It flips
+        // to .playing only when the timeControlStatus sink sees AVPlayer
+        // actually rendering, so the host keeps its loading spinner up through
+        // the transcode spin-up instead of showing a premature black screen.
         host.play()
-        state = .playing
         startMemoryProbe()
     }
 
