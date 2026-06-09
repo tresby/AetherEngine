@@ -84,11 +84,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // S16 PCM → FLAC encode).
         case truehd, dts
         case vorbis, pcm, mp2
+        /// AAC in LATM/LOAS framing (separate codec id from ADTS AAC).
+        /// The framing is what European DVB-T2 / satellite broadcasts
+        /// (and IPTV restreams of them) carry, usually around an HE-AAC
+        /// payload. It cannot take the ADTS stream-copy path (no ADTS
+        /// headers to strip, no ASC in extradata, and the payload is
+        /// typically SBR anyway), so it always bridges; the build ships
+        /// the aac_latm decoder.
+        case aacLatm
         case unsupported
 
         static func from(_ codecID: AVCodecID) -> AudioCodecCompat {
             switch codecID {
             case AV_CODEC_ID_AAC:    return .aac
+            case AV_CODEC_ID_AAC_LATM: return .aacLatm
             case AV_CODEC_ID_AC3:    return .ac3
             case AV_CODEC_ID_EAC3:   return .eac3
             case AV_CODEC_ID_FLAC:   return .flac
@@ -121,7 +130,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             case .eac3:   return "ec-3"
             case .flac:   return "fLaC"
             case .alac:   return "alac"
-            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .unsupported:
+            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .unsupported:
                 // mp3 is theoretically `mp4a.40.34`, but AVPlayer reads
                 // any mp4a sample entry as AAC, so we bridge it to FLAC
                 // instead, the engine then computes `fLaC` from the
@@ -149,7 +158,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         /// on a lossy mono/stereo source is negligible.
         var requiresBridge: Bool {
             switch self {
-            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2: return true
+            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm: return true
             default: return false
             }
         }
