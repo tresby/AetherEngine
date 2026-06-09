@@ -84,12 +84,6 @@ final class NativeAVPlayerHost {
     /// originating load() invocation.
     private static var nextSessionID: Int = 0
     private var sessionID: Int = 0
-    /// Wall-clock (mach) timestamp captured at the top of `load()`, used to
-    /// time-stamp the startup phases (asset.load done, readyToPlay, first
-    /// .playing) so a slow cold start can be attributed to server/network
-    /// (long pre-readyToPlay gap) vs client buffering (long readyToPlay ->
-    /// playing gap). DIAG: remove once live startup latency is understood.
-    private var loadStartTime: CFTimeInterval = 0
 
     // MARK: - Init
 
@@ -129,8 +123,6 @@ final class NativeAVPlayerHost {
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
-        loadStartTime = CACurrentMediaTime()
-        let t0 = loadStartTime
 
         EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil")", category: .engine)
 
@@ -203,8 +195,7 @@ final class NativeAVPlayerHost {
             }
             let nsErr = item.error as NSError?
             let errSuffix = nsErr.map { " err=\($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
-            let statusDelta = self.map { String(format: "%.2fs", CACurrentMediaTime() - $0.loadStartTime) } ?? "-"
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.status=\(statusStr) t+\(statusDelta)\(errSuffix)", category: .engine)
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.status=\(statusStr)\(errSuffix)", category: .engine)
 
             // On .failed, dump the asset's track format descriptions
             // so we can see what codec FourCC AVPlayer actually saw.
@@ -353,8 +344,7 @@ final class NativeAVPlayerHost {
             @unknown default:                      statusStr = "@unknown"
             }
             let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
-            let tcDelta = self.map { String(format: "%.2fs", CACurrentMediaTime() - $0.loadStartTime) } ?? "-"
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) t+\(tcDelta) reason=\(reason)", category: .engine)
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason)", category: .engine)
             Task { @MainActor in
                 guard let self = self else { return }
                 self.timeControlStatus = status
@@ -491,7 +481,7 @@ final class NativeAVPlayerHost {
                     case "duration":   detail = "seconds=\(asset.duration.seconds)"
                     default: detail = "-"
                     }
-                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) ok t+\(String(format: "%.2fs", CACurrentMediaTime() - t0)) url=\(urlStr) \(detail)", category: .engine)
+                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) ok url=\(urlStr) \(detail)", category: .engine)
                 } catch {
                     let nsErr = error as NSError
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) failed: \(nsErr.domain)/\(nsErr.code) '\(nsErr.localizedDescription)' url=\(urlStr)", category: .engine)
