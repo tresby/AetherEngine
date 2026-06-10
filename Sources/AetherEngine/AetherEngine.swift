@@ -183,16 +183,28 @@ public final class AetherEngine: ObservableObject {
 
     /// A frame from the live DVR window at `atSessionSeconds` (the
     /// `seekableLiveRange` timeline), decoded locally from the engine's
-    /// own segment cache: no network, no server round-trip. The composed
-    /// segment carries the output timeline in its tfdt, so the session
-    /// time IS the seek time (no shift arithmetic). Returns nil when no
-    /// native live session is active, the time is outside the resident
-    /// window, or decoding fails. Never throws.
+    /// own segment cache: no network, no server round-trip. The session
+    /// time is converted to the raw output timeline via the seam history
+    /// before the segment lookup and the extractor seek, mirroring the
+    /// inverse of the `$currentTime` fold. Returns nil when no native
+    /// live session is active, the time is outside the resident window,
+    /// or decoding fails. Never throws.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
         guard isLive, let session = nativeVideoSession else { return nil }
+        // Session -> output conversion: the published seekableLiveRange is
+        // output-time + shift (seam-resolved), while the segment table and
+        // the muxed tfdt live on the raw output timeline. Resolve the seam
+        // whose output-domain span contains the converted value, newest
+        // first (mirrors the $currentTime fold, inverted).
+        let outputSeconds: Double
+        if let seam = liveShiftSeams.last(where: { seconds - $0.shift >= $0.activateAt }) {
+            outputSeconds = seconds - seam.shift
+        } else {
+            outputSeconds = seconds - playlistShiftSeconds
+        }
         let gen = loadGeneration
         let source = await Task.detached(priority: .userInitiated) { [session] in
-            session.liveScrubThumbnailSource(atSeconds: seconds)
+            session.liveScrubThumbnailSource(atSeconds: outputSeconds)
         }.value
         guard let source else { return nil }
         // A zap/stop while the detached read was in flight cleared the
@@ -214,7 +226,7 @@ public final class AetherEngine: ObservableObject {
                 Task { await evicted.extractor.shutdown() }
             }
         }
-        return await extractor.thumbnail(at: seconds, maxWidth: maxWidth)
+        return await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
     }
 
     // MARK: - Output
