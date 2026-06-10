@@ -108,6 +108,11 @@ player.clock.$currentTime   // ~10 Hz playback clock (transport / scrub / resume
 player.clock.$sourceTime    // source PTS of the displayed frame (subtitle alignment)
 player.currentTime          // read-only polling access stays on the engine
 
+// Same split for timer-sampled diagnostics: the 1 Hz telemetry snapshot
+// lives on `player.diagnostics`, observed only by stats overlays.
+player.diagnostics.$liveTelemetry   // 1 Hz bitrate / buffer / FPS / sync snapshot
+player.liveTelemetry                // read-only polling access stays on the engine
+
 player.audioTracks    // [TrackInfo]
 player.selectAudioTrack(index: trackID)
 
@@ -281,6 +286,48 @@ engine-driven path is the default. The engine's `apply()` runs
 synchronously inside `load(url:)`, then `waitForSwitch` blocks
 until the panel reaches the target mode or 5 s timeout, then
 `replaceCurrentItem` runs against an already-correct panel mode.
+
+### SwiftUI `Menu` in custom player chrome
+
+On tvOS 26, the focused row of an open SwiftUI `Menu` blinks whenever
+any SwiftUI render transaction runs in the hosting tree, even one fully
+contained in an unrelated leaf view (a `TimelineView(.periodic)` wall
+clock, a playbar observing `engine.clock`, a subtitle overlay).
+Minimal repro: a `Menu` next to a `TimelineView(.periodic(from: .now,
+by: 1))`, open the menu, the focused item blinks once per second. This
+is a SwiftUI issue, not an engine one; reported to Apple by an
+AetherEngine adopter (see AetherEngine#29).
+
+The engine keeps its own surfaces out of the blast radius by splitting
+every continuously ticking value off the engine's `ObservableObject`
+(`engine.clock` at ~10 Hz, `engine.diagnostics` at 1 Hz). But a player
+UI always has something ticking, so if your custom chrome needs a
+dropdown while playback runs, build the menu button in UIKit and let
+SwiftUI host it. `UIButton` with `button.menu` +
+`showsMenuAsPrimaryAction` renders the same system menu as SwiftUI's
+`Menu` (public API since tvOS 17), and a `UIViewRepresentable` wrapper
+can guarantee the open dropdown is never rebuilt:
+
+```swift
+struct TrackMenuButton: UIViewRepresentable {
+    let items: [TrackMenuItem]
+
+    func makeUIView(context: Context) -> UIButton { /* configure once */ }
+
+    func updateUIView(_ button: UIButton, context: Context) {
+        // Same-value reassignment tears down an open dropdown. Only
+        // replace the UIMenu when the items actually changed.
+        if context.coordinator.currentItems != items {
+            context.coordinator.currentItems = items
+            button.menu = buildMenu(from: items)
+        }
+    }
+}
+```
+
+SwiftUI diffing can re-run `updateUIView` as often as it likes; the
+guard means an open menu only rebuilds on a real item change. Credit
+to @ohjey for isolating the mechanism and the pattern (AetherEngine#29).
 
 ## Playback pipeline
 
@@ -536,7 +583,7 @@ go in `./Fixtures/user/` (gitignored).
 Things AetherEngine deliberately doesn't do, so you don't have to read the source to find out:
 
 - No built-in UI. No controls, no transport bar, no pretty HUD.
-- No external analytics or session reporting. A 1 Hz `@Published liveTelemetry: LiveTelemetry?` surface is provided for host UIs that want to render runtime stats locally; nothing leaves the device.
+- No external analytics or session reporting. A 1 Hz `engine.diagnostics.liveTelemetry` surface is provided for host UIs that want to render runtime stats locally; nothing leaves the device.
 - No playlist / queue management. Call `load(url:)` when you want the next one.
 - No subtitle overlay. The engine decodes packets and emits `SubtitleCue` (text or `CGImage` with normalised position); your UI paints them with whatever style and animation you want.
 - No Metal shaders. Everything renders through Apple's native display stack.
