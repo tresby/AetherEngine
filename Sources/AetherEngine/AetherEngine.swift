@@ -2523,6 +2523,11 @@ public final class AetherEngine: ObservableObject {
         metadata = nil
         audioTracks = []
         subtitleTracks = []
+        // Session-scoped like the track lists; must survive stopInternal,
+        // which also runs under the audio-track-switch reload (that path
+        // skips the probe, so clearing here would strand the session with
+        // an empty font list after any audio switch).
+        fontAttachments = []
         videoFormat = .sdr
         sourceVideoFormat = .sdr
         pendingExternalMetadata = []
@@ -3497,7 +3502,6 @@ public final class AetherEngine: ObservableObject {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
-        fontAttachments = []
         isLoadingSubtitles = false
         // Audio-track state belongs to the host's picker; clear it so a
         // stale index from the previous session can't be re-applied via

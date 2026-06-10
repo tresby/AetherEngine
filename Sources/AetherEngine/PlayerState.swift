@@ -453,19 +453,21 @@ public struct FontAttachment: Sendable, Equatable {
         self.data = data
     }
 
+    private static let fontMIMEs: Set<String> = [
+        "font/ttf", "font/otf", "font/sfnt", "font/collection",
+        "application/x-truetype-font", "application/vnd.ms-opentype",
+        "application/font-sfnt", "application/x-font-ttf",
+        "application/x-font-otf",
+    ]
+
+    private static let fontExtensions: Set<String> = ["ttf", "otf", "ttc"]
+
     /// True when the MIME type or, as a fallback for missing / generic
     /// MIME, the filename extension identifies a font payload.
     static func isFontPayload(mimeType: String?, filename: String?) -> Bool {
-        let fontMIMEs: Set<String> = [
-            "font/ttf", "font/otf", "font/sfnt", "font/collection",
-            "application/x-truetype-font", "application/vnd.ms-opentype",
-            "application/font-sfnt", "application/x-font-ttf",
-            "application/x-font-otf",
-        ]
         if let mime = mimeType?.lowercased(), fontMIMEs.contains(mime) {
             return true
         }
-        let fontExtensions: Set<String> = ["ttf", "otf", "ttc"]
         if let ext = filename.flatMap({ ($0 as NSString).pathExtension.lowercased() }),
            fontExtensions.contains(ext) {
             // Only trust the extension when the MIME is absent or generic;

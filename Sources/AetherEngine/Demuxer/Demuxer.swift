@@ -469,8 +469,14 @@ public final class Demuxer: @unchecked Sendable {
             let filename = metadataValue(stream.pointee.metadata, key: "filename")
             let mimeType = metadataValue(stream.pointee.metadata, key: "mimetype")
             guard FontAttachment.isFontPayload(mimeType: mimeType, filename: filename) else { continue }
+            let fallbackExt: String
+            switch mimeType?.lowercased() {
+            case "font/otf", "application/vnd.ms-opentype", "application/x-font-otf": fallbackExt = "otf"
+            case "font/collection": fallbackExt = "ttc"
+            default: fallbackExt = "ttf"
+            }
             fonts.append(FontAttachment(
-                filename: filename ?? "font-\(i).ttf",
+                filename: filename ?? "font-\(i).\(fallbackExt)",
                 mimeType: mimeType ?? "",
                 data: Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
             ))

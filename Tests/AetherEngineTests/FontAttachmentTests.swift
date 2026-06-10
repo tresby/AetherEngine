@@ -22,5 +22,7 @@ struct FontAttachmentTests {
         #expect(FontAttachment.isFontPayload(mimeType: nil, filename: "fonts.TTC"))
         #expect(!FontAttachment.isFontPayload(mimeType: "application/octet-stream", filename: "notes.txt"))
         #expect(!FontAttachment.isFontPayload(mimeType: nil, filename: nil))
+        // A declared non-font MIME wins over a font-looking extension.
+        #expect(!FontAttachment.isFontPayload(mimeType: "image/jpeg", filename: "logo.ttf"))
     }
 }
