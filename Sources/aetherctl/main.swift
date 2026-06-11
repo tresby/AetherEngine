@@ -86,6 +86,9 @@ private func printUsage() {
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
+      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
+                           [--master] [--discontinuity-at N] [--slow-refresh]
+                           [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -1765,6 +1768,12 @@ if first == "dvr" {
         exit(64)
     }
     exit(runDVR(path: path, seconds: seconds, dvrWindow: dvrWin))
+}
+
+// HLS live fixture subcommand.
+if first == "hlsfixture" {
+    let rest = Array(args.dropFirst(2))
+    exit(runHLSFixture(args: rest))
 }
 
 // Live subcommand: no URL positional (the fixture supplies its own URL).
