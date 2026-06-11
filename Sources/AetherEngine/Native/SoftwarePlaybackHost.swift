@@ -514,16 +514,13 @@ final class SoftwarePlaybackHost {
             startDemuxLoop()
         }
 
-        // Don't eager-start the audio synchronizer. The pre-collapse
-        // pattern was: start(at:) fires only on the first decoded audio
-        // sample, so the master clock's time-zero aligns with the
-        // sample's PTS. Eager-starting here with an empty renderer queue
-        // means the clock ticks forward through the demux loop's spin-up
-        // and the first sample lands "in the past" — dropped, with a
-        // visible initial flicker or audio gap. The demux loop calls
-        // `audioOutput.start(at: .zero)` itself on first enqueue;
-        // `start()` is idempotent so the duplicate call from `seek()`'s
-        // resume path is a no-op.
+        // Don't eager-start the audio synchronizer: the demux loop arms
+        // the master clock via `seekClock` on the first decoded audio
+        // sample, so the clock's time-zero aligns with that sample's
+        // PTS. Eager-starting here with an empty renderer queue means
+        // the clock ticks forward through the demux loop's spin-up and
+        // the first sample lands "in the past" — dropped, with a
+        // visible initial flicker or audio gap.
         // Resume the synchronizer after a pause(). Guarded so a cold
         // start stays lazy (the clock is armed off the first decoded
         // sample, see the comment above); an unguarded setRate here
@@ -786,12 +783,6 @@ final class SoftwarePlaybackHost {
     /// internal locks, so off-main use is safe.
     private func startDemuxLoop() {
         guard let dem = demuxer else { return }
-        // `AVSampleBufferDisplayLayer` isn't Sendable in Apple's
-        // headers, but we only read `isReadyForMoreMediaData` off-main
-        // (which is documented as thread-safe by AVFoundation).
-        // Wrapping in `UncheckedSendable` quiets the closure-capture
-        // diagnostic without forcing the loop back to the main actor.
-        let layer = UncheckedSendable(renderer.displayLayer)
         let vDec = videoDecoder
         let vIdx = videoStreamIndex
         let aDec = audioDecoder
@@ -911,7 +902,6 @@ final class SoftwarePlaybackHost {
                 audioOutput: aOut,
                 audioStreamIndex: aIdx,
                 renderer: rndr,
-                displayLayer: layer.value,
                 condition: condition,
                 initialClockTime: initialClock,
                 initialRate: initialRate,
@@ -1227,7 +1217,6 @@ final class SoftwarePlaybackHost {
         audioOutput: AudioOutput?,
         audioStreamIndex: Int32,
         renderer: SampleBufferRenderer,
-        displayLayer: AVSampleBufferDisplayLayer,
         condition: NSCondition,
         initialClockTime: CMTime,
         initialRate: Float,
@@ -1521,17 +1510,4 @@ final class SoftwarePlaybackHost {
 func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
     var p: UnsafeMutablePointer<AVPacket>? = packet
     trackedPacketFree(&p)
-}
-
-// MARK: - Sendable wrapper
-
-/// Box for non-Sendable reference types that we only touch on a single
-/// background queue. Captures the value once at construction so the
-/// closure that owns it can be marked `@Sendable` without Swift 6
-/// strict concurrency rejecting the capture. Used for
-/// `AVSampleBufferDisplayLayer`, whose `isReadyForMoreMediaData`
-/// reads are documented as thread-safe.
-private struct UncheckedSendable<T>: @unchecked Sendable {
-    let value: T
-    init(_ value: T) { self.value = value }
 }

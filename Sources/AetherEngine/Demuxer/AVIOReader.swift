@@ -1940,14 +1940,12 @@ private func seekCallback(
 
 enum AVIOReaderError: Error, CustomStringConvertible {
     case allocationFailed
-    case httpError(code: Int)
     case noResponse
     case requestTimeout
 
     var description: String {
         switch self {
         case .allocationFailed: return "Failed to allocate AVIO buffer"
-        case .httpError(let code): return "HTTP error \(code)"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
         }

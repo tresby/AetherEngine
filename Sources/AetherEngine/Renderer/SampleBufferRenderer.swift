@@ -12,23 +12,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     private(set) var displayLayer: AVSampleBufferDisplayLayer
 
-    /// Fired when the display layer instance is replaced. The host view
-    /// must swap the old sublayer out of its CALayer hierarchy and add
-    /// the new one. Required because once the layer has ping-ponged
-    /// between AVSampleBufferRenderSynchronizer and controlTimebase a
-    /// few times, Apple's "undefined behavior" warning cashes in: the
-    /// layer stays status=.rendering but silently stops consuming
-    /// frames, and no flush() can revive it. Only a fresh layer works.
-    var onLayerReplaced: ((AVSampleBufferDisplayLayer) -> Void)?
-
     /// Track the HDR output setting so we can restore it on recreated
     /// layers. Defaults match init().
     private var currentlyHDR: Bool = false
-
-    /// Track the requested video gravity so it survives the
-    /// recreate-display-layer-on-every-load() dance. The host sets it
-    /// once via `setVideoGravity` and we reapply on every fresh layer.
-    private var currentGravity: AVLayerVideoGravity = .resizeAspect
 
     /// Reorder buffer: collects frames from the decoder (which may arrive
     /// out of display order due to B-frames) and flushes them to the
@@ -56,7 +42,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// snapshots the color attachments at creation time).
     ///
     /// Guarded by `reorderLock`: written on the decoder thread in
-    /// `createSampleBuffer`, nil'd by `flush()`/`recreateDisplayLayer()`
+    /// `createSampleBuffer`, nil'd by `flush()`
     /// from other threads.
     private var cachedFormatDesc: CMVideoFormatDescription?
     private var cachedFormatKey: FormatDescriptionKey?
@@ -70,29 +56,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
         var primaries: String?
         var transfer: String?
         var matrix: String?
-    }
-
-    /// Tracks whether at least one frame has reached the display layer
-    /// since the last reset. Used by `AetherEngine.load()` to wait for
-    /// the first video frame to actually render before returning, so
-    /// callers that pause immediately after load (foreground reload)
-    /// don't freeze on an empty layer (black). Touched from both the
-    /// decoder callback thread (set) and the engine actor (read +
-    /// reset), hence the explicit lock.
-    private let firstFrameLock = NSLock()
-    nonisolated(unsafe) private var _hasRenderedFirstFrame = false
-    nonisolated var hasRenderedFirstFrame: Bool {
-        firstFrameLock.lock(); defer { firstFrameLock.unlock() }
-        return _hasRenderedFirstFrame
-    }
-
-    /// Reset the first-frame tracker. Call before waiting for the
-    /// next post-flush frame so a pre-flush frame doesn't satisfy
-    /// the wait spuriously.
-    func resetFirstFrameTracking() {
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
     }
 
     private var loggedLayerFailed = false
@@ -167,16 +130,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return layer
     }
 
-    /// Set how the rendered video frame fills its CALayer rect.
-    /// Survives layer recreation across `load()` cycles, the renderer
-    /// caches the value and re-applies it on every fresh layer.
-    func setVideoGravity(_ gravity: AVLayerVideoGravity) {
-        currentGravity = gravity
-        displayLayer.videoGravity = gravity
-    }
-
-    var videoGravity: AVLayerVideoGravity { currentGravity }
-
     /// Opt the display layer into HDR output. Call with `true` only when
     /// the decoder is delivering HDR10/DV pixel buffers directly (no
     /// tone-map). Call with `false` (or leave at default) for SDR output
@@ -192,37 +145,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
             }
             #endif
         }
-    }
-
-    /// Swap the display layer for a fresh instance. Called by
-    /// AetherEngine on every load() to avoid carrying over stale
-    /// Synchronizer/controlTimebase state across sessions, the
-    /// observed failure mode is status=.rendering but no frame
-    /// consumption, which no in-place reset can recover from.
-    /// The host view is notified via onLayerReplaced and must
-    /// remove the old sublayer and add the new one.
-    func recreateDisplayLayer() {
-        // Drop the cached format description, it's associated with
-        // the old layer's pipeline, and a new layer starts clean.
-        reorderLock.lock()
-        reorderBuffer.removeAll()
-        cachedFormatDesc = nil
-        cachedFormatKey = nil
-        reorderLock.unlock()
-
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
-
-        let newLayer = Self.makeDisplayLayer(isHDR: currentlyHDR, gravity: currentGravity)
-        displayLayer = newLayer
-        onLayerReplaced?(newLayer)
-
-        #if DEBUG
-        enqueueCount = 0
-        loggedLayerFailed = false
-        EngineLog.emit("[Renderer] display layer recreated", category: .swPlayback)
-        #endif
     }
 
     /// After seek, drop frames with PTS before the target to prevent
@@ -281,10 +203,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
         cachedFormatDesc = nil
         cachedFormatKey = nil
         reorderLock.unlock()
-
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
 
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
             displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) { }
@@ -349,9 +267,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
         // Mark first frame after the most recent reset. Lock-protected
         // because flushFrame runs on the decoder callback thread while
         // AetherEngine reads / resets this from its actor.
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = true
-        firstFrameLock.unlock()
 
         enqueueCount += 1
         // Sparse progress trail so a stall after enqueue #30 (the
@@ -385,8 +300,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
         )
 
-        // Cache access under reorderLock: flush()/recreateDisplayLayer()
-        // nil the cache from other threads, and an unsynchronized strong
+        // Cache access under reorderLock: flush() nils the cache from other threads, and an unsynchronized strong
         // ref read against that write is an ARC race.
         reorderLock.lock()
         let cachedDesc: CMVideoFormatDescription? =

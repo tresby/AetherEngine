@@ -14,7 +14,6 @@ final class AudioOutput: @unchecked Sendable {
     let synchronizer: AVSampleBufferRenderSynchronizer
 
     private let lock = NSLock()
-    private var _isStarted = false
 
     init() {
         renderer = AVSampleBufferAudioRenderer()
@@ -78,16 +77,7 @@ final class AudioOutput: @unchecked Sendable {
         #endif
     }
 
-    /// Start audio playback at the given time. Call after enqueueing first samples.
-    func start(at time: CMTime = .zero) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !_isStarted else { return }
-        synchronizer.setRate(_rate, time: time)
-        _isStarted = true
-    }
-
-    /// The current playback rate. Stored so resume() restores the correct speed.
+    /// The current playback rate, stored so seekClock can restore it.
     private var _rate: Float = 1.0
 
     /// Playback volume (0.0 = mute, 1.0 = full).
@@ -102,14 +92,11 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.setRate(rate, time: synchronizer.currentTime())
     }
 
-    /// Pause audio (and the master clock).
+    /// Pause audio (and the master clock). Hosts resume via setRate
+    /// (the pausedByHost pattern); there is deliberately no resume()
+    /// here.
     func pause() {
         synchronizer.setRate(0.0, time: synchronizer.currentTime())
-    }
-
-    /// Resume audio (and the master clock) at the current playback rate.
-    func resume() {
-        synchronizer.setRate(_rate, time: synchronizer.currentTime())
     }
 
     /// Enqueue a decoded audio CMSampleBuffer for playback.
@@ -161,24 +148,6 @@ final class AudioOutput: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         renderer.flush()
-        _isStarted = false
-    }
-
-    /// Flush the renderer queue without resetting `_isStarted` or
-    /// stopping the synchronizer. Used when hot-swapping the audio
-    /// decoder mid-playback (e.g. an audio-track switch with the
-    /// same audio mode), the master clock keeps ticking, the video
-    /// pipeline stays untouched, and only the queued audio samples
-    /// from the old track are dropped so the new language is heard
-    /// promptly. Without this, calling the regular flush would
-    /// reset `_isStarted = false`, and the synchronizer would stop
-    /// until a fresh `start(at:)` call jumped the clock, visually
-    /// the same fast-forward burst the cross-mode reset path
-    /// produces.
-    func flushRendererKeepingClock() {
-        lock.lock()
-        defer { lock.unlock() }
-        renderer.flush()
     }
 
     /// Stop and tear down.
@@ -187,21 +156,18 @@ final class AudioOutput: @unchecked Sendable {
         defer { lock.unlock() }
         synchronizer.setRate(0.0, time: .zero)
         renderer.flush()
-        _isStarted = false
     }
 
     /// Jump the synchronizer's master clock to a specific time and
-    /// resume at the given rate atomically. Used by seek paths so PTS-
-    /// stamped samples decoded after the seek align with the clock,
-    /// without falling-through-time race windows that
-    /// `pause → flush → setRate` would expose. Idempotent on
-    /// `_isStarted` (post-seek the synchronizer is started by definition,
-    /// so subsequent demux-loop `start(at:)` calls are no-ops).
+    /// resume at the given rate atomically. The ONLY way the clock is
+    /// (re)anchored: the hosts' demux loops call it once on the first
+    /// decoded packet, and the seek paths call it directly. Avoids the
+    /// falling-through-time race windows that `pause → flush → setRate`
+    /// would expose.
     func seekClock(to time: CMTime, rate: Float) {
         lock.lock()
         defer { lock.unlock() }
         _rate = rate
         synchronizer.setRate(rate, time: time)
-        _isStarted = true
     }
 }

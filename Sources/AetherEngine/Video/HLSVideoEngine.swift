@@ -1203,12 +1203,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 7. Wire the provider, the server, and serve the URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
-        // Convert resume position (if any) to a segment index so the
-        // provider's sliding-window playlist starts with the resume
-        // segment already visible.
-        let initialIndex = isLiveSession
-            ? 0
-            : Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
         // Live: no precomputed plan, no restart machinery (the feed is
         // forward-only and the live playlist grows as the producer cuts
         // segments). VOD keeps the restart handler so
@@ -1223,7 +1217,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
             frameRate: frameRate,
             hdcpLevel: hdcpLevel,
             sourceBitrate: sourceBitrate,
-            initialIndex: initialIndex,
             isLive: isLiveSession,
             liveWindowSizing: LiveWindowSizing(
                 targetSegmentDurationSeconds: Self.targetSegmentDuration,
@@ -1539,17 +1532,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
     }
 
-    /// Bump the sliding-window playlist so segments covering `seconds`
-    /// are listed before AVPlayer issues the seek-driven segment fetch.
-    /// Called by `AetherEngine.seek(to:)`. No-op if the position
-    /// already falls inside the visible window or if the playlist has
-    /// already transitioned to VOD-with-ENDLIST.
-    public func extendVisibleWindow(toCoverSeconds seconds: Double) {
-        guard let prov = provider else { return }
-        let idx = Self.segmentIndex(forSeconds: seconds, plan: segmentPlan)
-        prov.extendVisibleWindow(toCover: idx)
-    }
-
     /// Composed init.mp4 + segment bytes for the live scrub-thumbnail
     /// path, plus the segment index. The byte copy makes window-slide
     /// eviction harmless: if the file vanishes between lookup and read,
@@ -1569,20 +1551,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let initData = prov.peekInitSegment(),
               let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
         return (initData + segData, seg.index)
-    }
-
-    /// Locate the segment that contains a given source-time offset.
-    /// Linear scan, fine for our 2k-segment scale on the engine's
-    /// rare-event paths (load + seek). Returns 0 if `seconds` is nil
-    /// or negative, last index if past the end.
-    fileprivate static func segmentIndex(forSeconds seconds: Double?, plan: [Segment]) -> Int {
-        guard let s = seconds, s > 0, !plan.isEmpty else { return 0 }
-        for (i, seg) in plan.enumerated() {
-            if s < seg.startSeconds + seg.durationSeconds {
-                return i
-            }
-        }
-        return plan.count - 1
     }
 
     public func stop() {
@@ -3294,23 +3262,13 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     ///     the segment-server side.
     private static let forwardWaitWindow = 8
 
-    // MARK: - Sliding-window live/VOD playlist state
+    // MARK: - Playlist state
 
-    /// Segments visible in /media.m3u8 are `[0, visibleHighWater]`.
-    /// The visible window is monotonically increasing over a session
-    /// (live sliding window never retracts; VOD seek only extends).
-    /// Grows by `growthPerRefresh` on each playlist build, plus explicit
-    /// jumps from `extendVisibleWindow(toCover:)` on seek.
-    ///
-    /// Initial value covers the resume position so AVPlayer's first
-    /// playlist read already contains the seg AVPlayer is about to
-    /// seek to; otherwise AVPlayer either refuses the seek or stalls
-    /// waiting for the playlist to grow past the requested time.
-    ///
-    /// AVPlayer fires CoreMediaErrorDomain -12888 ("Playlist File
-    /// unchanged") after 2 consecutive polls of an unchanged playlist
-    /// (target-duration / 2 cadence, ≈ 2 s for our 4 s segments).
-    /// Adding ≥ 1 segment per build keeps that check happy.
+    /// Guards `segments`, the live window fields, and `refreshCounter`.
+    /// (The historical VOD sliding-window machinery that once lived
+    /// here was dead code: notePlaylistBuild always reported the full
+    /// VOD count and never consulted the window. Removed; VOD playlists
+    /// are complete from the first build.)
     private let stateLock = NSLock()
     /// Condition variable used to signal `waitForFirstLiveSegment` when
     /// the first live segment is appended. A separate NSCondition (not
@@ -3330,9 +3288,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// number was recycled (engine is a process-wide singleton; channel
     /// zap restarts immediately). Guarded by `firstSegmentCondition`.
     private var waitersCancelled = false
-    private var visibleHighWater: Int
     private var refreshCounter: Int = 0
-    private var endlistAdded: Bool = false
     /// First segment index visible in the live sliding-window playlist
     /// (`#EXT-X-MEDIA-SEQUENCE`). Monotonically increasing; advanced by
     /// `notePlaylistBuild` to `max(0, highWater - windowSegmentCount)`.
@@ -3342,20 +3298,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// of the visible live window; the playlist's
     /// `#EXT-X-DISCONTINUITY-SEQUENCE` value. Guarded by `stateLock`.
     private var _discontinuitySequence: Int = 0
-
-    /// How many segments past the resume position the initial playlist
-    /// exposes. 30 × 4 s = 120 s of forward runway: enough to absorb
-    /// AVPlayer's preferredForwardBufferDuration plus the producer's
-    /// startup latency without AVPlayer hitting the end of the visible
-    /// playlist and stalling.
-    private static let initialFillSegments = 30
-
-    /// Segments appended per playlist refresh. Must be ≥ 1 so two
-    /// consecutive polls never see the same playlist (the
-    /// -12888 trigger). Picked > 1 so the visible window grows faster
-    /// than playback consumes it (1 seg per 4 s playback vs 2 segs per
-    /// ~2.5 s poll = ~3.2x ahead).
-    private static let growthPerRefresh = 2
 
     init(
         cache: SegmentCache,
@@ -3367,7 +3309,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         frameRate: Double?,
         hdcpLevel: String?,
         sourceBitrate: Int64,
-        initialIndex: Int = 0,
         isLive: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
         blockingReloadEnabled: Bool = true,
@@ -3389,15 +3330,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         self.sourceBitrate = sourceBitrate
         self.restartHandler = restartHandler
 
-        if isLive {
-            // Live starts with an empty list; the producer appends as it
-            // cuts. The sliding-window state is dormant for live.
-            self.visibleHighWater = -1
-        } else {
-            let safeInitial = max(0, min(initialIndex, segments.count - 1))
-            let target = safeInitial + Self.initialFillSegments
-            self.visibleHighWater = min(segments.count - 1, max(Self.initialFillSegments, target))
-        }
     }
 
     /// Append a producer-finalized live segment to the growing list under
@@ -3438,26 +3370,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
         firstSegmentCondition.unlock()
-    }
-
-    // MARK: - Sliding-window operations
-
-    /// Extend the visible window so segment `index` is in the playlist.
-    /// Called from the engine's seek path before AVPlayer issues its
-    /// new segment fetch so the playlist already lists the target by
-    /// the time AVPlayer re-reads it. Idempotent and monotonic.
-    func extendVisibleWindow(toCover index: Int) {
-        guard !isLive else { return }   // live uses segments.count directly; window/endlist are VOD-only
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard !endlistAdded else { return }
-        let target = min(segments.count - 1, index + Self.initialFillSegments)
-        if target > visibleHighWater {
-            visibleHighWater = target
-            if visibleHighWater >= segments.count - 1 {
-                endlistAdded = true
-            }
-        }
     }
 
     /// Atomic snapshot the playlist build reads from. For VOD this
@@ -3574,7 +3486,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         // path; only the byte materialization changes. Without this
         // the sendfile path would skip the producer restart on
         // out-of-range fetches and AVPlayer would 404 indefinitely.
-        extendVisibleWindow(toCover: index)
         handleTargetChange(to: index)
         return cache.peekURL(index: index)
     }
@@ -3659,14 +3570,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         }
 
         let totalStart = DispatchTime.now()
-
-        // Defensive: if AVPlayer fetches a segment beyond the current
-        // visible window (e.g. via an internal seek path that bypassed
-        // the engine.seek hook), extend the window so the next playlist
-        // refresh includes it. Without this, AVPlayer could end up
-        // working off a stale view where it requests a seg that isn't
-        // "supposed to exist" yet.
-        extendVisibleWindow(toCover: index)
 
         // Update target + proactive-restart on big backward jump.
         // See `handleTargetChange` for rationale; this path and the

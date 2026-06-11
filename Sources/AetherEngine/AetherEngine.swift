@@ -669,9 +669,9 @@ public final class AetherEngine: ObservableObject {
     /// the heap climbs by several hundred MB over the session.
     /// 300 s covers normal pause durations and the backward-scrub
     /// reach that doesn't trigger a producer restart; cues evicted
-    /// before that get re-emitted by the producer on restart since
-    /// `EmbeddedSubtitleDecoder.resetState` clears the seen-key
-    /// dedupe set at every restart.
+    /// before that get re-emitted after a producer restart: the side
+    /// reader task restarts alongside it and instantiates a FRESH
+    /// `EmbeddedSubtitleDecoder`, so the dedupe set starts empty.
     private let subtitleCueRetentionSeconds: Double = 300
 
     /// How far past the playhead (source-PTS seconds) the embedded-
@@ -2486,8 +2486,6 @@ public final class AetherEngine: ObservableObject {
             let behind = (liveWindow?.edgeTime ?? target) - target   // >= 0; 0 == "to the edge"
             let clockTarget = max(0, (nativeHost?.seekableEnd ?? 0) - behind)
             EngineLog.emit("[AetherEngine] live seek target=\(target) behind=\(behind) seekableEnd=\(nativeHost?.seekableEnd ?? 0) clockTarget=\(clockTarget)", category: .engine)
-            // Skip extendVisibleWindow: that is the VOD sliding-window mechanism.
-            // The live playlist already exposes its window of segments.
             nativeHost?.seek(to: clockTarget)
             nativeClockSeconds = clockTarget
             clock.currentTime = target
@@ -2509,13 +2507,6 @@ public final class AetherEngine: ObservableObject {
         } else if let host = softwareHost {
             await host.seek(to: clockTarget)
         } else {
-            // Sliding-window EVENT playlist: ensure the seek target's
-            // segment is visible in the playlist before AVPlayer fetches
-            // it. Without this, a long forward seek can land AVPlayer
-            // on a segment that the playlist hasn't grown to expose
-            // yet — AVPlayer either fails the seek or stalls until the
-            // playlist's periodic refresh catches up.
-            nativeVideoSession?.extendVisibleWindow(toCoverSeconds: clockTarget)
             nativeHost?.seek(to: clockTarget)
         }
         nativeClockSeconds = clockTarget
@@ -3356,9 +3347,9 @@ public final class AetherEngine: ObservableObject {
         // retention window covers typical pause durations and the
         // backward-scrub reach that doesn't trigger a producer
         // restart; anything older that the user revisits via a far
-        // scrub gets re-emitted by the producer pump on restart (the
-        // EmbeddedSubtitleDecoder clears its dedupe set on every
-        // resetState).
+        // scrub gets re-emitted on restart (the restarted side reader
+        // instantiates a fresh EmbeddedSubtitleDecoder, so its dedupe
+        // set starts empty).
         pruneOldSubtitleCues()
     }
 

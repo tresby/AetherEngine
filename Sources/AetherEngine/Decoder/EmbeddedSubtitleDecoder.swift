@@ -278,14 +278,6 @@ final class EmbeddedSubtitleDecoder {
         )
     }
 
-    /// Reset the dedupe set + cue counter when restarting at a new
-    /// position (e.g. after a scrub). Called by HLSVideoEngine when
-    /// the producer restarts.
-    func resetState() {
-        seenKeys.removeAll(keepingCapacity: true)
-        nextCueID = 0
-    }
-
     // MARK: - Codec checks
 
     static func isBitmapCodec(_ id: AVCodecID) -> Bool {

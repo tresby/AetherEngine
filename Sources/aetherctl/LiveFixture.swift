@@ -79,12 +79,6 @@ final class LiveFixture: @unchecked Sendable {
     private let seedPackets: [Data]
     /// Per-loop timestamp increment in 90 kHz ticks (PTS / DTS / PCR base).
     private let loopPeriodTicks: Int64
-    /// The lowest PTS / DTS / PCR-base value found in the seed, used so
-    /// the served stream can start near zero rather than at the seed's
-    /// intrinsic start offset (not strictly required, kept at 0 here, the
-    /// per-loop offset is what matters for monotonicity).
-    private let seedBasePTS: Int64
-
     // MARK: - Socket state
 
     private var listenFd: Int32 = -1
@@ -200,7 +194,6 @@ final class LiveFixture: @unchecked Sendable {
         // Scan the seed for the PTS span so the per-loop offset lands the
         // next loop exactly one frame after the previous loop's last.
         let span = LiveFixture.measureTimestampSpan(packets: packets)
-        self.seedBasePTS = span.minPTS
         // loopPeriod = span + one frame interval. Falls back to a 5 s
         // period (450000 ticks) when the seed has no parseable PTS deltas.
         let frameInterval = span.frameInterval > 0 ? span.frameInterval : 3750
@@ -550,25 +543,24 @@ final class LiveFixture: @unchecked Sendable {
                 return false
             }
             buffer.append(contentsOf: chunk[0..<n])
-            if let end = headersTerminator(buffer) {
-                _ = end
+            if headersComplete(buffer) {
                 return true
             }
             if buffer.count > 8192 { return false }
         }
     }
 
-    private func headersTerminator(_ buf: [UInt8]) -> Int? {
-        guard buf.count >= 4 else { return nil }
+    private func headersComplete(_ buf: [UInt8]) -> Bool {
+        guard buf.count >= 4 else { return false }
         var i = 0
         while i <= buf.count - 4 {
             if buf[i] == 0x0D && buf[i + 1] == 0x0A
                 && buf[i + 2] == 0x0D && buf[i + 3] == 0x0A {
-                return i
+                return true
             }
             i += 1
         }
-        return nil
+        return false
     }
 
     /// Blocking send loop. Returns false on broken pipe / error.

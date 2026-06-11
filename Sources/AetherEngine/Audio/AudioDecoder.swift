@@ -224,33 +224,6 @@ final class AudioDecoder: @unchecked Sendable {
         close()
     }
 
-    // MARK: - Resampler
-
-    private func setupResampler(ctx: UnsafeMutablePointer<AVCodecContext>) throws {
-        var outLayout = AVChannelLayout()
-        av_channel_layout_default(&outLayout, channels)
-
-        let ret = swr_alloc_set_opts2(
-            &swrContext,
-            &outLayout,
-            AV_SAMPLE_FMT_FLT,
-            sampleRate,
-            &ctx.pointee.ch_layout,
-            ctx.pointee.sample_fmt,
-            ctx.pointee.sample_rate,
-            0,
-            nil
-        )
-        guard ret >= 0, swrContext != nil else {
-            throw AudioDecoderError.resamplerFailed
-        }
-
-        guard swr_init(swrContext) >= 0 else {
-            swr_free(&swrContext)
-            throw AudioDecoderError.resamplerFailed
-        }
-    }
-
     // MARK: - Format Description
 
     private func createFormatDescription() throws {

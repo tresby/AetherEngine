@@ -82,9 +82,9 @@ private func printUsage() {
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
-      aetherctl audio <url>
+      aetherctl audio [--seconds N] <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
@@ -1109,7 +1109,6 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
                          elapsed, bytes, Double(bytes) / 1_048_576.0))
             lastCacheTick = elapsed
         }
-        _ = tick // suppress unused-var warning
     }
 
     let finalState = engine.state
@@ -1862,6 +1861,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let switchAudioFlag = takeFlag("--switch-audio", from: &rest)
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
+    let audioSeconds = takeDoubleFlag("--seconds", from: &rest) ?? 10
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -1889,7 +1889,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
             maxWidth: extractWidth
         ))
     case "audio":
-        exit(runAudio(url: url, seconds: 10))
+        exit(runAudio(url: url, seconds: audioSeconds))
     case "customio":
         // urlArg is a filesystem path, not a URL; use rest.first directly.
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag))
