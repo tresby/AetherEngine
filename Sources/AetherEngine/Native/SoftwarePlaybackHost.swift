@@ -225,6 +225,21 @@ final class SoftwarePlaybackHost {
         set { feedLock.lock(); _clockArmed = newValue; feedLock.unlock() }
     }
 
+    /// Bumped at the head of every seek. The combined demux loop
+    /// re-checks it around its blocking `readPacket`, so a packet that
+    /// was in flight when the seek flushed the pipeline is discarded
+    /// instead of decoded: a stale pre-seek frame with pts past the
+    /// target would clear the renderer's one-shot skip threshold, and
+    /// the anchor-keyframe frames before the target then played as a
+    /// visible fast-forward burst.
+    nonisolated(unsafe) private var _seekGeneration: UInt64 = 0
+    nonisolated private var seekGeneration: UInt64 {
+        feedLock.lock(); defer { feedLock.unlock() }; return _seekGeneration
+    }
+    nonisolated private func bumpSeekGeneration() {
+        feedLock.lock(); _seekGeneration &+= 1; feedLock.unlock()
+    }
+
     /// Set when pause() stopped the synchronizer, so play() knows to
     /// restore the rate. play() previously never resumed the
     /// synchronizer at all (pause() set its rate to 0, play() only
@@ -536,7 +551,9 @@ final class SoftwarePlaybackHost {
     func seek(to seconds: Double) async {
         guard let dem = demuxer else { return }
         // Pause the demux loop so we don't race the seek against
-        // in-flight packet reads.
+        // in-flight packet reads, and invalidate any packet the loop has
+        // already pulled out of the demuxer (see _seekGeneration).
+        bumpSeekGeneration()
         let wasPlaying = isPlaying
         isPlaying = false
 
@@ -589,6 +606,13 @@ final class SoftwarePlaybackHost {
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
         }
+        // The clock is positioned either way; the demux loop must not
+        // re-arm it at the (stale) initialClockTime. Without this latch a
+        // seek landing before the first decoded audio packet got snapped
+        // back to the session start by the loop's one-shot arming (frozen
+        // picture until the clock walked to the target). The DVR path
+        // (seekLiveDVR) has carried the same latch since the feeder split.
+        clockArmed = true
     }
 
     /// Live DVR rewind: reseed the decoder pipeline from the retained
@@ -797,6 +821,16 @@ final class SoftwarePlaybackHost {
         // play/pause; the feeder decodes from its cursor with renderer
         // back-pressure. Live-only (no ring) and VOD keep the combined
         // loop below.
+        let getClockArmed: @Sendable () -> Bool = { [weak self] in
+            self?.clockArmed ?? true
+        }
+        let setClockArmed: @Sendable () -> Void = { [weak self] in
+            self?.clockArmed = true
+        }
+        let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
+            self?.seekGeneration ?? 0
+        }
+
         if liveSession, let ring {
             let readCursor: @Sendable () -> Int = { [weak self] in
                 self?.readFeedCursor() ?? 0
@@ -812,12 +846,6 @@ final class SoftwarePlaybackHost {
             }
             let getSourceEnded: @Sendable () -> Bool = { [weak self] in
                 self?.sourceEnded ?? true
-            }
-            let getClockArmed: @Sendable () -> Bool = { [weak self] in
-                self?.clockArmed ?? true
-            }
-            let setClockArmed: @Sendable () -> Void = { [weak self] in
-                self?.clockArmed = true
             }
             demuxQueue.async {
                 Self.runLiveReaderLoop(
@@ -880,6 +908,9 @@ final class SoftwarePlaybackHost {
                 noteEdge: noteEdge,
                 isPlaying: getIsPlaying,
                 stopRequested: getStopRequested,
+                clockArmed: getClockArmed,
+                markClockArmed: setClockArmed,
+                seekGeneration: getSeekGeneration,
                 onError: onError,
                 onEnd: onEnd
             )
@@ -962,6 +993,20 @@ final class SoftwarePlaybackHost {
                         )
                     }
                 }
+            }
+
+            // NOPTS repair. In the reader/feeder split the ring is the
+            // ONLY route to the decoder, and the ring append below gates
+            // on a valid pts: dropping NOPTS packets (not unusual for
+            // MPEG-TS / field-coded H.264) starved the decoder of
+            // reference frames and produced decode artifacts in DVR mode
+            // (the combined loop decodes such packets regardless).
+            // Synthesize a pts from the dts; decode order matches
+            // presentation order for the typical field-pair case, and a
+            // slightly mis-ordered ring entry beats a missing reference.
+            if streamIdx == videoStreamIndex || streamIdx == audioStreamIndex,
+               packet.pointee.pts == Int64.min, packet.pointee.dts != Int64.min {
+                packet.pointee.pts = packet.pointee.dts
             }
 
             // Live PTS-discontinuity detection + reconciliation, same
@@ -1174,6 +1219,9 @@ final class SoftwarePlaybackHost {
         noteEdge: @Sendable (Double) -> Void,
         isPlaying: @Sendable () -> Bool,
         stopRequested: @Sendable () -> Bool,
+        clockArmed: @Sendable () -> Bool,
+        markClockArmed: @Sendable () -> Void,
+        seekGeneration: @Sendable () -> UInt64,
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void
     ) {
@@ -1182,7 +1230,11 @@ final class SoftwarePlaybackHost {
         // is NOT idempotent (it always re-sets the synchronizer rate
         // and time), so calling it on every packet would snap the clock
         // back to `initialClockTime` 50× per second and freeze playback.
-        var clockArmed = false
+        // The latch is SHARED with the host (not loop-local): seek()
+        // anchors the clock itself and sets it, so a seek landing before
+        // the first decoded packet isn't overridden by a late re-arm at
+        // the stale initialClockTime (the DVR feeder has used the shared
+        // flag since the feeder split; this loop predates it).
 
         // Live PTS-discontinuity reconciliation (SW path). A program
         // boundary leaps the source PTS (forward or backward) far beyond
@@ -1215,6 +1267,7 @@ final class SoftwarePlaybackHost {
                 continue
             }
 
+            let genBeforeRead = seekGeneration()
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 packet = try demuxer.readPacket()
@@ -1230,6 +1283,17 @@ final class SoftwarePlaybackHost {
                 renderer.drainReorderBuffer()
                 onEnd()
                 break
+            }
+
+            // A seek landed while this packet was in flight: it predates
+            // the seek's pipeline flush, and decoding it would clear the
+            // renderer's/decoder's one-shot skip threshold ahead of the
+            // real post-seek frames (visible fast-forward burst after a
+            // backward seek). Discard and re-read at the new position.
+            if seekGeneration() != genBeforeRead {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                continue
             }
 
             let streamIdx = packet.pointee.stream_index
@@ -1332,8 +1396,20 @@ final class SoftwarePlaybackHost {
                 // Back-pressure against the renderer's actual queue, not
                 // the display layer's deprecated property — see
                 // `SampleBufferRenderer.isReadyForMoreMediaData` doc.
+                // While paused with a full queue, park on the condition
+                // instead of spinning: the renderer consumes nothing at
+                // rate 0, so the 5 ms poll otherwise burns CPU at 200 Hz
+                // for the whole pause.
                 while !renderer.isReadyForMoreMediaData && !stopRequested() {
-                    Thread.sleep(forTimeInterval: 0.005)
+                    if !isPlaying() {
+                        condition.lock()
+                        while !isPlaying() && !stopRequested() {
+                            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                        }
+                        condition.unlock()
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.005)
+                    }
                 }
                 if stopRequested() {
                     av_packet_unref(packet)
@@ -1346,9 +1422,9 @@ final class SoftwarePlaybackHost {
                 // nothing below would ever arm the master clock, so the
                 // session rendered one frozen frame with currentTime
                 // stuck at 0. Arm off the first video packet instead.
-                if !clockArmed, audioDecoder == nil, let aOut = audioOutput {
+                if !clockArmed(), audioDecoder == nil, let aOut = audioOutput {
                     aOut.seekClock(to: initialClockTime, rate: initialRate)
-                    clockArmed = true
+                    markClockArmed()
                 }
             } else if streamIdx == audioStreamIndex, let aDec = audioDecoder, let aOut = audioOutput {
                 let buffers = aDec.decode(packet: packet)
@@ -1360,9 +1436,9 @@ final class SoftwarePlaybackHost {
                 // resume / audio-switch reload) the first time we've
                 // got real audio in the renderer. Latched so subsequent
                 // packets don't keep snapping the clock back.
-                if !clockArmed, !buffers.isEmpty {
+                if !clockArmed(), !buffers.isEmpty {
                     aOut.seekClock(to: initialClockTime, rate: initialRate)
-                    clockArmed = true
+                    markClockArmed()
                 }
             }
 

@@ -27,14 +27,57 @@ enum SubtitleDecoder {
     /// via `Task.cancel()`; throws on open / codec failure. Returns
     /// cues sorted by `startTime`.
     static func decodeFile(url: URL, httpHeaders: [String: String] = [:]) async throws -> [SubtitleCue] {
-        try await Task.detached(priority: .userInitiated) {
-            try decodeFileSync(url: url, httpHeaders: httpHeaders)
-        }.value
+        // Task.cancel() does NOT propagate into a detached task (and
+        // `Task.isCancelled` inside it refers to the detached task, so it
+        // was always false): a superseded sidecar load used to decode the
+        // whole file to the end, HTTP traffic included. Bridge the
+        // caller's cancellation explicitly: the handler trips a shared
+        // flag the decode loop polls, and aborts the AVIO reader so a
+        // read blocked on a stalled source unwinds promptly.
+        let token = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                try decodeFileSync(url: url, httpHeaders: httpHeaders, cancel: token)
+            }.value
+        } onCancel: {
+            token.cancel()
+        }
+    }
+
+    /// Thread-safe cancellation token bridged into the detached decode
+    /// task (cf. `FrameExtractor.CancelToken`). Also aborts a registered
+    /// AVIO reader so cancellation isn't stuck behind a blocked read.
+    private final class CancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private var reader: AVIOReader?
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let r = reader
+            lock.unlock()
+            r?.markClosed()
+        }
+
+        var isCancelled: Bool {
+            lock.lock(); defer { lock.unlock() }; return cancelled
+        }
+
+        func register(_ r: AVIOReader) {
+            lock.lock()
+            let wasCancelled = cancelled
+            reader = r
+            lock.unlock()
+            if wasCancelled { r.markClosed() }
+        }
     }
 
     // MARK: - Synchronous core
 
-    private static func decodeFileSync(url: URL, httpHeaders: [String: String]) throws -> [SubtitleCue] {
+    private static func decodeFileSync(
+        url: URL, httpHeaders: [String: String], cancel: CancelFlag
+    ) throws -> [SubtitleCue] {
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         var formatContext: UnsafeMutablePointer<AVFormatContext>?
@@ -46,6 +89,7 @@ enum SubtitleDecoder {
             let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
             try reader.open()
             avioReader = reader
+            cancel.register(reader)
             guard let ctx = avformat_alloc_context() else {
                 reader.close()
                 throw SubtitleDecoderError.openFailed(code: -1)
@@ -129,7 +173,7 @@ enum SubtitleDecoder {
         var cues: [SubtitleCue] = []
         var nextID = 0
 
-        while !Task.isCancelled {
+        while !cancel.isCancelled {
             var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
             let readRet = av_read_frame(fmt, pkt)

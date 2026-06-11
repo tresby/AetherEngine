@@ -49,9 +49,28 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Cached CMVideoFormatDescription for sample-buffer wrapping.
     /// Format descriptions are expensive to create (allocation + Core
     /// Foundation refcount), cache keyed by pixel buffer dimensions +
-    /// format so we only rebuild when the stream changes.
+    /// full pixel format + colorimetry attachments so we only rebuild
+    /// when the stream actually changes (a mid-stream colorimetry
+    /// switch at identical dimensions must NOT reuse the stale
+    /// description: CMVideoFormatDescriptionCreateForImageBuffer
+    /// snapshots the color attachments at creation time).
+    ///
+    /// Guarded by `reorderLock`: written on the decoder thread in
+    /// `createSampleBuffer`, nil'd by `flush()`/`recreateDisplayLayer()`
+    /// from other threads.
     private var cachedFormatDesc: CMVideoFormatDescription?
-    private var cachedFormatKey: UInt64 = 0
+    private var cachedFormatKey: FormatDescriptionKey?
+
+    /// See `cachedFormatDesc`. Colorimetry fields are bridged Strings so
+    /// the struct stays Equatable without CF reference identity traps.
+    private struct FormatDescriptionKey: Equatable {
+        var width: Int
+        var height: Int
+        var pixelFormat: OSType
+        var primaries: String?
+        var transfer: String?
+        var matrix: String?
+    }
 
     /// Tracks whether at least one frame has reached the display layer
     /// since the last reset. Used by `AetherEngine.load()` to wait for
@@ -188,7 +207,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         reorderBuffer.removeAll()
         cachedFormatDesc = nil
-        cachedFormatKey = 0
+        cachedFormatKey = nil
         reorderLock.unlock()
 
         firstFrameLock.lock()
@@ -260,7 +279,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         // and CMVideoFormatDescriptionCreateForImageBuffer snapshots those
         // into the description at creation time.
         cachedFormatDesc = nil
-        cachedFormatKey = 0
+        cachedFormatKey = nil
         reorderLock.unlock()
 
         firstFrameLock.lock()
@@ -354,17 +373,29 @@ final class SampleBufferRenderer: @unchecked Sendable {
     }
 
     private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
-        // Reuse the format description unless dimensions or pixel format
+        // Reuse the format description unless the format actually
         // changed, rebuilding per frame wastes an allocation and Core
         // Foundation refcount churn in the hot path.
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        let key = (UInt64(width) << 40) | (UInt64(height) << 16) | UInt64(fmt & 0xFFFF)
+        let key = FormatDescriptionKey(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer),
+            pixelFormat: CVPixelBufferGetPixelFormatType(pixelBuffer),
+            primaries: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) as? String,
+            transfer: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String,
+            matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
+        )
+
+        // Cache access under reorderLock: flush()/recreateDisplayLayer()
+        // nil the cache from other threads, and an unsynchronized strong
+        // ref read against that write is an ARC race.
+        reorderLock.lock()
+        let cachedDesc: CMVideoFormatDescription? =
+            (cachedFormatKey == key) ? cachedFormatDesc : nil
+        reorderLock.unlock()
 
         let desc: CMVideoFormatDescription
-        if let cached = cachedFormatDesc, key == cachedFormatKey {
-            desc = cached
+        if let cachedDesc {
+            desc = cachedDesc
         } else {
             var formatDesc: CMVideoFormatDescription?
             let status = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -373,8 +404,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 formatDescriptionOut: &formatDesc
             )
             guard status == noErr, let new = formatDesc else { return nil }
+            reorderLock.lock()
             cachedFormatDesc = new
             cachedFormatKey = key
+            reorderLock.unlock()
             desc = new
         }
 

@@ -44,7 +44,18 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// After a seek, skip frames before this PTS to avoid the
     /// "fast forward" effect. Decoded for reference but not converted.
-    var skipUntilPTS: CMTime?
+    ///
+    /// Guarded by its own `skipLock` (not the main `lock`: `emit()` runs
+    /// WITH the main lock held, so a same-lock accessor would deadlock).
+    /// The host writes from the seek path while the demux thread reads
+    /// in `emit`; CMTime is a multi-word struct, so the old
+    /// unsynchronized access was a torn-read candidate.
+    var skipUntilPTS: CMTime? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
+        set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
+    }
+    private var _skipUntilPTS: CMTime?
+    private let skipLock = NSLock()
 
     /// Protects codecContext from concurrent access between the demux
     /// thread (decode) and the main thread (close/flush).
@@ -284,8 +295,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
-        lock.unlock()
+        // Inside the locked section: emit() reads onFrame under the same
+        // lock from the demux thread, and an unsynchronized closure write
+        // (multi-word + release of the old value) against that read is a
+        // data race with crash potential on a stop mid-decode.
         onFrame = nil
+        lock.unlock()
     }
 
     deinit {

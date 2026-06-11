@@ -235,9 +235,26 @@ final class EmbeddedSubtitleDecoder {
         guard !isClearEvent || isPGS else { return nil }
 
         // Dedupe full duplicate non-empty events; keep clear events
-        // distinct since each one trims a different previous cue.
+        // distinct since each one trims a different previous cue. The key
+        // includes the CONTENT, not just times + body count: two
+        // simultaneous speaker lines (classic anime ASS, one MKV block
+        // packet each with identical pts/duration and one text body each)
+        // are distinct events and must both survive; a times+count key
+        // collided them and silently dropped the second line.
         if !isClearEvent {
-            let key = "\(startTime)|\(endTime)|\(bodies.count)"
+            let contentKey = bodies.map { body -> String in
+                switch body {
+                case .text(let t):
+                    return "t:\(t)"
+                case .image(let img):
+                    // Bitmap cues: dimensions + position discriminate
+                    // cheaply (hashing pixels per event is not worth it;
+                    // identical-rect repeats ARE the duplicate case this
+                    // dedupe exists for).
+                    return "i:\(img.cgImage.width)x\(img.cgImage.height)@\(img.position)"
+                }
+            }.joined(separator: "\u{1F}")
+            let key = "\(startTime)|\(endTime)|\(contentKey)"
             if seenKeys.contains(key) { return nil }
             seenKeys.insert(key)
         }

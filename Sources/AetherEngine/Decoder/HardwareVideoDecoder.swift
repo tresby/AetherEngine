@@ -38,7 +38,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// After a seek, skip frames before this PTS to avoid the
     /// "fast forward" effect of dumping pre-seek RASL frames to the
     /// renderer. Decoded for reference but not delivered upstream.
-    var skipUntilPTS: CMTime?
+    ///
+    /// Guarded by its own `skipLock`: the host writes from the seek
+    /// path while VT's callback queue reads in `handleDecodedFrame`
+    /// (CMTime is a multi-word struct, so the old unsynchronized access
+    /// was a torn-read candidate on top of the ARC race). Deliberately
+    /// NOT the main `lock`: `close()` holds that across
+    /// `VTDecompressionSessionWaitForAsynchronousFrames`, which waits
+    /// for the very callback that would need the lock (deadlock).
+    var skipUntilPTS: CMTime? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
+        set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
+    }
+    private var _skipUntilPTS: CMTime?
+    private let skipLock = NSLock()
 
     // MARK: - Internals
 
@@ -406,11 +419,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     ) {
         // Seek-pre-roll trim: while skipUntilPTS is set, drop frames
         // whose PTS is earlier than the target. The renderer would
-        // skip them anyway but dropping here saves an enqueue.
-        if let threshold = skipUntilPTS, CMTimeCompare(pts, threshold) < 0 {
-            return
-        }
-        if skipUntilPTS != nil, CMTimeCompare(pts, skipUntilPTS!) >= 0 {
+        // skip them anyway but dropping here saves an enqueue. Single
+        // locked read into a local: the old triple read (with a force
+        // unwrap in the middle) could trap when the host's seek path
+        // nil'd the threshold between the check and the unwrap.
+        if let threshold = skipUntilPTS {
+            if CMTimeCompare(pts, threshold) < 0 {
+                return
+            }
             skipUntilPTS = nil
         }
 
