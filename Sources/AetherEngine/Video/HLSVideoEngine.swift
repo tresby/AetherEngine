@@ -525,7 +525,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        preopenedDemuxer: Demuxer? = nil
+        preopenedDemuxer: Demuxer? = nil,
+        sourceReopenableByURL: Bool = true
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -540,6 +541,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
         self.preopenedDemuxer = preopenedDemuxer
+        self.sourceReopenableByURL = sourceReopenableByURL
     }
 
     /// Whether this engine is serving an unbounded (live) source. Set
@@ -551,6 +553,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// appends it to the provider's growing segment list). VOD paths
     /// leave this false and are unaffected.
     private let isLiveSession: Bool
+
+    /// Whether a live-session loss can be recovered by reopening
+    /// `sourceURL`. `true` for real network URLs; `false` for custom
+    /// (IOReader-backed) sources whose `sourceURL` is the synthetic
+    /// `aether-custom://source` placeholder. Burning the reopen backoff
+    /// budget against that synthetic URL guarantees 6 consecutive
+    /// failures before the session stalls silently; when `false`,
+    /// `handlePumpFinished` surfaces the loss to the host via
+    /// `onLiveSourceReset` immediately instead.
+    private let sourceReopenableByURL: Bool
 
     /// DVR window in seconds for a live session (from `LoadOptions`).
     /// `nil` means live-only: no DVR seek, but the live window is still
@@ -1757,7 +1769,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return
         case .eof, .readError, .keyframeStarvation:
             // A healthy live source never EOFs; treat it like a loss.
-            break
+            // A source that cannot be reopened by URL (custom reader, e.g.
+            // the live HLS ingest) owns its upstream reconnection itself; by
+            // the time the pump exits, the loss is terminal. Re-opening the
+            // synthetic custom URL would burn the whole backoff budget on
+            // guaranteed failures and then stall silently. Surface the loss
+            // to the host instead (same retune surface as a detected source
+            // replay); the host re-negotiates or falls back.
+            if !sourceReopenableByURL {
+                EngineLog.emit(
+                    "[HLSVideoEngine] live custom-source pump exited (reason=\(reason)); "
+                    + "URL reopen not possible, requesting host retune",
+                    category: .session
+                )
+                onLiveSourceReset?()
+                return
+            }
         }
         restartLock.lock()
         let segmentsNow = provider?.liveContinuationPoint().nextIndex ?? 0

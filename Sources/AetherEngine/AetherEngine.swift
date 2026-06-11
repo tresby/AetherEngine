@@ -1742,7 +1742,8 @@ public final class AetherEngine: ObservableObject {
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
-            preopenedDemuxer: preopenedDemuxer
+            preopenedDemuxer: preopenedDemuxer,
+            sourceReopenableByURL: !isCustomSource
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
