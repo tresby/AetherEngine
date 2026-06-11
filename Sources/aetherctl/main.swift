@@ -1731,11 +1731,16 @@ private func takeFlag(_ name: String, from rest: inout [String]) -> Bool {
 }
 
 /// Pluck a `--key value` pair out of the rest-args list, returning
-/// the value as Int. Returns nil if absent or unparseable.
+/// the value as Int. Returns nil if absent; exits 64 on a present but
+/// missing/unparseable value (silently falling back to the default AND
+/// leaving the flag token in `rest` used to corrupt the URL positional).
 private func takeIntFlag(_ name: String, from rest: inout [String]) -> Int? {
-    guard let idx = rest.firstIndex(of: name),
-          idx + 1 < rest.count,
-          let value = Int(rest[idx + 1]) else { return nil }
+    guard let idx = rest.firstIndex(of: name) else { return nil }
+    guard idx + 1 < rest.count, let value = Int(rest[idx + 1]) else {
+        let got = idx + 1 < rest.count ? "'\(rest[idx + 1])'" : "nothing"
+        print("ERROR: \(name) expects an integer value, got \(got)")
+        exit(64)
+    }
     rest.removeSubrange(idx...(idx + 1))
     return value
 }
@@ -1751,13 +1756,29 @@ private func takeStringFlag(_ name: String, from rest: inout [String]) -> String
 }
 
 /// Pluck a `--key value` pair out of the rest-args list, returning
-/// the value as Double. Returns nil if absent or unparseable.
+/// the value as Double. Returns nil if absent; exits 64 on a present
+/// but missing/unparseable value (see `takeIntFlag`).
 private func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
-    guard let idx = rest.firstIndex(of: name),
-          idx + 1 < rest.count,
-          let value = Double(rest[idx + 1]) else { return nil }
+    guard let idx = rest.firstIndex(of: name) else { return nil }
+    guard idx + 1 < rest.count, let value = Double(rest[idx + 1]) else {
+        let got = idx + 1 < rest.count ? "'\(rest[idx + 1])'" : "nothing"
+        print("ERROR: \(name) expects a numeric value, got \(got)")
+        exit(64)
+    }
     rest.removeSubrange(idx...(idx + 1))
     return value
+}
+
+/// Reject leftover `--flags` after a subcommand's known flags were
+/// plucked: a typo'd flag otherwise either vanished silently or, worse,
+/// became the URL positional and produced a misleading open error.
+private func rejectStrayFlags(_ rest: [String], subcommand: String) {
+    if let stray = rest.first(where: { $0.hasPrefix("--") }) {
+        print("ERROR: unknown flag '\(stray)' for subcommand '\(subcommand)'")
+        print("")
+        printUsage()
+        exit(64)
+    }
 }
 
 // DVR matrix subcommand.
@@ -1770,6 +1791,7 @@ if first == "dvr" {
         print("ERROR: --path must be native, sw, or both (got '\(path)')")
         exit(64)
     }
+    rejectStrayFlags(rest, subcommand: "dvr")
     exit(runDVR(path: path, seconds: seconds, dvrWindow: dvrWin))
 }
 
@@ -1816,6 +1838,7 @@ if first == "live" {
     // --sliding is accepted-and-ignored for backward compat: sliding is now
     // the unconditional behaviour for a live session, so the flag is a no-op.
     _ = takeFlag("--sliding", from: &rest)
+    rejectStrayFlags(rest, subcommand: "live")
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
                  serveOnly: serveOnly, measureRSS: measureRSS,
                  reportCacheBytes: reportCacheBytes, rewindTest: rewindTest,
@@ -1839,6 +1862,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let switchAudioFlag = takeFlag("--switch-audio", from: &rest)
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
+    rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
         print("")

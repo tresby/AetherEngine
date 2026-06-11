@@ -109,9 +109,15 @@ func runHLSFixture(args: [String]) -> Int32 {
         fmp4: fmp4
     )
     let server = HLSFixtureServer(config: config)
+    // exactly: the blind UInt16(port) conversion trapped on
+    // out-of-range user input (e.g. --port 70000) instead of erroring.
+    guard let preferredPort = UInt16(exactly: port) else {
+        print("ERROR: --port must be 0-65535 (got \(port))")
+        return 64
+    }
     let listenPort: UInt16
     do {
-        listenPort = try server.start(preferredPort: UInt16(port))
+        listenPort = try server.start(preferredPort: preferredPort)
     } catch {
         print("ERROR: server start failed: \(error.localizedDescription)")
         return 1

@@ -157,6 +157,15 @@ final class LiveFixture: @unchecked Sendable {
         label: "com.aetherengine.livefixture.accept",
         qos: .userInitiated
     )
+    /// Fixture-global wall-clock zero for the broadcast timeline. Each
+    /// connection derives its starting loop index from "now", so a
+    /// reconnecting client (e.g. after a --drop-after RST) sees the
+    /// clock having ADVANCED across the gap, like a real broadcast.
+    /// Per-connection resets to zero made reconnect tests exercise the
+    /// engine's backward-discontinuity handling instead of its
+    /// reconnect-resume behaviour.
+    private let fixtureStart = Date()
+
     private let workQueue = DispatchQueue(
         label: "com.aetherengine.livefixture.work",
         qos: .userInitiated,
@@ -396,7 +405,14 @@ final class LiveFixture: @unchecked Sendable {
         // Per-PID continuity counter, carried across loop boundaries so the
         // seam never produces a continuity_counter discontinuity.
         var ccByPID: [Int: UInt8] = [:]
-        var loopIndex: Int64 = 0
+        // Broadcast-clock start for THIS connection: whole loops elapsed
+        // since the fixture came up (see `fixtureStart`). The pacing gate
+        // below measures against `startLoopIndex`, so only media emitted
+        // on this connection counts toward its 1x budget.
+        let startLoopIndex: Int64 = loopPeriodTicks > 0
+            ? Int64((Date().timeIntervalSince(fixtureStart) * 90_000.0) / Double(loopPeriodTicks))
+            : 0
+        var loopIndex: Int64 = startLoopIndex
 
         // One-shot program-boundary discontinuity. After `discontinuityAfter`
         // seconds of serving, every subsequent packet's PTS / DTS / PCR gets
@@ -461,7 +477,7 @@ final class LiveFixture: @unchecked Sendable {
                 // lead is exceeded, which keeps overhead negligible while still
                 // holding the long-run rate.
                 if paced {
-                    let emittedMedia = Double(loopIndex) * loopPeriodSeconds
+                    let emittedMedia = Double(loopIndex - startLoopIndex) * loopPeriodSeconds
                         + (Double(packetIndex) / Double(packetsPerLoop)) * loopPeriodSeconds
                     // Serve the preroll window unpaced so the producer can
                     // establish a live window before the 1x clamp engages. Once
