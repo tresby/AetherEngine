@@ -6,6 +6,11 @@ import Foundation
 /// initial join (start near the live edge), normal forward growth, and the
 /// provider window sliding past our cursor (rejoin at the edge, flagged as
 /// a discontinuity so downstream timestamp rebase has a deterministic cue).
+/// Policy notes: `edgeOffset` is expected >= 1 (0 would skip the entire
+/// current window and only pick up segments on the next refresh); a rejoin
+/// after a window slide resets `stallCount`; a playlist that SHRINKS
+/// (spec-violating server) is indistinguishable from a stall and counts as
+/// one, which is the desired pressure toward the stall budget.
 struct HLSPlaylistTracker {
     /// How many segments behind the live edge to start (HLS convention: 3).
     private let edgeOffset: Int

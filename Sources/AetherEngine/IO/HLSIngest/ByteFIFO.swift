@@ -5,6 +5,10 @@ import Foundation
 /// are unblocked by `finish()` (EOF) and `cancel()` (error). Storage is a
 /// Data re-based with subdata on consume, never `removeFirst`
 /// (the persistent-window slice-storage lesson, AetherEngine 70430de).
+/// Capacity is a soft bound: a write blocks only while the queue is at or
+/// above capacity, then appends its whole chunk, so storage can exceed
+/// capacity by at most one chunk. Wakeups use broadcast so the queue stays
+/// correct even with more than one waiter per side.
 final class ByteFIFO: @unchecked Sendable {
     private let capacity: Int
     private let condition = NSCondition()
@@ -26,7 +30,7 @@ final class ByteFIFO: @unchecked Sendable {
         }
         if finished || cancelled { return false }
         storage.append(data)
-        condition.signal()
+        condition.broadcast()
         return true
     }
 
@@ -45,7 +49,7 @@ final class ByteFIFO: @unchecked Sendable {
         // Re-base instead of removeFirst: removeFirst on a long-lived Data
         // retains the sliced-off prefix's backing storage.
         storage = storage.subdata(in: n..<storage.count)
-        condition.signal()
+        condition.broadcast()
         return n
     }
 
