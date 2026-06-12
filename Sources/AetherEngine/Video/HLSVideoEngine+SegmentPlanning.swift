@@ -268,7 +268,16 @@ extension HLSVideoEngine {
                                   24000, 22050, 16000, 12000, 11025, 8000, 7350]
         guard let freqIdx = freqTable.firstIndex(of: codecpar.pointee.sample_rate) else { return false }
         let channels = max(1, Int(codecpar.pointee.ch_layout.nb_channels))
-        let chanConfig = channels <= 7 ? channels : 2
+        // AudioSpecificConfig channelConfiguration: 1-6 map 1:1, 7 means
+        // EIGHT channels (7.1), and 7-channel audio has no config value
+        // at all. The old `channels <= 7 ? channels : 2` declared 8-ch
+        // sources as stereo (decoder garbage) and 6.1 as 7.1.
+        let chanConfig: Int
+        switch channels {
+        case 1...6: chanConfig = channels
+        case 8:     chanConfig = 7
+        default:    return false  // 7-ch (or >8): no ASC representation; let the bridge handle it
+        }
         // audioObjectType: basic AAC profiles map profile→profile+1 (LC = 2);
         // default to 2 (AAC-LC, the mp4a.40.2 the engine advertises) otherwise.
         let profile = Int(codecpar.pointee.profile)

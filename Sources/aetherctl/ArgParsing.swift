@@ -42,9 +42,11 @@ func takeStringFlag(_ name: String, from rest: inout [String]) -> String? {
 /// but missing/unparseable value (see `takeIntFlag`).
 func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
     guard let idx = rest.firstIndex(of: name) else { return nil }
-    guard idx + 1 < rest.count, let value = Double(rest[idx + 1]) else {
+    guard idx + 1 < rest.count, let value = Double(rest[idx + 1]), value.isFinite else {
+        // isFinite: Double("nan")/"inf"/"1e300" parse successfully and
+        // then trap in every downstream Int(Double) conversion.
         let got = idx + 1 < rest.count ? "'\(rest[idx + 1])'" : "nothing"
-        print("ERROR: \(name) expects a numeric value, got \(got)")
+        print("ERROR: \(name) expects a finite numeric value, got \(got)")
         exit(64)
     }
     rest.removeSubrange(idx...(idx + 1))

@@ -276,6 +276,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let prefetchEnabled: Bool
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
+    /// Streaming-mode backpressure bounds: suspend the URLSession task
+    /// once the retained buffer exceeds the high water mark, resume once
+    /// the consumer drains it below the low water mark. Without this the
+    /// delegate appended at line rate while a paused consumer read
+    /// nothing, ballooning streamBuffer by the rest of the file.
+    private static let streamHighWater = 64 * 1024 * 1024
+    private static let streamLowWater = 32 * 1024 * 1024
 
     private let bufferLock = NSLock()
     private var currentBuffer = Data()
@@ -511,6 +518,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `streamLock` (set on the prefetch queue, read from teardown threads).
     private var streamingSession: URLSession?
     private var streamingTask: URLSessionDataTask?
+    /// True while the streaming task is suspended for backpressure.
+    /// Guarded by `streamLock`; suspend/resume calls stay balanced
+    /// because every transition flips this flag under the lock.
+    private var streamingTaskSuspended = false
 
     /// Mark as closed without freeing resources. The AVIO read callback
     /// checks this flag and returns -1 immediately, which causes
@@ -527,7 +538,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // the semaphore wait in streamDownloadSync.
         streamLock.lock()
         let sTask = streamingTask
+        let wasSuspended = streamingTaskSuspended
+        streamingTaskSuspended = false
         streamLock.unlock()
+        if wasSuspended { sTask?.resume() }
         sTask?.cancel()
         // Persistent mode: wake a read blocked waiting for forward data and
         // release a delivery callback blocked on backpressure. Bumping the
@@ -582,9 +596,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         streamBuffer = Data()
         let sTask = streamingTask
         let sSession = streamingSession
+        let wasSuspended = streamingTaskSuspended
+        streamingTaskSuspended = false
         streamingTask = nil
         streamingSession = nil
         streamLock.unlock()
+        if wasSuspended { sTask?.resume() }
         streamDataReady.signal()
         // Cancel a still-running streaming download (markClosed normally
         // already did; this covers a close() without prior markClosed).
@@ -688,7 +705,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
                 if fetchSize <= 0 { break }
 
-                guard let data = fetchChunk(from: position, size: fetchSize) else {
+                guard let data = fetchChunk(from: position, size: fetchSize), !data.isEmpty else {
+                    // nil = transport failure (budget exhausted); EMPTY =
+                    // a 2xx response with no body, which used to refetch
+                    // the same offset forever (the retry budget only
+                    // covers transport errors).
                     break
                 }
 
@@ -742,10 +763,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     streamBuffer = streamBuffer.subdata(in: trimAmount..<streamBuffer.count)
                     streamBytesRead += Int64(trimAmount)
                 }
+                var toResume: URLSessionDataTask?
+                if streamingTaskSuspended, streamBuffer.count < Self.streamLowWater {
+                    streamingTaskSuspended = false
+                    toResume = streamingTask
+                }
                 streamLock.unlock()
+                toResume?.resume()
             } else if ended {
                 break
             } else {
+                // About to wait for data: a backpressure-suspended task
+                // would never deliver any, so resume it first (covers a
+                // forward seek whose target lies beyond the suspended
+                // frontier).
+                streamLock.lock()
+                var toResume: URLSessionDataTask?
+                if streamingTaskSuspended {
+                    streamingTaskSuspended = false
+                    toResume = streamingTask
+                }
+                streamLock.unlock()
+                toResume?.resume()
                 // Wait for more data from the streaming task
                 let timeout = streamDataReady.wait(timeout: .now() + .seconds(15))
                 if timeout == .timedOut { break }
@@ -1197,7 +1236,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             guard let self, !self.isClosed else { return }
             self.streamLock.lock()
             self.streamBuffer.append(data)
+            // Backpressure: park the transfer once the retained buffer
+            // exceeds the high water mark; readStreaming resumes it when
+            // the consumer drains below the low water mark (and before
+            // any wait, so a far-forward seek can't deadlock against a
+            // suspended producer).
+            var toSuspend: URLSessionDataTask?
+            if !self.streamingTaskSuspended, self.streamBuffer.count > Self.streamHighWater {
+                self.streamingTaskSuspended = true
+                toSuspend = self.streamingTask
+            }
             self.streamLock.unlock()
+            toSuspend?.suspend()
             self.addBytesFetched(data.count)
             self.streamDataReady.signal()
         } onComplete: { [weak self] in

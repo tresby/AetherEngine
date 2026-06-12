@@ -157,12 +157,26 @@ final class PacketRingBuffer {
         let slice = entries.filter { $0.pts >= startPts }
         lock.unlock()
 
-        return slice.compactMap { entry in
+        var packets = slice.compactMap { entry -> Packet? in
             guard let data = try? Data(contentsOf: entry.fileURL, options: [.alwaysMapped, .uncached]) else {
                 return nil
             }
             return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: data)
         }
+        // Re-establish the keyframe alignment the caller relies on: the
+        // off-lock file reads can race eviction's deferred deletions, so
+        // the leading (keyframe) entry can be the one that failed while
+        // later doomed-but-undeleted files still read fine. Decoding
+        // would then start on a non-keyframe and artifact until the next
+        // GOP. Trim to the first video keyframe (audio-only results pass
+        // through untouched).
+        if packets.contains(where: { $0.isVideo }),
+           let kf = packets.firstIndex(where: { $0.isVideo && $0.isKeyframe }) {
+            if kf > 0 { packets.removeFirst(kf) }
+        } else if packets.contains(where: { $0.isVideo }) {
+            return []
+        }
+        return packets
     }
 
     // MARK: - Sequential consumption (live feeder)

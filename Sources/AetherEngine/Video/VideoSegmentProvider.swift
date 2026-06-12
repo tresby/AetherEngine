@@ -756,6 +756,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             stateLock.unlock()
             if count >= Self.liveStartupSegments { return true }
             if !firstSegmentCondition.wait(until: deadline) {
+                // Re-read after the timed-out wait: an append racing the
+                // deadline would otherwise be judged on the stale count
+                // (waitForLiveSegment below already does this).
+                stateLock.lock()
+                let count = segments.count
+                stateLock.unlock()
                 // Degraded start: serving the first playlist with fewer
                 // than liveStartupSegments segments loses the startup
                 // cushion that absorbs transcode jitter, so a -16832

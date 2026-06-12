@@ -138,6 +138,19 @@ extension HLSVideoEngine {
     /// HEVC / H.264 / AV1 (with HW decode for AV1). The dispatch throws
     /// `unsupportedDVProfile` for DV variants AetherEngine doesn't
     /// route (P8.2, P10.2, etc.).
+    /// Manifest VIDEO-RANGE for a source transfer characteristic.
+    /// PQ and HLG are distinct manifest values; mapping HLG onto PQ made
+    /// the panel negotiate the wrong EOTF for HLG broadcasts (the AV1
+    /// route already distinguished them, the H.264 and plain-HEVC routes
+    /// did not).
+    private func manifestVideoRange(_ codecpar: UnsafePointer<AVCodecParameters>) -> HLSVideoRange {
+        switch codecpar.pointee.color_trc {
+        case AVCOL_TRC_SMPTE2084:    return .pq
+        case AVCOL_TRC_ARIB_STD_B67: return .hlg
+        default:                     return .sdr
+        }
+    }
+
     func resolveCodecRoute(
         codecpar: UnsafePointer<AVCodecParameters>
     ) throws -> CodecRoute {
@@ -150,7 +163,7 @@ extension HLSVideoEngine {
             let safeLevel = levelIDC > 0 ? levelIDC : 40         // 4.0
             return CodecRoute(
                 codecTagOverride: "avc1",
-                videoRange: isHDRTransfer(codecpar) ? .pq : .sdr,
+                videoRange: manifestVideoRange(codecpar),
                 primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: false,
@@ -483,7 +496,7 @@ extension HLSVideoEngine {
         case .none:
             return CodecRoute(
                 codecTagOverride: "hvc1",
-                videoRange: isHDRTransfer(codecpar) ? .pq : .sdr,
+                videoRange: manifestVideoRange(codecpar),
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: false,

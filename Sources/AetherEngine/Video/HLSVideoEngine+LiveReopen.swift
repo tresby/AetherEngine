@@ -42,19 +42,24 @@ extension HLSVideoEngine {
                 return
             }
         }
+        // Counter updates inside the same restartLock section: they are
+        // touched by the pump threads of successive producers, and the
+        // lock both orders those accesses and pairs them with the
+        // provider snapshot.
         restartLock.lock()
         let segmentsNow = provider?.liveContinuationPoint().nextIndex ?? 0
-        restartLock.unlock()
         if segmentsNow == lastReopenSegmentCount {
             barrenReopenCycles += 1
         } else {
             barrenReopenCycles = 0
         }
         lastReopenSegmentCount = segmentsNow
-        if barrenReopenCycles >= Self.maxBarrenReopenCycles {
+        let barrenNow = barrenReopenCycles
+        restartLock.unlock()
+        if barrenNow >= Self.maxBarrenReopenCycles {
             EngineLog.emit(
                 "[HLSVideoEngine] live source produced no segments across "
-                + "\(barrenReopenCycles) reopen cycles; giving up (source considered dead)",
+                + "\(barrenNow) reopen cycles; giving up (source considered dead)",
                 category: .session
             )
             return

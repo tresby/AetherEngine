@@ -160,6 +160,13 @@ final class LiveFixture: @unchecked Sendable {
     /// reconnect-resume behaviour.
     private let fixtureStart = Date()
 
+    /// Highest loopIndex any connection has emitted, fixture-global.
+    /// Guarded by `stateLock`. A reconnect must start ABOVE this: the
+    /// wall-clock derivation alone only matches a paced (1x) serve; an
+    /// unpaced first connection races far ahead of real time, and a
+    /// reconnect starting at wall-clock would still jump backward.
+    private var highWaterLoopIndex: Int64 = -1
+
     private let workQueue = DispatchQueue(
         label: "com.aetherengine.livefixture.work",
         qos: .userInitiated,
@@ -407,9 +414,12 @@ final class LiveFixture: @unchecked Sendable {
         // since the fixture came up (see `fixtureStart`). The pacing gate
         // below measures against `startLoopIndex`, so only media emitted
         // on this connection counts toward its 1x budget.
-        let startLoopIndex: Int64 = loopPeriodTicks > 0
+        let wallDerived: Int64 = loopPeriodTicks > 0
             ? Int64((Date().timeIntervalSince(fixtureStart) * 90_000.0) / Double(loopPeriodTicks))
             : 0
+        stateLock.lock()
+        let startLoopIndex = max(wallDerived, highWaterLoopIndex + 1)
+        stateLock.unlock()
         var loopIndex: Int64 = startLoopIndex
 
         // One-shot program-boundary discontinuity. After `discontinuityAfter`
@@ -523,6 +533,9 @@ final class LiveFixture: @unchecked Sendable {
             }
 
             loopIndex &+= 1
+            stateLock.lock()
+            if loopIndex > highWaterLoopIndex { highWaterLoopIndex = loopIndex }
+            stateLock.unlock()
         }
     }
 

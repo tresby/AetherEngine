@@ -75,6 +75,12 @@ func runHLSFixture(args: [String]) -> Int32 {
     // Flags.
     let port          = takeIntFlag("--port", from: &rest) ?? 8090
     let segSeconds    = takeIntFlag("--segment-seconds", from: &rest) ?? 4
+    // 0 made currentSequence() divide by zero (Int(inf) traps on the
+    // first playlist request); negatives produced a nonsense playlist.
+    guard segSeconds >= 1 else {
+        print("ERROR: --segment-seconds must be >= 1 (got \(segSeconds))")
+        return 64
+    }
     let discAt        = takeIntFlag("--discontinuity-at", from: &rest)
     let dropSeg       = takeIntFlag("--drop-segment", from: &rest)
     let withMaster    = takeFlag("--master",       from: &rest)
@@ -434,7 +440,10 @@ final class HLSFixtureServer: @unchecked Sendable {
 
         case _ where path.hasPrefix("/seg") && path.hasSuffix(".ts"):
             let indexStr = path.dropFirst("/seg".count).dropLast(".ts".count)
-            guard let index = Int(indexStr) else { send404(fd: fd); return }
+            // index >= 0: Swift's % is sign-preserving, so a manual
+            // curl typo like /seg-1.ts indexed slices[-1] and crashed
+            // the whole fixture process mid-debugging-session.
+            guard let index = Int(indexStr), index >= 0 else { send404(fd: fd); return }
             if let drop = config.dropSegment, drop == index {
                 send404(fd: fd)
                 return

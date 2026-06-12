@@ -102,7 +102,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     public func cancel() {
-        // Unblock a pending read without invalidating the reader.
+        // Unblock a pending read. CAVEAT vs the IOReader contract
+        // ("unblock, don't invalidate"): the FIFO's cancel latch is
+        // permanent, so every subsequent read returns -1. Safe today
+        // because forward-only sources can never re-enter a read after
+        // cancel (the engine's reload paths no-op for them and
+        // makeIndependentReader() returns nil); if forward-only readers
+        // ever become reload-capable, this poisoning fires immediately.
         fifo.cancel()
     }
 

@@ -39,6 +39,20 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertEqual(variants.max(by: { $0.bandwidth < $1.bandwidth })?.uri, "high/index.m3u8")
     }
 
+    func testBandwidthAttributeIgnoresQuotedContent() throws {
+        // A comma+KEY sequence INSIDE a quoted value is content, not an
+        // attribute boundary; the parser must skip it.
+        let text = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:CODECS="avc1.64001f,BANDWIDTH=99",BANDWIDTH=100,RESOLUTION=640x360
+        low/index.m3u8
+        """
+        guard case .master(let variants) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(variants[0].bandwidth, 100)
+    }
+
     func testParsesMediaPlaylist() throws {
         let text = """
         #EXTM3U

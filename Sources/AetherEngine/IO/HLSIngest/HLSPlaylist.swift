@@ -142,6 +142,13 @@ enum HLSPlaylistParser {
                 let before = line[line.index(before: range.lowerBound)]
                 guard before == ":" || before == "," else { continue }
             }
+            // Reject matches inside a quoted value: CODECS="a,KEY=1"
+            // contains a legal comma-KEY sequence that is content, not
+            // an attribute boundary. Inside-quotes == odd number of
+            // quotes before the match.
+            let quotesBefore = line[line.startIndex..<range.lowerBound]
+                .reduce(0) { $1 == "\"" ? $0 + 1 : $0 }
+            guard quotesBefore % 2 == 0 else { continue }
             let rest = line[range.upperBound...]
             if rest.hasPrefix("\"") {
                 let afterQuote = rest.dropFirst()

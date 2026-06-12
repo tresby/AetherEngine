@@ -147,6 +147,7 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
         try await engine.load(source: .custom(reader), options: options)
     } catch {
         print("VERDICT: custom source failed: load error: \(error.localizedDescription)")
+        engine.stop()
         return 1
     }
 
