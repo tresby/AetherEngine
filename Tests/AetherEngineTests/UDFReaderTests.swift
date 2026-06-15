@@ -6,13 +6,20 @@ final class UDFReaderTests: XCTestCase {
         // tiny mpls (2s clip 00001) + a recognizable m2ts payload
         func be16(_ v: Int) -> [UInt8] { [UInt8((v>>8)&0xff), UInt8(v&0xff)] }
         func be32(_ v: Int) -> [UInt8] { [UInt8((v>>24)&0xff),UInt8((v>>16)&0xff),UInt8((v>>8)&0xff),UInt8(v&0xff)] }
-        var pi = [UInt8](); pi += Array("00001".utf8) + Array("M2TS".utf8) + be16(0) + [0] + be32(0) + be32(90000) + [UInt8](repeating:0,count:8)
-        let playlist = be32(0) + be16(0) + be16(1) + be16(0) + (be16(pi.count) + pi)
-        var mpls = Array("MPLS".utf8) + Array("0200".utf8) + be32(40) + be32(0)
-        mpls += [UInt8](repeating: 0, count: 40 - mpls.count) + playlist
+        // Incremental += build (not one long + chain) to keep the Swift type
+        // checker fast (chained form trips "unable to type-check in reasonable time").
+        var pi: [UInt8] = []
+        pi += Array("00001".utf8); pi += Array("M2TS".utf8); pi += be16(0); pi.append(0)
+        pi += be32(0); pi += be32(90000); pi += [UInt8](repeating: 0, count: 8)
+        var playlist: [UInt8] = []
+        playlist += be32(0); playlist += be16(0); playlist += be16(1); playlist += be16(0)
+        playlist += be16(pi.count); playlist += pi
+        var mpls: [UInt8] = []
+        mpls += Array("MPLS".utf8); mpls += Array("0200".utf8); mpls += be32(40); mpls += be32(0)
+        mpls += [UInt8](repeating: 0, count: 40 - mpls.count); mpls += playlist
         // m2ts: BDAV-ish: 4-byte TP_extra header then 0x47 sync, repeated; make it 2 sectors
-        var m2ts = [UInt8]()
-        for _ in 0..<400 { m2ts += [0x00,0x00,0x00,0x00, 0x47] + [UInt8](repeating: 0x10, count: 187) }
+        var m2ts: [UInt8] = []
+        for _ in 0..<400 { m2ts += [0x00, 0x00, 0x00, 0x00, 0x47]; m2ts += [UInt8](repeating: 0x10, count: 187) }
         return UDFFixture.make(mplsBytes: mpls, m2tsBytes: m2ts)
     }
 
@@ -61,11 +68,17 @@ final class UDFReaderTests: XCTestCase {
         // not trap. Build the full fixture then cut it to just past the AVDP.
         func be16(_ v: Int) -> [UInt8] { [UInt8((v>>8)&0xff), UInt8(v&0xff)] }
         func be32(_ v: Int) -> [UInt8] { [UInt8((v>>24)&0xff),UInt8((v>>16)&0xff),UInt8((v>>8)&0xff),UInt8(v&0xff)] }
-        let pi = Array("00001".utf8) + Array("M2TS".utf8) + be16(0) + [0] + be32(0) + be32(90000) + [UInt8](repeating:0,count:8)
-        let playlist = be32(0) + be16(0) + be16(1) + be16(0) + (be16(pi.count) + pi)
-        var mpls = Array("MPLS".utf8) + Array("0200".utf8) + be32(40) + be32(0)
-        mpls += [UInt8](repeating: 0, count: 40 - mpls.count) + playlist
-        var m2ts = [UInt8](); for _ in 0..<400 { m2ts += [0x00,0x00,0x00,0x00,0x47] + [UInt8](repeating:0x10,count:187) }
+        var pi: [UInt8] = []
+        pi += Array("00001".utf8); pi += Array("M2TS".utf8); pi += be16(0); pi.append(0)
+        pi += be32(0); pi += be32(90000); pi += [UInt8](repeating: 0, count: 8)
+        var playlist: [UInt8] = []
+        playlist += be32(0); playlist += be16(0); playlist += be16(1); playlist += be16(0)
+        playlist += be16(pi.count); playlist += pi
+        var mpls: [UInt8] = []
+        mpls += Array("MPLS".utf8); mpls += Array("0200".utf8); mpls += be32(40); mpls += be32(0)
+        mpls += [UInt8](repeating: 0, count: 40 - mpls.count); mpls += playlist
+        var m2ts: [UInt8] = []
+        for _ in 0..<400 { m2ts += [0x00, 0x00, 0x00, 0x00, 0x47]; m2ts += [UInt8](repeating: 0x10, count: 187) }
         let full = UDFFixture.make(mplsBytes: mpls, m2tsBytes: m2ts)
         let truncated = full.prefix(258 * 2048) // AVDP present (sector 256), VDS cut off
         XCTAssertThrowsError(try {
