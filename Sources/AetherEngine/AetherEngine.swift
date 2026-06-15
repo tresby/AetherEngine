@@ -56,6 +56,16 @@ public final class AetherEngine: ObservableObject {
 
     @Published public internal(set) var state: PlaybackState = .idle
 
+    /// True while playback is stalled waiting for data after it had already
+    /// begun (AVPlayer `timeControlStatus == .waitingToPlayAtSpecifiedRate`
+    /// with play intent), i.e. a mid-playback rebuffer. Distinct from
+    /// `state`, which deliberately keeps reporting `.playing` across a
+    /// rebuffer so the play/pause icon does not flicker. Consumers that
+    /// trust `currentTime` (scrubbers, A/V sync, multi-player coordinators)
+    /// can gate on this to tell a stall from real playback (AetherEngine#35).
+    /// Always false on the initial load spin-up (that is `state == .loading`).
+    @Published public internal(set) var isBuffering: Bool = false
+
     /// High-frequency playback clock (`currentTime`, `sourceTime`,
     /// live-edge fields). Deliberately a SEPARATE ObservableObject:
     /// its ~10 Hz ticks must not fire `objectWillChange` on the
@@ -820,6 +830,7 @@ public final class AetherEngine: ObservableObject {
             ? LiveWindow(windowSeconds: options.nativeRemoteHLS ? .greatestFiniteMagnitude : options.dvrWindowSeconds)
             : nil
         state = .loading
+        isBuffering = false
         clock.currentTime = 0
         nativeClockSeconds = 0
         duration = 0
@@ -1385,6 +1396,7 @@ public final class AetherEngine: ObservableObject {
 
     public func pause() {
         activeTransportHost?.pause()
+        isBuffering = false
         if state == .playing {
             state = .paused
         }
@@ -1885,6 +1897,7 @@ public final class AetherEngine: ObservableObject {
         liveShiftSeams.removeAll()
         nativeClockSeconds = 0
         clock.sourceTime = 0
+        isBuffering = false
 
         liveWindowTimerTask?.cancel()
         liveWindowTimerTask = nil

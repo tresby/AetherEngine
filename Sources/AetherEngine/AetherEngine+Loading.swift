@@ -128,6 +128,9 @@ extension AetherEngine {
                 // .error / .idle are terminal; don't resurrect them.
                 if case .error = self.state { return }
                 if self.state == .idle { return }
+                // Mid-playback rebuffer: only once playback has begun, so
+                // the live startup spin-up (state == .loading) is excluded.
+                self.isBuffering = self.state == .playing && status == .waitingToPlayAtSpecifiedRate
                 switch status {
                 case .playing:
                     if self.state != .playing { self.state = .playing }
@@ -390,7 +393,14 @@ extension AetherEngine {
                 // `.waitingToPlayAtSpecifiedRate` is a buffer stall while the
                 // user still intends to play, so it maps to .playing and the
                 // play/pause icon doesn't flicker on a rebuffer.
-                guard self.state == .playing || self.state == .paused else { return }
+                //
+                // Mid-playback rebuffer detection (independent of the
+                // play/pause reconciliation below): only count it as
+                // buffering once playback has begun, never during the
+                // initial load spin-up (state == .loading).
+                let startedPlaying = self.state == .playing || self.state == .paused
+                self.isBuffering = startedPlaying && status == .waitingToPlayAtSpecifiedRate
+                guard startedPlaying else { return }
                 switch status {
                 case .paused:
                     if self.state != .paused { self.state = .paused }
