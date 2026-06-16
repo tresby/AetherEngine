@@ -2070,6 +2070,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         firstActualVideoPts = packet.pointee.pts != Int64.min
                             ? packet.pointee.pts
                             : packet.pointee.dts
+                        // Arm the no-cut watchdog at playback start so it also
+                        // catches a wedge BEFORE the first segment ever cuts
+                        // (e.g. an SSAI ad pod right after the join). Cleared
+                        // and re-armed on every finalize thereafter.
+                        if isLive, lastLiveSegmentFinalizeAt == nil {
+                            lastLiveSegmentFinalizeAt = Date()
+                        }
                         videoShiftPts = firstActualVideoDts - desiredFirstVideoTfdtPts
                         // Open the audio gate now that we know where
                         // video actually landed. Audio shift will be
