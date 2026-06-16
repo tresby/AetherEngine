@@ -221,7 +221,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the same host-retune path as a main-source loss.
     private var mergeMainEOF = false
     private var mergeSideEOF = false
-    private let videoStreamIndex: Int32
+    // Not `let`: an SSAI ad creative is authored with a different video
+    // PID than the program, so libavformat hands its video on a fresh
+    // stream index mid-pump. The live loop re-points this at the new
+    // video stream (see the SSAI program-switch detection in the read
+    // loop) so the ad's video keeps flowing instead of being dropped as
+    // a foreign stream.
+    private var videoStreamIndex: Int32
     private let videoOutputStreamIndex: Int32 = 0
     private let cache: SegmentCache
     /// Absolute index offset for segments produced by this instance.
@@ -329,6 +335,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// #EXT-X-DISCONTINUITY tag would arrive one segment late while the
     /// boundary segment itself mixes old- and new-program content.
     private var pendingForceCutFlag: Bool = false
+
+    /// Latched when an SSAI program switch re-points `videoStreamIndex` at
+    /// a new video PID whose codec params (SPS/resolution) differ. The next
+    /// segment that opens must start a FRESH muxer so a new init segment is
+    /// captured and the playlist emits a per-discontinuity EXT-X-MAP for it
+    /// (versioned-init path). Consumed when that segment opens.
+    private var pendingVideoProgramSwitch: Bool = false
 
     /// Cross-stream rebase pairing. A program boundary jumps the shared
     /// MPEG-TS source clock on BOTH streams, but the content gap at the
@@ -1534,7 +1547,37 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
                 av_packet_free_side_data(packet)
 
-                let pktStreamIdx = packet.pointee.stream_index
+                var pktStreamIdx = packet.pointee.stream_index
+
+                // SSAI program switch. An ad creative is authored with a
+                // DIFFERENT video PID than the program (content video=PID
+                // 0x102, ad video=PID 0x100; audio shares its PID), so
+                // libavformat hands the ad's video on a fresh stream index
+                // mid-pump. With videoStreamIndex pinned to the program's
+                // video, the ad's video is classified as a foreign stream
+                // and dropped → no keyframe → the cutter wedges and AVPlayer
+                // hangs. Re-point videoStreamIndex at the new video stream
+                // so the ad keeps flowing, reset the dts baseline (the new
+                // program owns its own clock; judging it against the old
+                // one mis-drops every packet), and force a discontinuity so
+                // the seam carries a fresh init (versioned-init path below).
+                if isLive, origin == .main, sideAudioDemuxer == nil,
+                   pktStreamIdx != videoStreamIndex,
+                   pktStreamIdx != (audioConfig?.sourceStreamIndex ?? -1),
+                   demuxer.isVideoStream(pktStreamIdx) {
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] SSAI video program switch: "
+                        + "videoStreamIndex \(videoStreamIndex) → \(pktStreamIdx) "
+                        + "(ad/program on a new video PID)",
+                        category: .session
+                    )
+                    videoStreamIndex = pktStreamIdx
+                    lastVideoSourceDts = Int64.min
+                    lastSeenVideoExtradata = nil
+                    pendingDiscontinuityFlag = true
+                    pendingForceCutFlag = true
+                    pendingVideoProgramSwitch = true
+                }
 
                 // Repair unset dts. The matroska demuxer can emit
                 // packets with `AV_NOPTS_VALUE` for dts on B-frames
