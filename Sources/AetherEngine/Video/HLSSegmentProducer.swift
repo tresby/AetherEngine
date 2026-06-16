@@ -1651,7 +1651,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
                 av_packet_free_side_data(packet)
 
-                var pktStreamIdx = packet.pointee.stream_index
+                let pktStreamIdx = packet.pointee.stream_index
 
                 // SSAI program switch. An ad creative is authored with a
                 // DIFFERENT video PID than the program (content video=PID
@@ -1967,24 +1967,46 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 inherited = true
                             } else {
                                 // Stream-copy: inherit the video rebase delta
-                                // so the A/V relationship survives the
-                                // boundary. Clamp so the first rebased output
-                                // dts never lands at or below the last emitted
-                                // one (an audio splice overlap would otherwise
-                                // trip the muxer's monotonic check); the clamp
-                                // ceiling equals the independent measurement's
-                                // continuation point.
-                                let maxShift = packet.pointee.dts - lastOutputDts - 1
-                                newShift = min(candidate, maxShift)
-                                inherited = true
-                                if newShift != candidate {
+                                // so the A/V relationship survives the boundary.
+                                // Audio and video are both 90 kHz here, so the
+                                // video-derived shift keeps the two streams
+                                // sample-aligned EXACTLY. Apply it verbatim; do
+                                // NOT clamp it to the last output dts. A genuine
+                                // SSAI splice changes the audio-vs-video start
+                                // skew by a sub-frame amount (Pluto content
+                                // leads by ~51 ms, the spliced ad by ~67 ms), so
+                                // the first rebased audio packet can land a few
+                                // ms before the last emitted one. The old clamp
+                                // absorbed that overlap by moving the ENTIRE
+                                // shift, which dragged every following packet
+                                // late and ACCUMULATED across creatives (audio
+                                // drifts later and later, the device symptom).
+                                // Keeping the sync-correct shift instead leaves
+                                // the lone overlapping boundary packet to
+                                // OutputTimestampSanitizer, which nudges just
+                                // that packet forward by a tick. Guard: a
+                                // physically implausible overlap (> 0.5 s, e.g.
+                                // a malformed reset) re-anchors so we never
+                                // compress a long audio region into 1-tick
+                                // spacing.
+                                let firstOutputDts = packet.pointee.dts - candidate
+                                let overlapTicks = lastOutputDts - firstOutputDts
+                                let maxOverlapTicks = audio.sourceTimeBase.num > 0
+                                    ? Int64(0.5 * Double(audio.sourceTimeBase.den)
+                                            / Double(audio.sourceTimeBase.num))
+                                    : Int64.max
+                                if overlapTicks > maxOverlapTicks {
+                                    newShift = packet.pointee.dts - lastOutputDts - 1
                                     EngineLog.emit(
-                                        "[HLSSegmentProducer] audio rebase inherit clamped: "
-                                        + "candidate=\(candidate) maxShift=\(maxShift) "
-                                        + "(splice overlap collapsed)",
+                                        "[HLSSegmentProducer] audio rebase inherit re-anchored: "
+                                        + "candidate=\(candidate) overlap=\(overlapTicks) ticks "
+                                        + "exceeds \(maxOverlapTicks) (implausible reset)",
                                         category: .session
                                     )
+                                } else {
+                                    newShift = candidate
                                 }
+                                inherited = true
                             }
                         } else {
                             // Audio crossed first; remember the pre-boundary
@@ -2030,13 +2052,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     category: .session
                                 )
                             } else {
+                                // Apply the video-derived shift verbatim (both
+                                // streams 90 kHz, so it is sample-exact). Same
+                                // reasoning as the inherit branch above: do not
+                                // clamp the shift to the last output dts, which
+                                // dragged audio permanently late and accumulated
+                                // across creatives. Leave the sub-frame splice
+                                // overlap to OutputTimestampSanitizer; only an
+                                // implausibly large overlap (> 0.5 s) re-anchors.
                                 let lastOutputDts = lastAudioSourceDts - audioShiftPts
-                                let maxShift = packet.pointee.dts - lastOutputDts - 1
-                                let applied = min(override_.shift, maxShift)
+                                let firstOutputDts = packet.pointee.dts - override_.shift
+                                let overlapTicks = lastOutputDts - firstOutputDts
+                                let maxOverlapTicks = tb.num > 0
+                                    ? Int64(0.5 * Double(tb.den) / Double(tb.num))
+                                    : Int64.max
+                                let applied = overlapTicks > maxOverlapTicks
+                                    ? packet.pointee.dts - lastOutputDts - 1
+                                    : override_.shift
                                 EngineLog.emit(
                                     "[HLSSegmentProducer] audio rebase corrected to video-derived shift: "
                                     + "old=\(audioShiftPts) new=\(applied)"
-                                    + (applied != override_.shift ? " (clamped from \(override_.shift))" : ""),
+                                    + (applied != override_.shift ? " (re-anchored, overlap \(overlapTicks) ticks)" : ""),
                                     category: .session
                                 )
                                 audioShiftPts = applied
