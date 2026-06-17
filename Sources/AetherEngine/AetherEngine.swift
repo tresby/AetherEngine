@@ -2067,6 +2067,13 @@ public final class AetherEngine: ObservableObject {
         isSubtitleActive = false
         subtitleCues = []
         isLoadingSubtitles = false
+        cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
+        activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        loadedSecondarySidecarURL = nil
+        isSecondarySubtitleActive = false
+        secondarySubtitleCues = []
+        isLoadingSecondarySubtitles = false
         // Audio-track state belongs to the host's picker; clear it so a
         // stale index from the previous session can't be re-applied via
         // `selectAudioTrack` before the next `load(url:)` repopulates
