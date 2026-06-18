@@ -2152,10 +2152,18 @@ public final class AetherEngine: ObservableObject {
         #if os(iOS) || os(tvOS)
         let nc = NotificationCenter.default
 
-        // Pause VIDEO when the app backgrounds so it doesn't keep streaming
-        // in the background. The host calls `reloadAtCurrentPosition()` from
-        // its own foreground hook to recover from any AVIO invalidation tvOS
-        // may do during suspension.
+        // Tear the VIDEO pipeline DOWN when the app backgrounds, rather than
+        // merely pausing it. Pausing left a live native session frozen across
+        // a multi-hour tvOS suspension: the AVPlayer decode session in the
+        // shared `mediaserverd`, the in-process loopback HLS server sockets,
+        // and the upstream AVIO connection all stayed allocated. On resume
+        // that wedged `mediaserverd` system-wide, every app (including
+        // unrelated ones) could only paint the first frame until the device
+        // was rebooted. `teardownVideoForBackground()` releases the decode
+        // session synchronously so nothing live crosses into suspension; the
+        // host's foreground hook rebuilds via `reloadAtCurrentPosition()`
+        // (which already does a full rebuild on every full-background return,
+        // so resume behaviour is unchanged).
         //
         // AUDIO (music) is the opposite: it is MEANT to keep playing in the
         // background (UIBackgroundModes audio). Pausing it here, or even just
@@ -2173,18 +2181,49 @@ public final class AetherEngine: ObservableObject {
                 guard let self = self else { return }
                 if self.audioAVPlayerActive || self.audioHost != nil { return }
                 guard self.state == .playing || self.state == .paused else { return }
-                self.nativeHost?.pause()
-                // The SW path must pause too: without this a SW session
-                // kept demuxing/decoding/streaming until tvOS suspended
-                // the process, while the published state already said
-                // .paused.
-                self.softwareHost?.pause()
-                self.state = .paused
+                await self.teardownVideoForBackground()
             }
         }
         lifecycleObservers.append(bgObserver)
         #endif
     }
+
+    #if os(iOS) || os(tvOS)
+    /// Release the full video pipeline on app background so nothing live
+    /// crosses into a tvOS process suspension.
+    ///
+    /// `stopInternal` unloads the AVPlayer item (`replaceCurrentItem(nil)`)
+    /// and invalidates the software path's `VTDecompressionSession`
+    /// synchronously, which is what frees the shared `mediaserverd` decode
+    /// session before suspension. `keepNativeHost: true` preserves the
+    /// `NativeAVPlayerHost` and `currentAVPlayer` so AVKit's system
+    /// Now-Playing registration survives the seam (issue #15); the item is
+    /// still unloaded, only the empty player shell is kept.
+    /// `keepCustomReader: true` retains a byte-source reader for the
+    /// foreground reload. `stopInternal` deliberately preserves
+    /// `clock.currentTime`, `loadedURL`, and `loadedOptions`, so the host's
+    /// `reloadAtCurrentPosition()` resumes at the paused position.
+    ///
+    /// A `UIApplication` background-task assertion is held across the
+    /// teardown so the synchronous decode-session release and the loopback
+    /// server's detached socket close (HLSVideoEngine.stop drains the
+    /// producer for up to 3 s before closing its sockets) complete before
+    /// tvOS suspends the process, instead of being frozen mid-flight.
+    @MainActor
+    private func teardownVideoForBackground() async {
+        let app = UIApplication.shared
+        let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        // Mirror the former handler's published state: the session is torn
+        // down but the host will reload + repause on foreground return.
+        state = .paused
+        // Give the loopback server's detached cleanup (<=3 s producer drain,
+        // then synchronous socket shutdown/close) time to land before we
+        // release the assertion and let the process suspend.
+        try? await Task.sleep(nanoseconds: 3_500_000_000)
+        if bgTask != .invalid { app.endBackgroundTask(bgTask) }
+    }
+    #endif
 }
 
 // MARK: - Errors
