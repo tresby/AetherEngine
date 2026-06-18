@@ -14,11 +14,11 @@ extension HLSVideoEngine {
         case profile81         // HEVC P8.1 with HDR10-compat base  → dvh1 + PQ  (on DV display)
         case profile84         // HEVC P8.4 with HLG-compat base    → hvc1 + HLG + SUPPLEMENTAL dvh1/db4h
         case profile7          // HEVC P7 dual-layer (BL = HDR10)   → hvc1 + PQ (BL only)
-        case profile82         // HEVC P8.2 with SDR-compat base    → reject
+        case profile82         // HEVC P8.2 with SDR-compat base    → play Rec.709 base as plain hvc1
         case av1Profile10      // AV1 P10.0 (no base)               → dav1 + PQ
         case av1Profile101     // AV1 P10.1 with HDR10-compat base  → dav1 + PQ
         case av1Profile104     // AV1 P10.4 with HLG-compat base    → av01 + HLG + SUPPLEMENTAL dav1
-        case av1Profile102     // AV1 P10.2 with SDR-compat base    → reject
+        case av1Profile102     // AV1 P10.2 with SDR-compat base    → play Rec.709 base as plain av01
         case unknown           // anything else                     → reject
     }
 
@@ -132,12 +132,18 @@ extension HLSVideoEngine {
     ///     P8.4's base is HLG-HEVC.
     ///   - HEVC P7 → plain `hvc1.2.4.L<level>` HDR10, strip dvcC (no P7
     ///     decoder on any Apple TV chip).
+    ///   - HEVC P8.2 / AV1 P10.2 → SDR-compat base, no Apple DV decode
+    ///     path and the SDR base can't be repackaged to a DV profile, so
+    ///     play the Rec.709 base as plain `hvc1` / `av01` (strip DV).
+    ///   - H.264 P9 (AVC+DV) → plain `avc1`, strip DV (no AVC+DV decoder).
     ///   - HEVC plain → `hvc1.2.4.L<level>`, range derived from transfer.
     ///
     /// Pre-condition: caller has validated `codecpar.codec_id` is one of
-    /// HEVC / H.264 / AV1 (with HW decode for AV1). The dispatch throws
-    /// `unsupportedDVProfile` for DV variants AetherEngine doesn't
-    /// route (P8.2, P10.2, etc.).
+    /// HEVC / H.264 / AV1 (with HW decode for AV1). Every recognized DV
+    /// profile now plays (DV-capable ones as DV, the SDR-base ones P8.2 /
+    /// P10.2 / P9 as their stripped Rec.709 base). The dispatch only
+    /// throws `unsupportedDVProfile` for genuinely unknown DV variants,
+    /// where we can't assume the base layer is independently decodable.
     /// Manifest VIDEO-RANGE for a source transfer characteristic.
     /// PQ and HLG are distinct manifest values; mapping HLG onto PQ made
     /// the panel negotiate the wrong EOTF for HLG broadcasts (the AV1
@@ -161,12 +167,29 @@ extension HLSVideoEngine {
             let levelIDC = Int(codecpar.pointee.level)
             let safeProfile = profileIDC > 0 ? profileIDC : 100  // High
             let safeLevel = levelIDC > 0 ? levelIDC : 40         // 4.0
+            // AVC + DV (Profile 9, dvav.09) has no decoder on any Apple
+            // device: AVPlayer accepts AVC but not AVC+DV (DrHurt's
+            // matrix). The base layer is an ordinary Rec.709 SDR AVC
+            // stream, so play it as plain `avc1` and STRIP the DV config.
+            // Without the strip the mov muxer writes a `dvvC` box onto the
+            // avc1 sample entry (strict=-2) and tvOS 26's codec filter
+            // rejects it (cf. the P8.1/P8.4 non-DV strip path). The RPU
+            // NALs ride along ignored, exactly like P7's enhancement layer.
+            let hasDV = doviConfigRecord(from: codecpar) != nil
+            if hasDV {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AVC+DV (Profile 9) detected; "
+                    + "no Apple AVC+DV decoder, playing Rec.709 base as "
+                    + "plain avc1 (DV config stripped)",
+                    category: .session
+                )
+            }
             return CodecRoute(
                 codecTagOverride: "avc1",
                 videoRange: manifestVideoRange(codecpar),
                 primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
                 supplementalCodecs: nil,
-                stripDolbyVisionMetadata: false,
+                stripDolbyVisionMetadata: hasDV,
                 dvVariant: .none
             )
         }
@@ -250,16 +273,28 @@ extension HLSVideoEngine {
                     stripDolbyVisionMetadata: false,
                     dvVariant: dvVariant
                 )
-            case .av1Profile102:
-                throw HLSVideoEngineError.unsupportedDVProfile(profile: 10, compatID: 2)
             case .unknown:
                 let p = Int(dvRecord?.dv_profile ?? 0)
                 let c = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 0)
                 throw HLSVideoEngineError.unsupportedDVProfile(profile: p, compatID: c)
-            case .none:
-                // Plain AV1, no DV. Pick color signaling per the
-                // source's transfer characteristic so AVPlayer hands
-                // the right colorspace to the display.
+            case .none, .av1Profile102:
+                // Plain AV1 (no DV) OR P10.2 (SDR-compat base). P10.2's
+                // base is an ordinary Rec.709 SDR AV1 stream; no Apple
+                // device decodes P10.2 as DV, and the SDR base can't be
+                // repackaged to a DV-capable profile (the pixels are SDR,
+                // not PQ). Both play the AV1 base; P10.2 additionally
+                // strips its DV config so the muxer writes a clean `av01`
+                // sample entry with no `dav1`/DV signaling. Pick color
+                // signaling per the source's transfer characteristic so
+                // AVPlayer hands the right colorspace to the display.
+                if dvVariant == .av1Profile102 {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] AV1 DV Profile 10.2 (SDR base) "
+                        + "detected; not DV-routable, playing Rec.709 base "
+                        + "as plain av01 (DV config stripped)",
+                        category: .session
+                    )
+                }
                 let trc = codecpar.pointee.color_trc
                 let videoRange: HLSVideoRange
                 let cp: Int, tc: Int, mc: Int, bd: Int
@@ -282,7 +317,7 @@ extension HLSVideoEngine {
                     videoRange: videoRange,
                     primaryCodecs: primary,
                     supplementalCodecs: nil,
-                    stripDolbyVisionMetadata: false,
+                    stripDolbyVisionMetadata: dvVariant == .av1Profile102,
                     dvVariant: dvVariant
                 )
             // HEVC DV variants can't reach this switch (classifyDVVariant
@@ -487,19 +522,34 @@ extension HLSVideoEngine {
                 stripDolbyVisionMetadata: true,
                 dvVariant: dvVariant
             )
-        case .profile82:
-            throw HLSVideoEngineError.unsupportedDVProfile(profile: 8, compatID: 2)
         case .unknown:
             let p = Int(dvRecord?.dv_profile ?? 0)
             let c = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 0)
             throw HLSVideoEngineError.unsupportedDVProfile(profile: p, compatID: c)
-        case .none:
+        case .none, .profile82:
+            // Plain HEVC (no DV) OR P8.2 (SDR-compat base). P8.2's base
+            // is an ordinary Rec.709 SDR HEVC stream; Apple has no P8.2
+            // DV decode path and the SDR base can't be repackaged to a
+            // DV-capable profile (the pixels are SDR, not PQ). Both play
+            // the HEVC base; P8.2 additionally strips its DV config so the
+            // muxer writes a clean `hvc1` + `hvcC` sample entry with no
+            // dvvC box (a leftover dvvC trips tvOS 26's codec filter, cf.
+            // the P8.1 non-DV strip path). Range derives from the base
+            // transfer (Rec.709 → SDR). The RPU NALs ride along ignored.
+            if dvVariant == .profile82 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] HEVC DV Profile 8.2 (SDR base) "
+                    + "detected; not DV-routable, playing Rec.709 base as "
+                    + "plain hvc1 (DV config stripped)",
+                    category: .session
+                )
+            }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: manifestVideoRange(codecpar),
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: nil,
-                stripDolbyVisionMetadata: false,
+                stripDolbyVisionMetadata: dvVariant == .profile82,
                 dvVariant: dvVariant
             )
         // AV1 DV variants unreachable here (classify was called with
