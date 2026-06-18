@@ -10,6 +10,21 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.11.0] — 2026-06-18
+
+### Added
+
+- **Live Dolby Vision Profile 7 to 8.1 conversion.** P7 sources (dual-layer BL+EL+RPU, the common Blu-ray remux profile that Apple platforms cannot decode) now play by routing the base layer as 8.1 and rewriting the RPU live via `DoviRpuConverter` (libdovi, shipped as the new `LibDovi` xcframework). On any conversion failure the path falls back to HDR10 rather than rejecting the file. The conversion is gated off for SSAI re-init. `aetherctl dovitest <file>` exercises the converter. (S1483, S1484, S1489)
+- **P8.2 / P10.2 / P9 base-layer playback.** These profiles now play their base layers instead of being rejected outright.
+- **Intel Mac support.** `LibDovi` ships x86_64 fat binaries (macOS and iOS Simulator) as of 1.0.2, so AetherEngine cross-builds for x86_64. (1.0.1 added the iOS slices that 1.0.0 was missing.)
+
+### Fixed
+
+- **Loopback-HLS 404 `loadFailed` wedge after a rapid seek burst (#50).** An in-range VOD segment (`index < segmentCount`) evicted from the rolling window while the single producer sat elsewhere was answered with a 404, which AVPlayer treats as terminal `loadFailed`. The server now returns a retriable 503 for in-range misses (404 stays for genuinely out-of-range indices), and `serveSegment` re-asserts the producer reposition across bounded waits instead of orphaning it behind the #35 restart coalescer's single pending slot.
+- **Subtitles raced ahead of the picture during post-seek rebuffer (#49).** Under a sustained seek rate the published clock held the optimistic seek target while AVPlayer stayed parked at the pre-seek frame, so subtitles (which read `sourceTime`) led the on-screen image. `sourceTime` now tracks the actually-rendered frame on the native path while `currentTime` keeps scrub intent. Adds the `clockLeadSeconds` diagnostic.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.0))
+
 ## [3.10.0] — 2026-06-17
 
 ### Added
