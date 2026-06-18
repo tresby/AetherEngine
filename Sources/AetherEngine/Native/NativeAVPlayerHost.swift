@@ -25,6 +25,16 @@ final class NativeAVPlayerHost {
 
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
+    /// AVPlayer's actually-rendered position, published on EVERY periodic
+    /// tick including while a seek is in flight. Unlike `currentTime` (which
+    /// the seek path holds at the optimistic target and the observer
+    /// suppresses across `seekInFlight`, issue #37), this tracks where the
+    /// picture really is: during a not-yet-landed seek AVPlayer keeps
+    /// reporting the pre-seek clock, i.e. the parked on-screen frame. The
+    /// engine folds it onto source PTS and publishes it as `clock.sourceTime`
+    /// so frame-accurate consumers (subtitle overlay) follow the picture
+    /// instead of the scrub target (issue #49).
+    @Published private(set) var renderedTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
@@ -522,11 +532,17 @@ final class NativeAVPlayerHost {
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
                 guard let self else { return }
+                // `renderedTime` always tracks AVPlayer's reported position,
+                // even mid-seek: during a not-yet-landed seek that value is
+                // the parked on-screen frame, which is exactly what the
+                // source-PTS `sourceTime` should follow (issue #49).
+                self.renderedTime = value
                 // While a seek is in flight AVPlayer still reports the
                 // pre-seek clock until the seek physically lands on the
-                // loopback HLS-fMP4 source; publishing it bounces the
-                // engine clock back through the old position (issue #37).
-                // The seek completion handler publishes the landed time.
+                // loopback HLS-fMP4 source; publishing it to `currentTime`
+                // bounces the engine clock back through the old position
+                // (issue #37). The seek completion handler publishes the
+                // landed time.
                 guard !self.seekInFlight else { return }
                 self.currentTime = value
             }
@@ -708,7 +724,13 @@ final class NativeAVPlayerHost {
                         // settles on the target immediately instead of
                         // waiting a tick for the periodic observer.
                         let landed = self.avPlayer.currentTime().seconds
-                        if landed.isFinite { self.currentTime = landed }
+                        if landed.isFinite {
+                            self.currentTime = landed
+                            // The picture now sits at the landed position too,
+                            // so settle the rendered clock with it rather than
+                            // waiting a tick for the periodic observer (#49).
+                            self.renderedTime = landed
+                        }
                     }
                     cont.resume()
                 }
@@ -802,6 +824,7 @@ final class NativeAVPlayerHost {
         isReady = false
         // (didReachEnd already cleared above, with the terminal flags.)
         currentTime = 0
+        renderedTime = 0
         duration = 0
         rate = 0
     }

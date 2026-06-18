@@ -92,10 +92,18 @@ extension AetherEngine {
                 guard let self = self else { return }
                 self.nativeClockSeconds = value
                 self.clock.currentTime = value
-                self.clock.sourceTime = value
+                // `sourceTime` owned by the `$renderedTime` sink below so it
+                // tracks the picture across a seek (issue #49); shift is 0 on
+                // this direct-remote path, so it equals `currentTime` in
+                // steady playback.
                 if self.isLive {
                     self.publishLiveWindow(edgeSessionTime: host.seekableEnd)
                 }
+            }
+            .store(in: &nativeCancellables)
+        host.$renderedTime
+            .sink { [weak self] value in
+                self?.clock.sourceTime = value
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
@@ -251,7 +259,9 @@ extension AetherEngine {
                 // restart that landed past the planned keyframe), rather than
                 // lagging until the next periodic time tick.
                 self.clock.currentTime = self.nativeClockSeconds + seconds
-                self.clock.sourceTime = self.currentTime
+                // `sourceTime` re-folds on the next `$renderedTime` tick
+                // against the new shift; leaving it to that sink keeps it on
+                // the rendered position rather than this optimistic clock (#49).
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
@@ -386,7 +396,9 @@ extension AetherEngine {
                     self.playlistShiftSeconds = active.shift
                 }
                 self.clock.currentTime = value + self.playlistShiftSeconds
-                self.clock.sourceTime = self.currentTime
+                // `sourceTime` is owned by the `$renderedTime` sink below so
+                // it tracks the picture, not this (optimistic, seek-suppressed)
+                // clock; the two agree in steady playback (issue #49).
                 // Live: publish the DVR window surfaces on every tick. The
                 // edge must sit on the SAME session axis as the playhead. The
                 // playhead is folded as host.currentTime + playlistShiftSeconds
@@ -397,6 +409,20 @@ extension AetherEngine {
                 if self.isLive {
                     self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
                 }
+            }
+            .store(in: &nativeCancellables)
+        // `sourceTime` rides AVPlayer's actually-rendered position, folded
+        // onto source PTS with the same seam-resolved shift as the playhead.
+        // It is published even while a seek is in flight (the `$currentTime`
+        // sink above is suppressed then), so frame-accurate consumers follow
+        // the on-screen picture instead of the optimistic scrub target during
+        // a not-yet-landed seek / rebuffer (issue #49).
+        host.$renderedTime
+            .sink { [weak self] value in
+                guard let self = self else { return }
+                let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
+                    ?? self.playlistShiftSeconds
+                self.clock.sourceTime = value + shift
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)

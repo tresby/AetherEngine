@@ -117,13 +117,19 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print("  #38 isSeeking observed in-flight=\(sawSeeking ? "yes" : "NO") ended-cleared=\(endedCleared ? "yes" : "NO")  "
           + ((sawSeeking && endedCleared) ? "<-- PASS" : "<-- FAIL"))
 
-    struct Sample { let wall: Double; let ct: Double; let playing: Bool }
+    struct Sample { let wall: Double; let ct: Double; let src: Double; let playing: Bool }
     var samples: [Sample] = []
     let t0 = Date()
     func sample() {
         samples.append(Sample(
             wall: Date().timeIntervalSince(t0),
             ct: engine.currentTime,
+            // sourceTime tracks the rendered frame; ct - src is the published
+            // clock running ahead of the picture (issue #49 clockLead). On a
+            // fast headless AVPlayer the seek lands almost immediately, so this
+            // stays ~0 here; the metric exists to quantify the on-device
+            // rebuffer-stall window where it blows out.
+            src: engine.sourceTime,
             playing: engine.state == .playing
         ))
     }
@@ -194,6 +200,12 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         maxForwardStep = max(maxForwardStep, step)
     }
 
+    // clockLead: how far the published clock (ct) runs ahead of the rendered
+    // frame (src) across the burst. Peak + post-settle residual (issue #49).
+    var maxClockLead = 0.0
+    for s in samples { maxClockLead = max(maxClockLead, s.ct - s.src) }
+    let settleClockLead = (samples.last.map { $0.ct - $0.src }) ?? 0
+
     let finalCt = samples.last?.ct ?? engine.currentTime
     let settleError = abs(finalCt - finalTarget)
 
@@ -209,6 +221,8 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print(String(format: "  finalSeekTarget=%.1f finalClock=%.2f settleError=%.2fs",
                  finalTarget, finalCt, settleError))
     print(String(format: "  clock backwardJumps(>1s)=%d  maxForwardStep=%.2fs", backwardJumps, maxForwardStep))
+    print(String(format: "  clockLead (currentTime ahead of sourceTime/picture) peak=%.2fs settle=%.2fs",
+                 maxClockLead, settleClockLead))
     print("  --- restart-machinery log tally ---")
     print("  producer restarted (full restarts) = \(fullRestart)")
     print("  coalesced behind in-flight         = \(coalesced)")

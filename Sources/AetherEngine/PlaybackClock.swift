@@ -35,11 +35,15 @@ public final class PlaybackClock: ObservableObject {
     /// folded with `playlistShiftSeconds`).
     @Published public internal(set) var currentTime: Double = 0
 
-    /// Source PTS of the currently displayed frame. Equal to
-    /// `currentTime` on every path now that the native clock is
-    /// unified onto source time; kept as a stable alias for callers
-    /// that want to express source-timeline intent explicitly
-    /// (subtitle overlay, side-demuxer seek).
+    /// Source PTS of the currently displayed frame. On the native path
+    /// this rides AVPlayer's actually-rendered position, so it equals
+    /// `currentTime` in steady playback but holds the on-screen frame
+    /// while a seek is in flight or the loopback source rebuffers,
+    /// rather than jumping to the seek target the scrub clock
+    /// (`currentTime`) shows. Frame-accurate consumers (subtitle
+    /// overlay, side-demuxer re-arm) read this so they follow the
+    /// picture and not the scrub intent (issue #49). On the SW / audio
+    /// paths it equals `currentTime` always.
     @Published public internal(set) var sourceTime: Double = 0
 
     /// Fractional progress through the loaded item. Reset to 0 on

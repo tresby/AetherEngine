@@ -587,6 +587,20 @@ public final class AetherEngine: ObservableObject {
         activeProducerShiftSeconds - playlistShiftSeconds
     }
 
+    /// `currentTime - sourceTime`: how far the optimistic scrub clock leads
+    /// the actually-rendered frame position. 0 in steady playback (both ride
+    /// the same fold). Positive while a native seek is in flight or the
+    /// loopback source is rebuffering after a seek: `currentTime` holds the
+    /// seek target while the picture stays parked, so `sourceTime` (driven by
+    /// AVPlayer's reported position) trails it. This is the divergence
+    /// rrgomes measured on-device for AetherEngine#49 (the published clock
+    /// running ahead of AVPlayer's own clock under a sustained seek rate),
+    /// distinct from `frameAhead` (the producer-shift fold, which reads 0
+    /// because the producer shift is correct). Diagnostics only.
+    public var clockLeadSeconds: Double {
+        clock.currentTime - clock.sourceTime
+    }
+
     /// Monotonic load/stop generation. Bumped by every `stopInternal`
     /// (which runs at the head of every `load()`, `stop()`, and audio
     /// reload), captured by `load()`/`reloadWithAudioOverride` after
@@ -640,10 +654,14 @@ public final class AetherEngine: ObservableObject {
     /// reloading the live playlist during a pause).
     var liveWindowTimerTask: Task<Void, Never>?
 
-    /// Source PTS of the currently displayed frame. Equal to `currentTime`
-    /// on every path now that the native clock is unified onto source time;
-    /// kept as a stable alias for callers that want to express source-
-    /// timeline intent explicitly (subtitle overlay, side-demuxer seek).
+    /// Source PTS of the currently displayed frame. Tracks AVPlayer's
+    /// actually-rendered position on the native path, so it equals
+    /// `currentTime` in steady playback but holds the on-screen frame while a
+    /// seek is in flight or the loopback source rebuffers, instead of jumping
+    /// to the seek target the scrub clock shows (issue #49). Use it wherever
+    /// you need the picture's position rather than the scrub intent (subtitle
+    /// overlay, side-demuxer re-arm). On the SW / audio paths (shift 0, seeks
+    /// resolve synchronously) it equals `currentTime` always.
     /// Forwarder; for push updates subscribe to `clock.$sourceTime`.
     public var sourceTime: Double { clock.sourceTime }
 
@@ -1669,9 +1687,11 @@ public final class AetherEngine: ObservableObject {
             // Publish the target up front so the playhead holds it while the
             // host suppresses the periodic observer's stale pre-seek reads,
             // then await the real landing before flipping back to .playing.
+            // Only `currentTime` (the scrub clock) takes the optimistic target;
+            // `sourceTime` stays on the rendered frame via the `$renderedTime`
+            // sink until the seek actually lands (issue #49).
             nativeClockSeconds = clockTarget
             clock.currentTime = target
-            clock.sourceTime = target
             await nativeHost?.seek(to: clockTarget)
             guard seekGeneration == seekGen else { return }
             nativeClockSeconds = clockTarget
@@ -1698,9 +1718,10 @@ public final class AetherEngine: ObservableObject {
         // the clock only at finalize below, as before.
         let nativeOnly = !audioAVPlayerActive && audioHost == nil && softwareHost == nil && nativeHost != nil
         if nativeOnly {
+            // Optimistic scrub clock only; `sourceTime` holds the rendered
+            // frame via the `$renderedTime` sink until the seek lands (#49).
             nativeClockSeconds = clockTarget
             clock.currentTime = target
-            clock.sourceTime = target
         }
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
