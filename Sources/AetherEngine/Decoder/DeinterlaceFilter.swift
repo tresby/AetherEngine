@@ -37,6 +37,12 @@ final class DeinterlaceFilter {
     private var pixFmt: Int32 = -1
     private var loggedUnavailable = false
 
+    /// The stream time_base the graph was configured with. bwdif/yadif
+    /// halve their output link's time_base (and scale frame PTS by 2),
+    /// so `pull` rescales pulled PTS back into this base before handing
+    /// frames to the decoder, which timestamps on the stream time_base.
+    private var inputTimeBase = AVRational(num: 0, den: 1)
+
     /// True once a graph has been configured for this session; the
     /// decoder uses this to keep routing frames through the filter
     /// after the first interlaced one engaged it.
@@ -134,6 +140,7 @@ final class DeinterlaceFilter {
         graph = g
         srcCtx = src
         sinkCtx = sink
+        inputTimeBase = timeBase
         width = frame.pointee.width
         height = frame.pointee.height
         pixFmt = frame.pointee.format
@@ -157,7 +164,22 @@ final class DeinterlaceFilter {
     /// one-frame temporal lookahead), any other negative on error.
     func pull(into out: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let sink = sinkCtx else { return -1 }
-        return av_buffersink_get_frame(sink, out)
+        let ret = av_buffersink_get_frame(sink, out)
+        guard ret >= 0 else { return ret }
+        // bwdif/yadif configure their output link with time_base =
+        // input/2 and emit frame PTS in that halved base (pts *= 2 even
+        // in send_frame mode). The decoder timestamps every frame on the
+        // stream time_base, so without this rescale interlaced PTS arrive
+        // at 2x their real time: playback runs at half speed and a resume
+        // seek lands frames in the far future, freezing the picture.
+        let sinkTB = av_buffersink_get_time_base(sink)
+        if out.pointee.pts != Int64.min {  // AV_NOPTS_VALUE
+            out.pointee.pts = av_rescale_q(out.pointee.pts, sinkTB, inputTimeBase)
+        }
+        if out.pointee.duration > 0 {
+            out.pointee.duration = av_rescale_q(out.pointee.duration, sinkTB, inputTimeBase)
+        }
+        return ret
     }
 
     /// Free the graph. Called on flush (seek discontinuity: the
