@@ -38,6 +38,11 @@ final class NativeAVPlayerHost {
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
+    /// #50: monotonic token guarding a deferred item-failed confirmation.
+    /// Bumped each time a possibly-spurious `.failed` is deferred so a
+    /// later transition (a new failure, item swap) cancels an in-flight
+    /// confirmation.
+    private var failureConfirmToken: Int = 0
     /// True after the AVPlayer item reaches the end of its stream.
     /// Engine flips state to .idle so host end-of-content flows
     /// (auto-dismiss, next-episode countdown if no marker) fire.
@@ -399,7 +404,8 @@ final class NativeAVPlayerHost {
                         self.avPlayer.play()
                     }
                 case .failed:
-                    self.failureMessage = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    let desc = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    self.handleItemFailed(desc, item: item)
                 default:
                     break
                 }
@@ -639,6 +645,65 @@ final class NativeAVPlayerHost {
     /// `stopInternal()` after invoking `tearDown()` here).
     func tearDown() {
         unloadCurrentItem()
+    }
+
+    // MARK: - Failure handling
+
+    /// #50: AVPlayer flips `item.status` to `.failed` on transient errors it
+    /// then self-heals - an in-range loopback 404 the host retries, or an
+    /// AVIOReader range-read reconnect ("The network connection was lost.") -
+    /// while the player keeps playing straight through from buffer: the clock
+    /// and subtitle cues keep advancing and the title plays to the end. The
+    /// `item.error` is non-nil, but the failure is not actually terminal.
+    /// Publishing it as a terminal `.error` aborts a session that is
+    /// demonstrably still playing (rrgomes' device capture: `tcs=playing`,
+    /// `rate=1.0` at the `.failed` transition).
+    ///
+    /// A genuine fatal failure leaves the player stopped, so gate on
+    /// `timeControlStatus`: if the player is not playing, surface immediately;
+    /// if it is still playing, defer and confirm after a short settle. If it
+    /// is still playing at confirmation it has recovered (suppress); if it has
+    /// since stopped the failure was real (surface). This is the engine-side
+    /// fix for the spurious-`.failed`-while-playing state-machine inconsistency
+    /// rrgomes flagged, so hosts no longer need to suppress it themselves.
+    @MainActor
+    private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
+        // Ignore a late `.failed` KVO from an item we have already replaced.
+        guard playerItem === item else { return }
+
+        failureConfirmToken &+= 1
+        let token = failureConfirmToken
+
+        if avPlayer.timeControlStatus != .playing {
+            failureMessage = desc
+            return
+        }
+
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed while player still .playing; "
+            + "deferring possibly-spurious failure: \(desc)",
+            category: .engine
+        )
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self = self,
+                  self.failureConfirmToken == token,
+                  self.playerItem === item else { return }
+            if self.avPlayer.timeControlStatus == .playing {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: "
+                    + "player recovered and is still playing",
+                    category: .engine
+                )
+            } else {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: "
+                    + "player stopped (tcs=\(self.avPlayer.timeControlStatus.rawValue))",
+                    category: .engine
+                )
+                self.failureMessage = desc
+            }
+        }
     }
 
     // MARK: - Playback control
