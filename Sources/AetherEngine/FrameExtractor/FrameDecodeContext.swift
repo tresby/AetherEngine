@@ -27,6 +27,11 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var videoStreamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 90000)
+    /// Source sample aspect ratio (pixel width/height), read from the stream
+    /// at open. Anamorphic sources (NTSC/PAL DVD, anamorphic Blu-ray) store
+    /// non-square pixels; without this the thumbnail draws square-pixel and
+    /// looks horizontally stretched. Defaults to 1:1 (square) when unset.
+    private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
     private(set) var isHDR = false
 
@@ -105,6 +110,13 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         guard let codecpar = stream.pointee.codecpar else {
             throw FrameDecodeError.noCodecParameters
+        }
+        // Prefer the container/stream SAR; the software decoder does not
+        // reliably attach SAR to its output frames (see SoftwareVideoDecoder),
+        // so the per-frame value is only a fallback in convertToCGImage.
+        let parSAR = codecpar.pointee.sample_aspect_ratio
+        if parSAR.num > 0, parSAR.den > 0 {
+            streamSAR = parSAR
         }
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
@@ -254,6 +266,21 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
     }
 
+    /// Compute the output pixel dimensions for a target display width,
+    /// applying the source sample aspect ratio so anamorphic frames draw at
+    /// their true display shape. `targetWidth` is treated as the display
+    /// width and is capped to the coded width; the height is derived from the
+    /// display aspect ratio (coded aspect scaled by SAR). Square pixels
+    /// (sar 1:1) reduce to the coded aspect. Exposed for regression testing.
+    static func displayDimensions(srcW: Int, srcH: Int, sar: AVRational, targetWidth: Int) -> (Int, Int) {
+        let dstW = min(targetWidth, srcW)
+        let sarNum = sar.num > 0 ? Double(sar.num) : 1
+        let sarDen = sar.den > 0 ? Double(sar.den) : 1
+        let displayHeight = Double(dstW) * Double(srcH) * sarDen / (Double(srcW) * sarNum)
+        let dstH = max(1, Int(displayHeight.rounded()))
+        return (dstW, dstH)
+    }
+
     /// Output width for snapshot mode: native width, optionally capped
     /// to `maxSize` while preserving aspect ratio.
     private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, maxSize: CGSize?) -> Int {
@@ -302,8 +329,20 @@ final class FrameDecodeContext: @unchecked Sendable {
         let srcH = Int(frame.pointee.height)
         guard srcW > 0, srcH > 0, targetWidth > 0 else { return nil }
 
-        let dstW = min(targetWidth, srcW)
-        let dstH = max(1, Int((Double(dstW) * Double(srcH) / Double(srcW)).rounded()))
+        // Resolve the sample aspect ratio: the stream value (read at open) is
+        // authoritative, with the per-frame value as a fallback. For square
+        // pixels both are 1:1 and the output keeps the coded aspect.
+        let frameSAR = frame.pointee.sample_aspect_ratio
+        let sar = (streamSAR.num > 1 || streamSAR.den > 1)
+            ? streamSAR
+            : (frameSAR.num > 0 && frameSAR.den > 0 ? frameSAR : AVRational(num: 1, den: 1))
+
+        // targetWidth is the intended display width; derive the display height
+        // from the source display aspect ratio (coded aspect scaled by SAR) so
+        // anamorphic sources draw at their true shape, e.g. NTSC DVD 720x480
+        // SAR 8:9 -> 4:3 instead of a stretched 3:2.
+        let (dstW, dstH) = Self.displayDimensions(
+            srcW: srcW, srcH: srcH, sar: sar, targetWidth: targetWidth)
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
 
         swsContext = sws_getCachedContext(
