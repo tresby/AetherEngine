@@ -78,15 +78,33 @@ final class EmbeddedSubtitleDecoder {
             return nil
         }
 
-        // Bitmap codecs author their bitmaps against a known canvas
-        // (the source video frame). The probe step often can't
-        // determine those dimensions when the file is big and the
-        // sub stream sparse; seed from the captured video frame size
-        // as a fallback. The codec's PCS will overwrite once it
-        // arrives.
+        // Bitmap codecs need a canvas to position their rects against.
+        // The probe step often can't determine those dimensions when
+        // the file is big and the sub stream sparse, so seed a fallback;
+        // the codec's PCS / display-definition segment overwrites once
+        // an epoch-start arrives.
+        //
+        // PGS/HDMV is special: it is authored against the Blu-ray
+        // presentation composition plane (the PCS video descriptor),
+        // which is the HD 1920x1080 plane, NOT the source video frame.
+        // On a 4K (2160p) remux carrying a 1080p PGS track, seeding the
+        // source frame (3840x2160) makes any cue decoded before the next
+        // epoch-start PCS normalize against the wrong, too-large canvas,
+        // it renders shrunk and pulled toward screen center. That window
+        // is hit after an audio-track reload re-arms the side demuxer
+        // mid-epoch: the first resumed cue uses the seed (wrong), and
+        // only the next line (an epoch start) corrects ctx dimensions.
+        // Seed the standard composition plane for PGS so the pre-PCS
+        // window is already correct. DVB/DVD/XSUB do author against the
+        // video frame, so they keep the source-dimension seed.
         if Self.isBitmapCodec(id) {
-            if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
-            if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
+            if id == AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+                if ctx.pointee.width == 0 { ctx.pointee.width = 1920 }
+                if ctx.pointee.height == 0 { ctx.pointee.height = 1080 }
+            } else {
+                if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
+                if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
+            }
         }
 
         if avcodec_open2(ctx, codec, nil) < 0 {
