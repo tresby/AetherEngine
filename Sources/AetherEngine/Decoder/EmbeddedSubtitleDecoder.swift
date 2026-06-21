@@ -99,8 +99,19 @@ final class EmbeddedSubtitleDecoder {
         // video frame, so they keep the source-dimension seed.
         if Self.isBitmapCodec(id) {
             if id == AV_CODEC_ID_HDMV_PGS_SUBTITLE {
-                if ctx.pointee.width == 0 { ctx.pointee.width = 1920 }
-                if ctx.pointee.height == 0 { ctx.pointee.height = 1080 }
+                // Force the standard composition plane UNCONDITIONALLY,
+                // overriding any width/height carried in the subtitle
+                // stream's codecpar. A `if width == 0` guard is not enough:
+                // some muxes copy the source video frame size into the PGS
+                // stream's codecpar, so ctx.width arrives non-zero and
+                // wrong (e.g. 3840x2160 on a 4K remux whose PGS plane is
+                // 1920x1080). The PCS overwrites with the true plane on the
+                // next epoch start; this value only governs the pre-PCS
+                // window, the mid-epoch first cue after an audio-track
+                // reload re-arms the side demuxer, where 1920x1080 is the
+                // correct PGS default.
+                ctx.pointee.width = 1920
+                ctx.pointee.height = 1080
             } else {
                 if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
                 if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
