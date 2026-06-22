@@ -2,29 +2,20 @@ import Foundation
 import Libavformat
 import Libavutil
 
-/// Bridges a public `IOReader` into an `AVIOContext` via FFmpeg's
-/// `avio_alloc_context` read/seek callbacks. Mirrors `AVIOReader`'s
-/// lifecycle so the `Demuxer` accepts it at the same seam used for HTTP.
-///
-/// `@unchecked Sendable`: the only mutable state touched across threads is
-/// the close latches and the `context` pointer. `isClosed` is a plain Bool
-/// written without a lock (a benign race: the read callback only needs to
-/// eventually observe the flag to abort), matching AVIOReader's treatment.
-/// The `context` pointer is written once under the engine's existing teardown
-/// ordering (`markClosed` then `close`).
+/// Bridges an `IOReader` into `AVIOContext` via avio_alloc_context callbacks,
+/// mirroring AVIOReader's lifecycle at the same Demuxer seam.
+/// @unchecked Sendable: isClosed is a benign-race plain Bool (read callback
+/// only needs to eventually observe it); context written once under teardown ordering.
 final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     private let reader: IOReader
-    /// Matches AVIOReader.avioBufferSize (256 KB) for parity.
-    private static let bufferSize: Int32 = 256 * 1024
+    private static let bufferSize: Int32 = 256 * 1024  // matches AVIOReader.avioBufferSize
     private var buffer: UnsafeMutablePointer<UInt8>?
     private(set) var context: UnsafeMutablePointer<AVIOContext>?
     private var isClosed = false
     private var isFullyClosed = false
     private(set) var isSeekable: Bool = true
 
-    /// The custom reader owns its own I/O accounting; the memory probe only
-    /// meaningfully tracks network bytes, so report 0 here.
-    var cumulativeBytesFetched: Int64 { 0 }
+    var cumulativeBytesFetched: Int64 { 0 }  // custom readers don't track network bytes
 
     init(reader: IOReader) {
         self.reader = reader
@@ -52,10 +43,7 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         }
         context = ctx
 
-        // Probe seekability before any reads: SEEK_SET to 0 is a no-op for a
-        // seekable reader (returns >= 0) and is refused by a forward-only one
-        // (returns negative). Whence 0 == SEEK_SET. Safe here because the
-        // reader is fresh at position 0; FFmpeg has not read anything yet.
+        // SEEK_SET to 0 is a no-op for seekable, refused by forward-only (returns negative).
         isSeekable = reader.seek(offset: 0, whence: 0) >= 0
     }
 
@@ -69,32 +57,22 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         isFullyClosed = true
         isClosed = true
         if let ctx = context {
-            // avio_context_free releases the struct but NOT ctx->buffer
-            // (verified against aviobuf.c); the canonical pattern frees the
-            // buffer first. Must free ctx.pointee.buffer, not our original
-            // av_malloc pointer: FFmpeg can realloc the buffer internally
-            // (ffio_set_buf_size), making the original pointer stale.
+            // avio_context_free does NOT free ctx->buffer (verified, aviobuf.c).
+            // Free ctx.pointee.buffer (not original av_malloc ptr: FFmpeg may
+            // realloc via ffio_set_buf_size).
             av_free(ctx.pointee.buffer)
             avio_context_free(&context)
         }
         context = nil
         buffer = nil
-        // The bridge does NOT own the reader. The engine (primary reader) or
-        // the side path (clone reader) closes it. This decoupling lets the
-        // engine reuse one reader across an internal reload and run clones
-        // concurrently without a bridge teardown killing the source.
+        // Bridge does NOT own the reader; engine/side-path owns lifetime.
     }
 
     fileprivate func performRead(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
-        // -1 is an abort (mid-playback teardown), NOT a clean end-of-stream.
-        // Mirrors AVIOReader.read, which returns -1 on isClosed and reserves
-        // AVERROR_EOF for an actual EOF so FFmpeg does not run EOS handling
-        // on a forced stop.
+        // -1 = forced abort (not EOF); mirrors AVIOReader.read so FFmpeg doesn't run EOS handling.
         guard !isClosed else { return -1 }
         let n = reader.read(buf, size: size)
-        // IOReader's contract uses 0 for EOF; FFmpeg's avio expects
-        // AVERROR_EOF and can spin on a literal 0. Map it.
-        if n == 0 { return FFmpegErr.eof }
+        if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
         return n
     }
 

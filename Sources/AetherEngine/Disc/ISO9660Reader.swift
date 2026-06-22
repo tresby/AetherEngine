@@ -14,9 +14,8 @@ public enum DiscError: Error, Equatable {
     case malformed(String)
 }
 
-/// Read-only ISO9660 reader for the DVD-Video bridge filesystem. Parses the
-/// Primary Volume Descriptor and walks one directory level. No external libs.
-/// All offsets per ECMA-119. Random-access via the supplied seekable IOReader.
+/// Read-only ISO9660 (ECMA-119) reader for the DVD-Video bridge filesystem.
+/// Parses PVD and walks one directory level. Random-access via seekable IOReader.
 final class ISO9660Reader {
     private let reader: IOReader
     let sectorSize: Int
@@ -25,8 +24,7 @@ final class ISO9660Reader {
 
     init(reader: IOReader) throws {
         self.reader = reader
-        // Volume descriptors live in 2048-byte sectors regardless of the
-        // declared logical block size; the PVD is the 17th sector (index 16).
+        // PVD is the 17th sector (index 16); always 2048 bytes regardless of logical block size.
         let pvd = try ISO9660Reader.readBytes(reader, at: 16 * 2048, count: 2048)
         guard pvd.count >= 190,
               pvd[1] == 0x43, pvd[2] == 0x44, pvd[3] == 0x30,   // "CD0"
@@ -35,7 +33,7 @@ final class ISO9660Reader {
         }
         let bs = Int(pvd[128]) | (Int(pvd[129]) << 8)
         self.sectorSize = bs > 0 ? bs : 2048
-        // Root directory record begins at offset 156 in the PVD.
+        // Root directory record at PVD offset 156.
         guard let rootLBA = ISO9660Reader.le32(pvd, 156 + 2),
               let rootLength = ISO9660Reader.le32(pvd, 156 + 10) else {
             throw DiscError.malformed("truncated root directory record")
@@ -45,7 +43,6 @@ final class ISO9660Reader {
         guard rootLength > 0 else { throw DiscError.malformed("empty root directory") }
     }
 
-    /// List the file entries (non-directory) in a named top-level directory.
     func list(directory: String) throws -> [DiscFile] {
         let root = try readExtent(lba: rootLBA, length: rootLength)
         let entries = parseRecords(root)
@@ -76,7 +73,7 @@ final class ISO9660Reader {
                 continue
             }
             guard pos + recLen <= data.count, recLen >= 34 else { break }
-            let lenFI = Int(data[pos + 32]) // safe: recLen >= 34 ensures pos + 32 < data.count
+            let lenFI = Int(data[pos + 32])  // safe: recLen >= 34
             guard pos + 33 + lenFI <= data.count,
                   let lba = ISO9660Reader.le32(data, pos + 2),
                   let length = ISO9660Reader.le32(data, pos + 10) else { break }
@@ -84,9 +81,7 @@ final class ISO9660Reader {
             let isDir = (flags & 0x02) != 0
             let idBytes = Array(data[(pos + 33)..<(pos + 33 + lenFI)])
             pos += recLen
-            // Skip "." (0x00) and ".." (0x01) self/parent entries.
-            // lenFI == 1 is checked first, so idBytes[0] is safe (comma short-circuits).
-            if lenFI == 1, idBytes[0] <= 1 { continue }
+            if lenFI == 1, idBytes[0] <= 1 { continue }  // skip "." (0x00) and ".." (0x01)
             var name = String(decoding: idBytes, as: UTF8.self)
             if let semi = name.firstIndex(of: ";") { name = String(name[..<semi]) }
             out.append(Record(name: name, isDir: isDir, lba: lba, length: length))

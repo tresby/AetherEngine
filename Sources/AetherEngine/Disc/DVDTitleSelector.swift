@@ -1,11 +1,7 @@
 import Foundation
 
-/// Selects the DVD-Video main title without IFO parsing or GPL nav libs.
-/// DVD content is grouped into Video Title Sets (VTS). For title set `nn`,
-/// `VTS_nn_0.VOB` holds menus/data and `VTS_nn_1.VOB`..`VTS_nn_9.VOB` hold the
-/// content. The main title is, with high reliability, the title set whose
-/// content VOBs sum to the largest total size. Returns those content VOBs in
-/// part order; menu VOBs are excluded.
+/// Selects DVD-Video main title without IFO parsing. VTS_nn_0.VOB = menus;
+/// VTS_nn_1..9.VOB = content. Main title = largest total content VOB size.
 enum DVDTitleSelector {
     static func selectMainTitleVOBs(_ files: [DiscFile]) -> [DiscFile] {
         struct Part { let title: Int; let part: Int; let file: DiscFile }
@@ -23,8 +19,7 @@ enum DVDTitleSelector {
         return parts.sorted { $0.part < $1.part }.map(\.file)
     }
 
-    /// Parse "VTS_NN_P.VOB" -> (title NN, part P). Case-insensitive. Returns
-    /// nil for anything that is not a VTS content/menu VOB.
+    /// Parse "VTS_NN_P.VOB" -> (title NN, part P). Case-insensitive.
     static func parseVOBName(_ name: String) -> (title: Int, part: Int)? {
         let upper = name.uppercased()
         guard upper.hasPrefix("VTS_"), upper.hasSuffix(".VOB") else { return nil }
