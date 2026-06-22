@@ -1,28 +1,12 @@
 // Tests/AetherEngineTests/LivePlaylistRefreshTests.swift
-//
-// Invariants of the live media playlist across refresh-generation
-// bumps, pinned because the live-reload stall investigation showed the
-// reload join consuming exactly this shape: a playlist regenerated from
-// seg0 whose EXT-X-SODALITE-REFRESH counter had advanced several
-// generations while the producer raced through a re-served backlog.
-// The playlist itself must stay spec-valid and byte-distinguishable
-// across consecutive builds regardless of how fast segments append:
-//
-//   - no #EXT-X-ENDLIST and no #EXT-X-PLAYLIST-TYPE (a sliding live
-//     playlist per RFC 8216 §4.3.3.5),
-//   - #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES advertised (URL live
-//     sources honor blocking reload),
-//   - #EXT-X-MEDIA-SEQUENCE equals the snapshot's firstVisible,
-//   - exactly one #EXTINF + URI pair per visible segment,
-//   - the refresh counter makes two consecutive builds differ even
-//     when no segment was appended in between (the anti--12888 line).
+// Pins live-playlist invariants across refresh-generation bumps (reproduction of the live-reload stall:
+// playlist regenerated from seg0 while producer raced through a backlog). Guards: no ENDLIST/PLAYLIST-TYPE,
+// CAN-BLOCK-RELOAD=YES, MEDIA-SEQUENCE==firstVisible, one EXTINF+URI per segment, refresh counter
+// makes consecutive builds byte-distinct (anti -12888).
 import XCTest
 @testable import AetherEngine
 
-/// Live provider with a hand-controlled snapshot, so the test drives
-/// the exact sequence of (count, firstVisible, refreshCounter) the
-/// playlist builder sees across builds. Only members the media-playlist
-/// builder reads are meaningful; the rest take protocol defaults.
+/// Hand-controlled snapshot for driving exact (count, firstVisible, refreshCounter) sequences; only playlist-builder-relevant members are meaningful.
 private final class ScriptedLiveProvider: HLSSegmentProvider, @unchecked Sendable {
     var count: Int
     var firstVisible: Int = 0
@@ -49,10 +33,7 @@ final class LivePlaylistRefreshTests: XCTestCase {
         playlist.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     }
 
-    /// The reload join shape from the device repro: a playlist
-    /// regenerated from seg0 with a 20-segment backlog (window has not
-    /// slid). It must list every segment from 0, stay open-ended, and
-    /// keep the blocking-reload contract.
+    /// Device repro shape: 20-segment backlog from seg0, no window slide. Must list all segments, stay open-ended, keep blocking-reload contract.
     func testBacklogJoinShapeIsValidAndComplete() {
         let provider = ScriptedLiveProvider(count: 20)
         let playlist = HLSLocalServer.buildMediaPlaylistText(provider: provider)
@@ -69,10 +50,7 @@ final class LivePlaylistRefreshTests: XCTestCase {
         XCTAssertTrue(ls.contains("seg19.mp4"))
     }
 
-    /// Two consecutive builds with NO new segment must still differ at
-    /// the byte level (the refresh counter line), so AVPlayer's
-    /// "Playlist File unchanged" (-12888) check never trips during a
-    /// quiet window.
+    /// Consecutive builds with no new segment must differ byte-for-byte via the refresh counter, preventing AVPlayer -12888 during quiet windows.
     func testConsecutiveBuildsDifferViaRefreshCounter() {
         let provider = ScriptedLiveProvider(count: 3)
         let first = HLSLocalServer.buildMediaPlaylistText(provider: provider)
@@ -82,24 +60,19 @@ final class LivePlaylistRefreshTests: XCTestCase {
         XCTAssertTrue(lines(first).contains("#EXT-X-SODALITE-REFRESH:1"))
         XCTAssertTrue(lines(second).contains("#EXT-X-SODALITE-REFRESH:2"))
 
-        // And the refresh line is the ONLY difference for an unchanged
-        // window: stripping it makes the builds identical, proving the
-        // counter cannot disturb segment listing or tags.
+        // Refresh line is the ONLY difference: stripping it makes builds identical, proving the counter cannot disturb segment listing.
         func stripped(_ s: String) -> [String] {
             lines(s).filter { !$0.hasPrefix("#EXT-X-SODALITE-REFRESH:") }
         }
         XCTAssertEqual(stripped(first), stripped(second))
     }
 
-    /// A refresh-generation bump across appended segments (the reload's
-    /// racing producer) keeps MEDIA-SEQUENCE anchored to firstVisible
-    /// and extends the listing at the tail only.
+    /// Racing producer appends across a refresh bump: MEDIA-SEQUENCE stays anchored to firstVisible, tail extends.
     func testAppendAcrossRefreshBumpKeepsSequenceAnchored() {
         let provider = ScriptedLiveProvider(count: 2)
         let first = HLSLocalServer.buildMediaPlaylistText(provider: provider)
         XCTAssertEqual(lines(first).filter { $0.hasPrefix("#EXTINF:") }.count, 2)
 
-        // Producer races: 18 more segments before the next fetch.
         provider.count = 20
         let second = HLSLocalServer.buildMediaPlaylistText(provider: provider)
         let ls = lines(second)
@@ -107,8 +80,7 @@ final class LivePlaylistRefreshTests: XCTestCase {
                       "no window slide happened, so the sequence must stay 0")
         XCTAssertEqual(ls.filter { $0.hasPrefix("#EXTINF:") }.count, 20)
 
-        // Window slide (firstVisible advances): MEDIA-SEQUENCE follows
-        // and segments below it disappear from the listing.
+        // Window slide: MEDIA-SEQUENCE follows firstVisible, segments below it disappear.
         provider.firstVisible = 5
         let third = HLSLocalServer.buildMediaPlaylistText(provider: provider)
         let ls3 = lines(third)

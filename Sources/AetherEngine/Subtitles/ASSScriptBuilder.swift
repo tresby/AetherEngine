@@ -1,64 +1,32 @@
 import Foundation
 
-/// Reassembles a complete ASS script from the raw event lines the
-/// engine emits with `LoadOptions.preserveASSMarkup` (AetherEngine#30).
+/// Reassembles a full ASS script (header + Dialogue lines) from the raw event lines the engine emits under `LoadOptions.preserveASSMarkup` (#30), for whole-file renderers (e.g. swift-ass-renderer `loadTrack(content:)`).
 ///
-/// libavcodec normalizes every ASS/SSA event to
-/// `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`
-/// WITHOUT timestamps; timing travels on the cue (`startTime` /
-/// `endTime`, absolute source-PTS seconds). Whole-file renderers
-/// (e.g. swift-ass-renderer's `loadTrack(content:)`) want a full
-/// script with `Dialogue:` lines instead. This builder accumulates
-/// events as they stream in from the paced side demuxer, dedupes
-/// re-emits by CONTENT (line text + cue times), and renders
-/// `header + Dialogue lines` on demand.
+/// libavcodec normalizes events to `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text` WITHOUT timestamps; timing travels on the cue (`startTime`/`endTime`, absolute source-PTS seconds). Accumulates streamed events from the paced side demuxer, dedupes re-emits by CONTENT (line text + cue times).
 ///
-/// Dedupe is deliberately NOT keyed on ReadOrder: the spec says it is
-/// unique per event, but real files ship with ReadOrder hardcoded to
-/// 0 on every line (field repro: an anime MKV whose whole track
-/// collapsed to one event under ReadOrder-keyed dedupe). The content
-/// key still absorbs the engine's re-emits after seeks, which are
-/// byte-identical.
+/// Dedupe deliberately NOT keyed on ReadOrder: real files ship ReadOrder hardcoded to 0 on every line (field repro: anime MKV collapsed to one event under ReadOrder-keyed dedupe). Content key still absorbs byte-identical post-seek re-emits.
 ///
-/// Pure string assembly, no rendering, no UI: the engine stays
-/// backend-only; hosts hand the script to whatever renderer they ship.
-/// Not thread-safe; confine to one actor (hosts typically call it
-/// from their MainActor cue sink).
+/// Not thread-safe; confine to one actor (typically host MainActor cue sink).
 public final class ASSScriptBuilder {
 
     private let header: String
-    /// Synthesized Dialogue lines with their cue start (for ordering)
-    /// and arrival sequence (stable tie-break).
     private var events: [(start: Double, seq: Int, line: String)] = []
     /// Content keys (`start|end|raw line`) of everything in `events`.
     private var seen: Set<String> = []
 
     public var eventCount: Int { events.count }
 
-    /// `header` is the track's script header, i.e.
-    /// `TrackInfo.assHeader` (`[Script Info]` + `[V4+ Styles]` +
-    /// the `[Events]` Format line). NUL bytes are stripped: MKV
-    /// CodecPrivate is frequently NUL-terminated, and libass parses
-    /// C-string-style, so a single embedded NUL would make it ignore
-    /// every line appended after the header (field repro: "2 styles,
-    /// 0 events" for a script that visibly contained the events).
+    /// `header` is the track's `TrackInfo.assHeader`. NUL bytes stripped: MKV CodecPrivate is often NUL-terminated and libass parses C-string-style, so an embedded NUL drops every line after the header (field repro: "2 styles, 0 events").
     public init(header: String) {
         self.header = header.replacingOccurrences(of: "\0", with: "")
     }
 
-    /// Add one cue body. `rawEventText` is `SubtitleCue.body`'s text
-    /// under `preserveASSMarkup`; it may contain SEVERAL raw event
-    /// lines joined by newlines (one per packet rect). `start` / `end`
-    /// are the cue's times in seconds. Returns true when at least one
-    /// NEW event (unseen content) was added.
+    /// Add one cue body. `rawEventText` may contain SEVERAL raw event lines joined by newlines (one per packet rect); `start`/`end` in seconds. Returns true when at least one NEW (unseen) event was added.
     @discardableResult
     public func add(rawEventText: String, start: Double, end: Double) -> Bool {
         var addedAny = false
         for line in rawEventText.split(separator: "\n", omittingEmptySubsequences: true) {
-            // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-            // The numeric-ReadOrder check validates the line SHAPE
-            // (so plain text with many commas is rejected); the value
-            // itself is untrustworthy and unused.
+            // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text. Numeric-ReadOrder check validates line SHAPE (rejects comma-heavy plain text); value itself untrustworthy and unused.
             let fields = line.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
             guard fields.count == 9, Int(fields[0]) != nil else { continue }
             let key = "\(start)|\(end)|\(line)"
@@ -76,16 +44,7 @@ public final class ASSScriptBuilder {
         return addedAny
     }
 
-    /// The full script: header, then all known events ordered by
-    /// ReadOrder.
-    ///
-    /// MKV codec private data usually ends after the last `Style:`
-    /// line WITHOUT an `[Events]` section (mkvmerge and friends strip
-    /// it together with the events). Appending `Dialogue:` lines
-    /// straight after such a header leaves them inside `[V4+ Styles]`
-    /// and libass parses 0 events (field repro: "Added subtitle file:
-    /// <memory> (2 styles, 0 events)"). Synthesize the section plus
-    /// the standard Format line whenever the header lacks it.
+    /// Full script: header then events ordered by start/seq. MKV CodecPrivate often ends after the last `Style:` WITHOUT an `[Events]` section, so appended `Dialogue:` lines land inside `[V4+ Styles]` and libass parses 0 events (field repro: "2 styles, 0 events"); synthesize the section + Format line when missing.
     public func script() -> String {
         var lines = [header]
         lines.reserveCapacity(events.count + 2)
@@ -105,12 +64,7 @@ public final class ASSScriptBuilder {
         return lines.joined(separator: "\n")
     }
 
-    /// Drop all accumulated events. The header is PER-TRACK
-    /// (`TrackInfo.assHeader` carries that track's `[V4+ Styles]`):
-    /// on a subtitle track switch build a NEW instance with the new
-    /// track's header instead of resetting this one, or the new
-    /// track's events render against the old track's styles. reset()
-    /// is for same-track re-feeds only.
+    /// Drop accumulated events. Header is PER-TRACK (`TrackInfo.assHeader` carries that track's `[V4+ Styles]`): on a track SWITCH build a NEW instance, not reset, else new events render against old styles. reset() is for same-track re-feeds only.
     public func reset() {
         events.removeAll(keepingCapacity: true)
         seen.removeAll(keepingCapacity: true)

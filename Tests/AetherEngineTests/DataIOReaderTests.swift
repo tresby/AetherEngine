@@ -48,9 +48,9 @@ struct DataIOReaderTests {
         let reader = DataIOReader(data: Data())
         var buf = [UInt8](repeating: 0, count: 4)
         let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 4) }
-        #expect(n == 0)  // EOF immediately
-        #expect(reader.seek(offset: 0, whence: 65536) == 0)  // AVSEEK_SIZE = 0
-        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)  // seekability probe succeeds
+        #expect(n == 0)
+        #expect(reader.seek(offset: 0, whence: 65536) == 0)   // AVSEEK_SIZE = 0
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
     }
 
     @Test("Seek beyond end clamps to the length")
@@ -59,7 +59,7 @@ struct DataIOReaderTests {
         #expect(reader.seek(offset: 10, whence: SEEK_SET) == 3)  // clamped to length
         var buf = [UInt8](repeating: 0, count: 1)
         let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 1) }
-        #expect(n == 0)  // EOF
+        #expect(n == 0)
     }
 
     @Test("Negative seek is rejected and leaves the cursor unchanged")
@@ -68,6 +68,6 @@ struct DataIOReaderTests {
         #expect(reader.seek(offset: -5, whence: SEEK_SET) < 0)
         var buf = [UInt8](repeating: 0, count: 1)
         _ = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 1) }
-        #expect(buf[0] == 1)  // cursor still at 0; first byte
+        #expect(buf[0] == 1)  // cursor still at 0
     }
 }

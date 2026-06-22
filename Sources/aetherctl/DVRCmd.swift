@@ -3,8 +3,7 @@ import AetherEngine
 
 // MARK: - dvr matrix harness
 
-/// Run the full DVR matrix on one playback path (native or SW).
-/// Returns 0 if all hard invariants pass, 1 otherwise.
+/// Run the DVR matrix on one playback path (native or SW). Returns 0 if all hard invariants pass.
 @MainActor
 private func dvrMatrixRun(
     label: String,
@@ -39,9 +38,7 @@ private func dvrMatrixRun(
     print(String(format: "  post-load state=%@ isLive=%@ t=%.2fs",
                  "\(engine.state)", "\(engine.isLive)", engine.currentTime))
 
-    // ---- Sampling loop ----
-    // Sample every ~12s. Two-thirds through the run we inject a rewind+return.
-    let sampleInterval = 12
+    let sampleInterval = 12 // sample every ~12s; inject rewind+return at two-thirds of the run
     let totalTicks = max(sampleInterval * 2 + sampleInterval, Int(playSeconds))
     let rewindTick = (totalTicks * 2) / 3
     let rewindOffset = 20.0   // seconds to rewind behind live edge
@@ -73,9 +70,7 @@ private func dvrMatrixRun(
         let disk = engine.segmentCacheDiskBytes ?? 0
         diskSamples.append(disk)
 
-        // Stall detection: time must advance over consecutive ticks at
-        // wall-clock 1x. The synthetic fixture runs faster than 1x so
-        // currentTime may jump ahead; the hard failure is it staying put.
+        // Stall: time staying put is the failure (fixture runs faster than 1x so forward jumps are normal).
         if case .playing = stateNow {
             if ct <= prevTime && tick > 5 {
                 anyStall = true
@@ -93,7 +88,6 @@ private func dvrMatrixRun(
                          Double(disk) / 1_048_576.0))
         }
 
-        // Mid-run: rewind then return to edge.
         if tick == rewindTick && !rewindDone {
             rewindEdgeBefore = engine.liveEdgeTime
             seekTargetTime = rewindEdgeBefore - rewindOffset
@@ -102,16 +96,13 @@ private func dvrMatrixRun(
             await engine.seek(to: seekTargetTime)
             rewindDone = true
 
-            // Collect 5 post-seek samples (1s each).
             for si in 0..<5 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 let pt = engine.currentTime
                 let pb = engine.behindLiveSeconds
                 postSeekTimeSamples.append(pt)
                 print(String(format: "    post-seek +%ds t=%.2f behind=%.2f", si+1, pt, pb))
-                // Update prevTime to the post-seek cursor so stall check
-                // doesn't false-positive on the next iteration.
-                prevTime = pt
+                prevTime = pt // reset stall-check baseline after seek
             }
 
             // Now return to live edge.
@@ -119,7 +110,6 @@ private func dvrMatrixRun(
             await engine.seekToLiveEdge()
             seekToEdgeDone = true
 
-            // Collect 5 post-return samples.
             for ri in 0..<5 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 let pt = engine.currentTime
@@ -145,25 +135,19 @@ private func dvrMatrixRun(
     print("")
     print("=== HARD INVARIANT CHECKS (\(label)) ===")
 
-    // Check 1: no stall (state stayed .playing, time advanced).
     let check1 = !anyStall
     print("  [1] Sustained .playing with advancing time: \(check1 ? "PASS" : "FAIL")")
 
-    // Check 2: seekableLiveRange non-nil and has positive span.
     let check2 = finalRange != nil && (finalRange!.upperBound - finalRange!.lowerBound) > 0
     let rangeStr = finalRange.map { String(format: "%.2f...%.2f", $0.lowerBound, $0.upperBound) } ?? "nil"
     print("  [2] seekableLiveRange non-nil and advancing: \(check2 ? "PASS" : "FAIL")  (\(rangeStr))")
 
-    // Check 3: after rewind, the playhead moved backward vs. the edge before.
-    // Use the earliest post-seek sample as the "where we landed" value.
+    // Check 3: after rewind, playhead moved back vs. the pre-rewind edge.
     var check3 = false
     var check3detail = "no rewind performed"
     if rewindDone, let firstPostSeek = postSeekTimeSamples.first {
-        // Playhead must have moved back relative to the pre-rewind edge.
-        // Tolerance: one full DVR window (keyframe granularity varies
-        // between 1 s and 5 s on the fixture so we allow generous slack).
         let movedBack = firstPostSeek < rewindEdgeBefore
-        let landedNearTarget = abs(firstPostSeek - seekTargetTime) <= dvrWindow
+        let landedNearTarget = abs(firstPostSeek - seekTargetTime) <= dvrWindow // generous: keyframe granularity 1-5s
         check3 = movedBack && landedNearTarget
         check3detail = String(format: "edgeBefore=%.2f target=%.2f landed=%.2f movedBack=%@ landedNear=%@",
                               rewindEdgeBefore, seekTargetTime, firstPostSeek,
@@ -171,9 +155,7 @@ private func dvrMatrixRun(
     }
     print("  [3] After rewind, playhead moved back to near target: \(check3 ? "PASS" : "FAIL")  (\(check3detail))")
 
-    // Check 4: after seekToLiveEdge, isAtLiveEdge became true OR
-    // behindLiveSeconds dropped sharply (< 10s) since it may not flip
-    // the boolean instantly on the synthetic fixture.
+    // Check 4: after seekToLiveEdge, isAtLiveEdge or behindLiveSeconds < 10s (boolean may not flip instantly on the synthetic fixture).
     var check4 = false
     var check4detail = "no seekToLiveEdge performed"
     if seekToEdgeDone {
@@ -185,9 +167,7 @@ private func dvrMatrixRun(
     }
     print("  [4] After seekToLiveEdge, isAtLiveEdge or behind < 10s: \(check4 ? "PASS" : "FAIL")  (\(check4detail))")
 
-    // Check 5: disk bytes do not grow unbounded (plateau).
-    // "Not growing unbounded" = the last third of samples is not strictly
-    // larger than the first third, or the total growth is < 50 MB.
+    // Check 5: disk bytes plateau (last-third max not much larger than first-third max).
     var check5 = true
     var check5detail = "no samples"
     if diskSamples.count >= 3 {
@@ -196,9 +176,7 @@ private func dvrMatrixRun(
         let firstMax = firstThird.max() ?? 0
         let lastMax  = lastThird.max()  ?? 0
         let growthMB = Double(max(0, lastMax - firstMax)) / 1_048_576.0
-        // Allow up to 100 MB growth (the first-segment warm-up can spike
-        // before the sliding window prunes old segments).
-        check5 = growthMB < 100.0
+        check5 = growthMB < 100.0 // 100 MB tolerance for first-segment warm-up spike
         check5detail = String(format: "firstMax=%.2fMB lastMax=%.2fMB growth=%.2fMB",
                               Double(firstMax) / 1_048_576.0,
                               Double(lastMax)  / 1_048_576.0,
@@ -206,11 +184,10 @@ private func dvrMatrixRun(
     }
     print("  [5] Disk bytes not unbounded (plateau): \(check5 ? "PASS" : "FAIL")  (\(check5detail))")
 
-    // Informational (device-verify) metrics -- do NOT fail on these.
     print("")
     print("=== INFO (device-verify) metrics (\(label)) ===")
 
-    // RSS / phys footprint slope (unreliable off-device on macOS).
+    // RSS slope is unreliable off-device on macOS.
     let phys = physFootprintBytes()
     let res  = residentBytes()
     print(String(format: "  INFO (device-verify): phys_footprint=%.1fMB  resident=%.1fMB",
@@ -218,7 +195,6 @@ private func dvrMatrixRun(
                  res  >= 0 ? Double(res)  / 1_048_576.0 : -1))
     print("  INFO (device-verify): macOS phys_footprint ~7-8GB VM does NOT map to tvOS jetsam; verify on device.")
 
-    // behindLiveSeconds stability during the rewind window.
     if !postSeekTimeSamples.isEmpty {
         let minBehind = postReturnBehindSamples.min().map { String(format: "%.2f", $0) } ?? "n/a"
         print("  INFO (device-verify): behindLiveSeconds post-seek min=\(minBehind)s (unreliable on synthetic fixture; verify on device.)")
@@ -243,8 +219,6 @@ private func dvrMatrixRun(
     return hardPassed ? 0 : 1
 }
 
-/// Entry point for the `dvr` subcommand.
-/// Runs the DVR matrix on one or both playback paths.
 func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
     EngineLog.handler = { print($0) }
 
@@ -257,7 +231,6 @@ func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
     let runNative = path == "native" || path == "both"
     var runSW     = path == "sw"     || path == "both"
 
-    // Validate that the SW seed exists before committing to the SW leg.
     if runSW && !fm.fileExists(atPath: swSeed) {
         let genCmd = "ffmpeg -i \(nativeSeed) -f lavfi -t 5 "
             + "-i \"sine=frequency=440:sample_rate=48000\" "
@@ -282,7 +255,6 @@ func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
             return 1
         }
 
-        // Start a LiveFixture for the native leg.
         let fixture: LiveFixture
         do {
             fixture = try LiveFixture(seedPath: nativeSeed)
@@ -315,7 +287,6 @@ func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
     }
 
     if runSW {
-        // Force SW routing for the SW leg.
         AetherEngine.setForceSoftwarePathForTesting(true)
         defer { AetherEngine.setForceSoftwarePathForTesting(false) }
 

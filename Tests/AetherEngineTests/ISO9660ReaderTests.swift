@@ -33,8 +33,7 @@ final class ISO9660ReaderTests: XCTestCase {
     }
 
     func test_truncatedImageThrowsMalformedOrNotISO() throws {
-        // A valid-looking ISO whose backing data is cut off before the PVD's
-        // referenced root extent must throw, not trap.
+        // PVD present but root extent cut off: must throw, not trap.
         let full = ISO9660Fixture.make(files: [.init(name: "VTS_01_1.VOB", length: 100)])
         let truncated = full.prefix(17 * ISO9660Fixture.sectorSize) // PVD present, root extent cut
         XCTAssertThrowsError(try {

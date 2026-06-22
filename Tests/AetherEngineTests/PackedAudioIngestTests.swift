@@ -1,9 +1,7 @@
 import XCTest
 @testable import AetherEngine
 
-/// Pure-logic coverage for the packed-audio companion ingest: the
-/// first-segment format sniff, the ID3v2 PRIV program-clock timestamp
-/// parser, and the producer's synthesized side-audio clock.
+/// Covers the packed-audio ingest: segment format sniff, ID3v2 PRIV timestamp parser, and synthesized side-audio clock.
 final class PackedAudioIngestTests: XCTestCase {
 
     // MARK: - Segment format classification
@@ -86,7 +84,6 @@ final class PackedAudioIngestTests: XCTestCase {
                   body: privBody(owner: PackedAudioID3.appleTimestampOwner, timestamp: ts),
                   major: 4)
         ])
-        // Append fake ADTS data after the tag like a real segment.
         XCTAssertEqual(
             PackedAudioID3.transportStreamTimestamp90k(in: tag + Data([0xFF, 0xF1, 0x50])),
             Int64(ts)
@@ -182,7 +179,6 @@ final class PackedAudioIngestTests: XCTestCase {
         XCTAssertEqual(clock.stamp(packetDuration: 0), 0)
         XCTAssertEqual(clock.stamp(packetDuration: -1), frame)
         XCTAssertEqual(clock.stamp(packetDuration: 100), 2 * frame)
-        // The valid 100-tick duration advanced the clock by 100.
         XCTAssertEqual(clock.stamp(packetDuration: 0), 2 * frame + 100)
     }
 

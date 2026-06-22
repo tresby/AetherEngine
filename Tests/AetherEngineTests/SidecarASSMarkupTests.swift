@@ -42,14 +42,12 @@ final class SidecarASSMarkupTests: XCTestCase {
         XCTAssertTrue(header.contains("Style: Default"))
 
         XCTAssertEqual(result.cues.count, 2)
-        // Each cue body is the raw libavcodec event line
-        // (ReadOrder,Layer,Style,...,Text) WITH override tags intact.
+        // Each cue body is the raw libavcodec event line (ReadOrder,Layer,Style,...,Text) with override tags intact.
         guard case let .text(first) = result.cues[0].body else {
             return XCTFail("expected text body")
         }
         XCTAssertTrue(first.contains("{\\i1}Hello{\\i0} world"), "override tags must survive: \(first)")
-        // It must be parseable by ASSScriptBuilder (9 comma fields,
-        // numeric ReadOrder), the host's whole-script reassembler.
+        // Must be parseable by ASSScriptBuilder (9 comma fields, numeric ReadOrder).
         let builder = ASSScriptBuilder(header: header)
         XCTAssertTrue(builder.add(rawEventText: first, start: result.cues[0].startTime, end: result.cues[0].endTime))
         XCTAssertEqual(builder.eventCount, 1)
@@ -67,7 +65,6 @@ final class SidecarASSMarkupTests: XCTestCase {
         guard case let .text(first) = result.cues[0].body else {
             return XCTFail("expected text body")
         }
-        // Plain text: override tags stripped, no event-line prefix.
         XCTAssertEqual(first, "Hello world")
     }
 }

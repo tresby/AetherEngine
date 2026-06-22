@@ -5,64 +5,35 @@ import Libavcodec
 import Libavformat
 import Libavutil
 
-/// Packet-by-packet decoder for an embedded subtitle stream
-/// (SubRip / ASS / SSA / WebVTT / mov_text / PGS / DVB / HDMV).
-/// Owns one AVCodecContext for the lifetime of an active subtitle
-/// track; the demux pump in HLSSegmentProducer feeds packets, this
-/// decoder emits `SubtitleEvent` results back through its caller.
-///
-/// Lifted out of the pre-1.0 aether-path AetherEngine.swift, the
-/// hard-won handling of PGS PES-header strip + zlib / gzip
-/// Matroska compression wrappers + PGS clear-event semantics is
-/// preserved verbatim.
-///
+/// Packet-by-packet decoder for an embedded subtitle stream (SubRip/ASS/SSA/WebVTT/mov_text/PGS/DVB/HDMV).
+/// Owns one AVCodecContext per active track; HLSSegmentProducer feeds packets and bridges results to MainActor.
+/// Handles PGS PES-header strip, zlib/gzip Matroska compression wrappers, and PGS clear-event semantics.
 /// Not MainActor: lives on the HLSSegmentProducer pump worker queue.
-/// The caller bridges results back to MainActor via the callback
-/// AetherEngine installs.
 final class EmbeddedSubtitleDecoder {
 
-    /// One emit from a single subtitle packet.
     struct SubtitleEvent: @unchecked Sendable {
-        /// Cues produced. Empty for PGS clear events (each PGS event
-        /// implicitly terminates whatever was previously on screen;
-        /// AetherEngine applies the trim).
+        /// Empty for PGS clear events (each PGS event implicitly terminates the previous bitmap; AetherEngine applies the trim).
         let cues: [SubtitleCue]
-        /// True when this packet was a PGS event (with or without
-        /// rects). AetherEngine uses this to drive end-time fix-up of
-        /// previously shown bitmap cues.
         let isPGS: Bool
-        /// Time at which the previous PGS cue should be trimmed
-        /// (matches the new event's startTime). nil for non-PGS or
-        /// unknown.
+        /// PTS at which the previous PGS cue should be trimmed. nil for non-PGS.
         let pgsTrimAt: Double?
     }
 
-    /// The codec ID for the active stream. Exposed for callers who
-    /// want to gate behavior on text vs bitmap or check for PGS
-    /// specifically.
+    /// Exposed so callers can gate on text-vs-bitmap or check for PGS specifically.
     let codecID: AVCodecID
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var nextCueID: Int = 0
     private var seenKeys: Set<String> = []
 
-    /// Canvas dimensions used to normalize bitmap subtitle position.
-    /// Set from the source video dimensions at init; some bitmap
-    /// codecs override them via their PCS so the decoder context's
-    /// width/height may differ.
+    /// Fallback canvas for bitmap subtitle positioning; some codecs (PGS) override via PCS once it arrives.
     private let sourceVideoWidth: Int32
     private let sourceVideoHeight: Int32
 
-    /// When true and the track codec is ASS / SSA, cues carry the raw
-    /// event line (override tags, style references, escapes intact)
-    /// instead of the stripped plain text. Hosts opt in via
-    /// `LoadOptions.preserveASSMarkup` and render the styling
-    /// themselves (AetherEngine#30). Non-ASS codecs ignore the flag.
+    /// When true and codec is ASS/SSA, cues carry the raw libavcodec event line (AetherEngine#30 styled rendering).
     private let preserveASSMarkup: Bool
 
-    /// Open the subtitle decoder for `stream`. Returns `nil` if the
-    /// codec couldn't be opened (no decoder for codec_id, or
-    /// avcodec_open2 fails).
+    /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
     init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false) {
         guard let codecpar = stream.pointee.codecpar,
               codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
@@ -78,12 +49,7 @@ final class EmbeddedSubtitleDecoder {
             return nil
         }
 
-        // Bitmap codecs author their bitmaps against a known canvas
-        // (the source video frame). The probe step often can't
-        // determine those dimensions when the file is big and the
-        // sub stream sparse; seed from the captured video frame size
-        // as a fallback. The codec's PCS will overwrite once it
-        // arrives.
+        // Seed bitmap canvas from video dims; PCS overwrites once it arrives (probe can't always determine them upfront).
         if Self.isBitmapCodec(id) {
             if ctx.pointee.width == 0 { ctx.pointee.width = sourceVideoWidth }
             if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
@@ -102,9 +68,7 @@ final class EmbeddedSubtitleDecoder {
         self.preserveASSMarkup = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
 
-        // Some demuxers default subtitle streams to AVDISCARD_DEFAULT
-        // which can swallow packets the parser thinks are useless.
-        // Force NONE so every byte makes it to av_read_frame.
+        // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
         stream.pointee.discard = AVDISCARD_NONE
     }
 
@@ -114,21 +78,10 @@ final class EmbeddedSubtitleDecoder {
         }
     }
 
-    /// Decode `packet` against the active codec. Returns `nil` if
-    /// nothing usable; otherwise a `SubtitleEvent` with cues + PGS
-    /// trim info.
-    ///
-    /// Resulting `cue.startTime` / `cue.endTime` are in **absolute
-    /// source PTS seconds** (the same coordinate the host's overlay
-    /// compares against `engine.sourceTime`, which is `AVPlayer.
-    /// currentTime + playlistShiftSeconds`). No subtraction of the
-    /// stream's `start_time` happens here: for a typical MKV the
-    /// subtitle stream's `start_time` is the PTS of the first cue
-    /// (PGS has no continuous track), so subtracting it shifted
-    /// every cue back by that amount — Harry Potter's first PGS
-    /// cue at source PTS=19.186 s got mapped to startTime=0 and
-    /// fired immediately at session-start, dragging every subsequent
-    /// cue forward by the same 19 s offset.
+    /// Decode `packet`. Returns nil if nothing usable; otherwise a SubtitleEvent with cues + PGS trim info.
+    /// cue.startTime/endTime are absolute source PTS seconds (same axis as engine.sourceTime).
+    /// Do NOT subtract stream.start_time: for MKV that equals the first cue's PTS, which would shift all cues back
+    /// and fire the first PGS cue immediately (confirmed with Harry Potter, first cue at source PTS=19.186 s).
     func decode(
         packet: UnsafeMutablePointer<AVPacket>,
         streamTimeBase: AVRational
@@ -139,10 +92,7 @@ final class EmbeddedSubtitleDecoder {
         var gotSub: Int32 = 0
         let ret = decodeWithFixups(ctx: ctx, pkt: packet, sub: &sub, gotSub: &gotSub)
 
-        // Some MKV converters drop the trailing END segment (0x80) on
-        // PGS; the decoder accumulates state but never gets the
-        // signal to emit. If gotSub is still 0 after the real packet
-        // and the codec is PGS, feed a synthetic END to flush.
+        // Some MKV converters drop the PGS trailing END (0x80); feed a synthetic one to flush accumulated state.
         if gotSub == 0,
            ctx.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE,
            packet.pointee.size > 30 {
@@ -167,20 +117,12 @@ final class EmbeddedSubtitleDecoder {
         }
 
         guard ret >= 0, gotSub != 0 else {
-            // The synthetic PGS END flush can set gotSub even when the
-            // real decode returned ret < 0; the AVSubtitle then owns
-            // allocations that must be freed or they leak.
+            // Synthetic PGS END flush can set gotSub even when ret < 0; free to avoid a leak.
             if gotSub != 0 { avsubtitle_free(&sub) }
             return nil
         }
 
         let tbSec = Double(streamTimeBase.num) / Double(streamTimeBase.den)
-        // Convert the packet's raw PTS straight to source seconds; do
-        // not subtract any stream offset. The cue produced here goes
-        // into `subtitleCues`, which the host filters against
-        // `engine.sourceTime` (= AVPlayer.currentTime +
-        // playlistShiftSeconds). Both clocks are in absolute source
-        // PTS seconds, so the comparison aligns naturally.
         let rawPTS = packet.pointee.pts
         let pktPTS = (rawPTS == Int64.min) ? 0 : Double(rawPTS) * tbSec
         let startOffset = Double(sub.start_display_time) / 1000.0
@@ -195,9 +137,7 @@ final class EmbeddedSubtitleDecoder {
         let startTime = pktPTS + startOffset
         let endTime = pktPTS + endOffset
 
-        // Bitmap subtitles author rects against the canvas size in
-        // the codec context (PCS-reported). Fall back to source video
-        // dims if missing.
+        // PCS-reported canvas; fall back to source video dims if missing.
         let canvasW = ctx.pointee.width > 0 ? ctx.pointee.width : sourceVideoWidth
         let canvasH = ctx.pointee.height > 0 ? ctx.pointee.height : sourceVideoHeight
 
@@ -234,32 +174,22 @@ final class EmbeddedSubtitleDecoder {
         guard endTime > startTime else { return nil }
         guard !isClearEvent || isPGS else { return nil }
 
-        // Bound the dedupe set: a long zero-seek live session with
-        // DVB/PGS subs would otherwise accumulate one key per event
-        // forever. The reset only weakens dedupe (a re-emitted duplicate
-        // renders as an identical overlay at identical times, invisible),
-        // never correctness.
+        // Bound the dedupe set to prevent unbounded growth on long live sessions (DVB/PGS).
+        // Reset only weakens dedupe (a re-emitted duplicate renders as an identical overlay), never correctness.
         if seenKeys.count > 4096 {
             seenKeys.removeAll(keepingCapacity: true)
         }
 
-        // Dedupe full duplicate non-empty events; keep clear events
-        // distinct since each one trims a different previous cue. The key
-        // includes the CONTENT, not just times + body count: two
-        // simultaneous speaker lines (classic anime ASS, one MKV block
-        // packet each with identical pts/duration and one text body each)
-        // are distinct events and must both survive; a times+count key
-        // collided them and silently dropped the second line.
+        // Dedupe duplicate non-empty events; key includes CONTENT not just times+count:
+        // two simultaneous speaker lines (classic anime ASS, identical pts/duration, one body each)
+        // are distinct and must both survive.
         if !isClearEvent {
             let contentKey = bodies.map { body -> String in
                 switch body {
                 case .text(let t):
                     return "t:\(t)"
                 case .image(let img):
-                    // Bitmap cues: dimensions + position discriminate
-                    // cheaply (hashing pixels per event is not worth it;
-                    // identical-rect repeats ARE the duplicate case this
-                    // dedupe exists for).
+                    // Dimensions + position discriminate cheaply; identical-rect repeats are the target case.
                     return "i:\(img.cgImage.width)x\(img.cgImage.height)@\(img.position)"
                 }
             }.joined(separator: "\u{1F}")
@@ -462,9 +392,7 @@ final class EmbeddedSubtitleDecoder {
 
     // MARK: - Rect → text / image
 
-    /// Raw ASS event line for the rect, exactly as libavcodec hands
-    /// it over. Delegates to `SubtitleRectText` so the embedded and
-    /// sidecar `preserveASSMarkup` paths share one source of truth.
+    /// Raw ASS event line as libavcodec delivers it. Delegates to SubtitleRectText so embedded and sidecar paths share one source of truth.
     private static func rawASSLine(_ rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
         SubtitleRectText.rawASSLine(for: rect)
     }
@@ -474,16 +402,9 @@ final class EmbeddedSubtitleDecoder {
     }
 
 
-    /// Render a bitmap subtitle rect (PGS / DVB / HDMV) into a
-    /// CGImage with normalised position. Walks the indexed-pixel
-    /// plane (`data[0]`) through the palette (`data[1]`) into a
-    /// packed RGBA buffer and wraps that as a CGImage.
-    ///
-    /// The palette is delivered by libavcodec as 32-bit values laid
-    /// out with alpha in the high byte and BGR below, i.e. on a
-    /// little-endian platform the bytes in memory read `[B, G, R, A]`.
-    /// We rewrite to RGBA byte order for CGImage's
-    /// `premultipliedLast` consumer.
+    /// Render a PGS/DVB/HDMV bitmap rect into a CGImage with normalised position.
+    /// Palette from libavcodec is 32-bit with alpha in the high byte and BGR below ([B,G,R,A] on little-endian);
+    /// rewritten to RGBA for CGImage's premultipliedLast.
     private static func imageForSubtitleRect(
         _ rect: UnsafeMutablePointer<AVSubtitleRect>,
         videoWidth: Int,
@@ -499,16 +420,11 @@ final class EmbeddedSubtitleDecoder {
         let width = Int(r.w)
         let height = Int(r.h)
         let stride = Int(r.linesize.0)
-        // Corrupt-input hardening: a malformed rect reporting a stride
-        // smaller than its width would read past the plane allocation.
+        // Malformed rect guard: stride < width would read past the plane allocation.
         guard stride >= width else { return nil }
 
-        // Walk once to find the bounding box of non-zero-alpha pixels.
-        // Some Blu-ray-to-MKV conversions emit PGS events as full
-        // 1920x1080 ODS bitmaps with cropping parameters that FFmpeg's
-        // pgssubdec discards. Re-crop ourselves so the overlay
-        // positions correctly and doesn't carry ~8 MB of transparent
-        // pixels per cue.
+        // Re-crop to non-zero-alpha bounding box: some Blu-ray-to-MKV conversions emit full 1920x1080 ODS bitmaps
+        // with cropping params that FFmpeg's pgssubdec discards, carrying ~8 MB of transparent pixels per cue.
         let alphaThreshold: UInt8 = 8
         var minX = width, minY = height, maxX = -1, maxY = -1
         for y in 0..<height {
@@ -542,9 +458,7 @@ final class EmbeddedSubtitleDecoder {
                 let g = palettePtr[palOff + 1]
                 let red = palettePtr[palOff + 2]
                 let a = palettePtr[palOff + 3]
-                // Premultiply against alpha so CGImage's
-                // premultipliedLast renders correctly without the
-                // black-fringe edges that straight alpha produces.
+                // Premultiply: straight alpha produces black-fringe edges in CGImage premultipliedLast.
                 let outOff = dstRow + cx * 4
                 rgba[outOff + 0] = UInt8((Int(red) * Int(a) + 127) / 255)
                 rgba[outOff + 1] = UInt8((Int(g) * Int(a) + 127) / 255)

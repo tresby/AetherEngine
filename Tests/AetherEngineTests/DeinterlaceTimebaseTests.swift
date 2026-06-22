@@ -3,21 +3,10 @@ import Libavutil
 import Libavfilter
 @testable import AetherEngine
 
-/// Regression for interlaced MPEG-2 / VC-1 / MPEG-4 (DVD rips) playing at
-/// half speed (and freezing on resume).
-///
-/// bwdif/yadif halve the filter's output `time_base` and scale frame PTS
-/// by `pts_multiplier` (=2) even in `send_frame` mode. If the decoder
-/// reads the filtered frame's PTS with the *stream* time_base (un-halved),
-/// every presentation timestamp lands at 2x its real wall-clock time:
-/// the renderer paces frames at half rate and a resume seek puts frames
-/// in the far future, freezing the picture. `DeinterlaceFilter.pull`
-/// must rescale the pulled PTS from the buffersink time_base back into the
-/// stream time_base so downstream `emit()` (which uses the stream
-/// time_base) sees real timestamps.
+/// Regression: bwdif/yadif halve the filter output time_base and double PTS; DeinterlaceFilter.pull
+/// must rescale back into stream time_base or playback runs at half speed and resume freezes.
 struct DeinterlaceTimebaseTests {
 
-    /// Allocate a small interlaced YUV420P frame with the given PTS.
     private func makeFrame(pts: Int64) -> UnsafeMutablePointer<AVFrame> {
         let f = av_frame_alloc()!
         f.pointee.width = 64
@@ -31,16 +20,13 @@ struct DeinterlaceTimebaseTests {
 
     @Test("Deinterlaced frame PTS stays on the stream time_base (no 2x drift)")
     func deinterlacedPTSMatchesStreamTimebase() {
-        // 1 tick == 1/30 s. After the fix, a frame whose source PTS is N
-        // must come out of the filter with a PTS that, read on THIS
-        // time_base, is still N (i.e. N/30 s) — not 2N.
+        // 1 tick == 1/30 s; source PTS N must emerge as N (not 2N) on the stream time_base.
         let streamTB = AVRational(num: 1, den: 30)
         let tbSeconds = Double(streamTB.num) / Double(streamTB.den)
 
         let filter = DeinterlaceFilter()
         defer { filter.teardown() }
 
-        // Feed a run of frames with monotonically increasing PTS.
         let inputPTS: [Int64] = [0, 1, 2, 3, 4, 5, 6, 7]
         var outSeconds: [Double] = []
 
@@ -49,7 +35,6 @@ struct DeinterlaceTimebaseTests {
 
         for pts in inputPTS {
             let f = makeFrame(pts: pts)
-            // ensureGraph is idempotent once built; mirrors the decoder.
             let built = filter.ensureGraph(frame: f, timeBase: streamTB)
             #expect(built, "bwdif/yadif must be available in the linked FFmpeg build")
             guard built else { var ff: UnsafeMutablePointer<AVFrame>? = f; av_frame_free(&ff); return }
@@ -60,8 +45,6 @@ struct DeinterlaceTimebaseTests {
 
             while filter.pull(into: out) >= 0 {
                 if out.pointee.pts != Int64.min {
-                    // Interpret the pulled PTS the way emit() does: with the
-                    // STREAM time_base. The fix makes pull() rescale into it.
                     outSeconds.append(Double(out.pointee.pts) * tbSeconds)
                 }
                 av_frame_unref(out)
@@ -70,16 +53,13 @@ struct DeinterlaceTimebaseTests {
 
         #expect(!outSeconds.isEmpty, "filter produced no frames")
 
-        // The newest source frame is at 7/30 s. Pre-fix, outputs run to
-        // ~14/30 s (2x). The deinterlacer holds one frame of lookahead, so
-        // the latest output trails the latest input by one frame at most.
+        // Pre-fix outputs ran to ~14/30 s (2x). Deinterlacer holds one frame of lookahead.
         let maxInput = Double(inputPTS.max()!) * tbSeconds
         for s in outSeconds {
             #expect(s <= maxInput + tbSeconds * 0.5,
                     "output PTS \(s)s exceeds source range (max \(maxInput)s) — time_base doubled")
         }
 
-        // Consecutive outputs must be one frame apart (1/30 s), not two.
         let sorted = outSeconds.sorted()
         if sorted.count >= 2 {
             for i in 1..<sorted.count {

@@ -2,14 +2,8 @@ import Testing
 import Libavutil
 @testable import AetherEngine
 
-/// Regression for scrub-preview / thumbnail frames of anamorphic SD content
-/// (NTSC/PAL DVD rips, anamorphic Blu-ray) rendering horizontally stretched.
-///
-/// `FrameExtractor` decodes through the software path and scaled the frame
-/// using coded width/height only, ignoring the sample aspect ratio (SAR), so
-/// an NTSC DVD (720x480 stored, displayed at 4:3) produced a 3:2 thumbnail
-/// that the host then drew too wide. `displayDimensions` must fold the SAR
-/// into the output height so the thumbnail keeps the source display aspect.
+/// Regression: FrameExtractor used coded width/height only, ignoring SAR, so anamorphic DVD
+/// thumbnails rendered at 3:2 instead of 4:3. displayDimensions must fold SAR into output height.
 struct FrameExtractorSARTests {
 
     private func ratio(_ wh: (Int, Int)) -> Double { Double(wh.0) / Double(wh.1) }
@@ -44,8 +38,7 @@ struct FrameExtractorSARTests {
 
     @Test("BT.601 PAL SAR 12:11 applies (slightly wider than exact 4:3)")
     func pal601() {
-        // The BT.601 PAL 4:3 SAR 12:11 yields ~1.364, not exact 4:3, but it
-        // must still be applied rather than ignored (square would give 1.25).
+        // SAR 12:11 yields ~1.364, not exact 4:3; must be applied (square would give 1.25).
         let dims = FrameDecodeContext.displayDimensions(
             srcW: 720, srcH: 576, sar: AVRational(num: 12, den: 11), targetWidth: 320)
         #expect(abs(ratio(dims) - (720.0 * 12.0) / (576.0 * 11.0)) < 0.01,

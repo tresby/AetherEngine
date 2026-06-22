@@ -1,35 +1,20 @@
 // Sources/AetherEngine/Subtitles/NativeSubtitleCueStore.swift
 import Foundation
 
-/// A single native mov_text subtitle track exposed to hosts after load (#55).
-/// Ordinal is the 0-based index into the muxer's declared text tracks and
-/// matches the `group.options` position in the AVPlayer legible group.
-/// `language` is the ISO 639 tag from the source stream metadata (nil when
-/// absent). `displayName` is a human-readable label suitable for a track
-/// picker (the locale display name of `language`, or "Subtitle <n>" as
-/// the fallback when language is nil).
+/// A native mov_text subtitle track exposed to hosts after load (#55). `ordinal` is the 0-based index into the muxer's text tracks and matches the `group.options` position in the AVPlayer legible group. `language` is the ISO 639 tag (nil when absent); `displayName` is the locale display name of `language`, or "Subtitle <n>" fallback.
 public struct NativeSubtitleTrack: Sendable, Equatable {
     public let ordinal: Int
     public let language: String?
     public let displayName: String
 
-    /// Returns how many tracks in `tracks[0..<ordinal]` share the same
-    /// language as `tracks[ordinal]`. This rank is used by
-    /// `setNativeSubtitleSelected` to pick the correct AVMediaSelectionOption
-    /// when two tracks carry the same language tag (e.g. eng "Full" and eng "SDH").
-    ///
-    /// Returns 0 when `ordinal` is out of range or the track has no language.
+    /// Count of tracks in `tracks[0..<ordinal]` sharing `tracks[ordinal]`'s language; used by `setNativeSubtitleSelected` to disambiguate same-language AVMediaSelectionOptions (e.g. eng "Full" vs eng "SDH"). Returns 0 when out of range or no language.
     public static func sameLanguageRank(of ordinal: Int, in tracks: [NativeSubtitleTrack]) -> Int {
         guard ordinal < tracks.count, let lang = tracks[ordinal].language else { return 0 }
         return tracks[0..<ordinal].filter { $0.language == lang }.count
     }
 }
 
-/// Sole owner of the bounded decoded-cue array backing the native
-/// mov_text subtitle track (#55). Holds only text `SubtitleCue`s, never
-/// packet data, so its footprint is bounded by cue count (leak guard).
-/// The producer drains `cuesInWindow` per segment cut to build mov_text
-/// samples on the AVPlayer axis.
+/// Sole owner of the decoded-cue array backing the native mov_text track (#55). Text `SubtitleCue`s only, never packet data, so footprint is bounded by cue count (leak guard). Producer drains `cuesInWindow` per segment cut to build mov_text samples on the AVPlayer axis.
 final class NativeSubtitleCueStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cues: [SubtitleCue] = []

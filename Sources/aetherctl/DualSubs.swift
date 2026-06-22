@@ -3,15 +3,7 @@ import AetherEngine
 
 // MARK: - dualsubs: two independent subtitle channels (issue #47)
 
-/// Loads a file, activates a primary and a secondary embedded subtitle
-/// track, lets both side demuxers run, then asserts BOTH cue arrays
-/// populate independently. Optionally seeks and verifies both channels
-/// re-arm at the new position.
-///
-/// This is the headless macOS analogue of the device repro for #47:
-/// the side-demuxer infrastructure is platform-agnostic, so both
-/// channels can be observed via their published cue arrays directly on
-/// macOS without a display layer.
+/// Headless macOS analogue of the #47 device repro: activates primary and secondary subtitle tracks, asserts both cue arrays populate independently, and optionally re-arms after a seek.
 @MainActor
 private func dualSubsRun(path: String, primaryIndex: Int, secondaryIndex: Int, seekTo: Double?) async -> Int32 {
     print("")
@@ -35,8 +27,7 @@ private func dualSubsRun(path: String, primaryIndex: Int, secondaryIndex: Int, s
         return 1
     }
 
-    // Wait for playback to begin (state .playing). Up to 15 s.
-    var waited = 0.0
+    var waited = 0.0 // wait up to 15s for .playing
     while engine.state != .playing, waited < 15.0 {
         try? await Task.sleep(nanoseconds: 100_000_000)
         waited += 0.1
@@ -48,13 +39,10 @@ private func dualSubsRun(path: String, primaryIndex: Int, secondaryIndex: Int, s
     print(String(format: "  loaded: state=%@ duration=%.1fs t=%.2fs",
                  "\(engine.state)", engine.duration, engine.currentTime))
 
-    // Activate both subtitle channels. The side demuxers open
-    // independent cursors into the source and pace against sourceTime.
     engine.selectSubtitleTrack(index: primaryIndex)
     engine.selectSecondarySubtitleTrack(index: secondaryIndex)
 
-    // Give both side demuxers time to produce cues. 8 s matches the
-    // typical side-demuxer latency (seek + decode warm-up) plus margin.
+    // 8s covers typical side-demuxer latency (seek + decode warm-up).
     print("  waiting 8s for both side demuxers to emit cues...")
     try? await Task.sleep(nanoseconds: 8_000_000_000)
 
@@ -65,8 +53,7 @@ private func dualSubsRun(path: String, primaryIndex: Int, secondaryIndex: Int, s
     if let seekTo {
         print("  seeking to \(seekTo)s...")
         await engine.seek(to: seekTo)
-        // Both channels re-arm on seek; give them 6 s to catch up.
-        try? await Task.sleep(nanoseconds: 6_000_000_000)
+        try? await Task.sleep(nanoseconds: 6_000_000_000) // both channels re-arm on seek
         let p2 = engine.subtitleCues.count
         let s2 = engine.secondarySubtitleCues.count
         print("  after seek to \(seekTo)s: primaryCues=\(p2) secondaryCues=\(s2)")
@@ -78,7 +65,6 @@ private func dualSubsRun(path: String, primaryIndex: Int, secondaryIndex: Int, s
     return ok ? 0 : 1
 }
 
-/// Entry point for the `dualsubs` subcommand.
 func runDualSubs(path: String, primaryIndex: Int, secondaryIndex: Int, seekTo: Double?) -> Int32 {
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in

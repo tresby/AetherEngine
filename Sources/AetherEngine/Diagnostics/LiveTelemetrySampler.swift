@@ -1,9 +1,8 @@
 import Foundation
 import AVFoundation
 
-/// Bounded ring buffer that retains the most recent `capacity` values
-/// and exposes their sum. Used for 10-second rolling windows of byte
-/// counts (for instant-bitrate) and frame counts (for observed FPS).
+/// Bounded ring buffer exposing the sum of the most recent `capacity` values.
+/// Used for 10-second rolling windows of byte counts (instant bitrate) and frame counts (observed FPS).
 struct RollingWindow<T: AdditiveArithmetic> {
     private var buffer: [T]
     private var index: Int = 0
@@ -27,10 +26,7 @@ struct RollingWindow<T: AdditiveArithmetic> {
         return active.reduce(.zero, +)
     }
 
-    /// Number of slots actually populated (less than `capacity` until
-    /// the buffer wraps for the first time). Used by the sampler to
-    /// keep instant-bitrate `nil` until the window has at least 2
-    /// samples, one sample is a delta of zero seconds.
+    /// Populated slot count; sampler keeps instant-bitrate nil until count >= 2 (one sample = zero-second delta).
     var count: Int { filled ? capacity : index }
 
     mutating func reset() {
@@ -40,23 +36,16 @@ struct RollingWindow<T: AdditiveArithmetic> {
     }
 }
 
-/// Drives `engine.diagnostics.liveTelemetry` at 1 Hz while the engine
-/// is `.playing` or `.paused`. Owns no playback state; reads
-/// from the engine's existing subsystem counters once per tick and
-/// assembles a `LiveTelemetry` snapshot.
-///
-/// Started from `AetherEngine` at the same lifecycle points as the
-/// memprobe task. Stopped in `stopInternal`.
+/// Drives engine.diagnostics.liveTelemetry at 1 Hz. Reads existing engine counters; owns no playback state.
+/// Started with the memprobe task; stopped in stopInternal.
 @MainActor
 final class LiveTelemetrySampler {
     private weak var engine: AetherEngine?
     private var task: Task<Void, Never>?
 
-    // 10-second rolling windows (10 buckets, 1 second each).
-    private var byteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)
+    private var byteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)   // 10-second rolling window
     private var frameWindow = RollingWindow<Int>(capacity: 10, zero: 0)
 
-    // Previous-tick snapshots for delta calculation.
     private var lastDemuxerBytes: Int64 = 0
     private var lastFramesEnqueued: Int = 0
     private var sessionStartTime: Date?
@@ -70,11 +59,7 @@ final class LiveTelemetrySampler {
         stop()
         byteWindow.reset()
         frameWindow.reset()
-        // Seed from the CURRENT counters, not zero: the demuxer has
-        // already prefetched by the time the sampler starts, and a
-        // zero seed pushed the whole accumulated byte count into the
-        // first tick's window, inflating the instant bitrate for the
-        // first ~10 s of every session.
+        // Seed from CURRENT counters: a zero seed pushes all pre-start prefetch bytes into tick 1, inflating instant bitrate for ~10 s.
         lastDemuxerBytes = engine?.demuxerBytesFetched ?? 0
         lastFramesEnqueued = 0
         sessionStartTime = Date()
@@ -95,7 +80,7 @@ final class LiveTelemetrySampler {
     private func tick() {
         guard let engine = engine else { return }
 
-        // ---- Demuxer-driven instant + average bitrate (works on both paths) ----
+        // Instant + average bitrate from demuxer byte counters (both native and SW paths)
         let demuxerBytes = engine.demuxerBytesFetched
         let bytesThisTick = max(0, demuxerBytes - lastDemuxerBytes)
         lastDemuxerBytes = demuxerBytes
@@ -120,7 +105,7 @@ final class LiveTelemetrySampler {
             averageBitrateMbps = nil
         }
 
-        // ---- Per-path FPS, dropped frames, network, sync gap ----
+        // Per-path: FPS, dropped frames, network throughput, A/V sync gap
         let observedFps: Double?
         let droppedFrameCount: Int?
         let networkThroughputMbps: Double?
@@ -145,12 +130,7 @@ final class LiveTelemetrySampler {
                 networkThroughputMbps = nil
                 networkTransferredBytes = nil
             }
-            // Gap is measured by HLSSegmentProducer (audio gate open vs.
-            // video gate open in source-clock ms). The producer only runs
-            // on the native path, so this is where the value belongs;
-            // the software host enqueues directly into the sample buffer
-            // and has no comparable pre-mux gap to expose.
-            avSyncGapMs = engine.lastAVGapMs
+            avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
             forwardBufferSeconds = Self.computeNativeForwardBuffer(engine: engine)
 
         case .software:
@@ -166,12 +146,10 @@ final class LiveTelemetrySampler {
                 observedFps = nil
             }
             droppedFrameCount = nil
-            // Software path: same source as instant bitrate (the
-            // demuxer pulls the same bytes off the network).
-            networkThroughputMbps = instantBitrateMbps
+            networkThroughputMbps = instantBitrateMbps  // SW: demuxer pulls the same bytes
             networkTransferredBytes = demuxerBytes
-            avSyncGapMs = nil  // see .native arm — the producer that measures the gap doesn't run on this path
-            forwardBufferSeconds = nil  // software host has no comparable surface yet
+            avSyncGapMs = nil          // HLSSegmentProducer doesn't run on SW path
+            forwardBufferSeconds = nil // SW host has no loadedTimeRanges equivalent
 
         case .aether, .none, .audio:
             observedFps = nil
@@ -182,7 +160,6 @@ final class LiveTelemetrySampler {
             forwardBufferSeconds = nil
         }
 
-        // ---- Engine diagnostics (always populated, cheap) ----
         let snapshot = LiveTelemetry(
             instantBitrateMbps: instantBitrateMbps,
             averageBitrateMbps: averageBitrateMbps,

@@ -9,13 +9,7 @@ extension HLSVideoEngine {
         case .stopRequested, .muxerFailed:
             return
         case .sourceReplay:
-            // The server restarted its stream from the beginning after a
-            // reconnect (Jellyfin transcode respawn). Reopening the same
-            // URL would replay the same content again, so the in-engine
-            // reopen path cannot recover this; only a fresh playback
-            // negotiation (new session / URL) gets back to the live edge.
-            // Hand it to the host and leave the session parked (AVPlayer
-            // drains its buffer while the host retunes).
+            // Server restarted stream from beginning (Jellyfin transcode respawn); URL reopen would replay stale content. Delegate to host for fresh negotiation.
             EngineLog.emit(
                 "[HLSVideoEngine] live source replayed from start after reconnect; "
                 + "requesting host retune (fresh playback session)",
@@ -24,11 +18,7 @@ extension HLSVideoEngine {
             onLiveSourceReset?()
             return
         case .segmentStall:
-            // The cutter wedged (hostile SSAI ad pod the direct re-mux
-            // can't keep cutting through). An in-engine URL reopen would
-            // re-enter the same ad pod, so hand it to the host: the
-            // direct-path fallback latch sends it to the server-muxed
-            // route, which tolerates the ad pod's timestamp resets.
+            // SSAI ad pod the cutter can't cut through; URL reopen would re-enter it. Delegate to host for server-muxed fallback.
             EngineLog.emit(
                 "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
                 + "requesting host retune to the server route",
@@ -37,14 +27,7 @@ extension HLSVideoEngine {
             onLiveSourceReset?()
             return
         case .eof, .readError, .keyframeStarvation:
-            // A healthy live source never EOFs; treat it like a loss.
-            // A source that cannot be reopened by URL (custom reader, e.g.
-            // the live HLS ingest) owns its upstream reconnection itself; by
-            // the time the pump exits, the loss is terminal. Re-opening the
-            // synthetic custom URL would burn the whole backoff budget on
-            // guaranteed failures and then stall silently. Surface the loss
-            // to the host instead (same retune surface as a detected source
-            // replay); the host re-negotiates or falls back.
+            // Custom-reader sources (e.g. live HLS ingest) own their own reconnection; URL reopen burns the backoff budget on guaranteed failures.
             if !sourceReopenableByURL {
                 EngineLog.emit(
                     "[HLSVideoEngine] live custom-source pump exited (reason=\(reason)); "
@@ -55,10 +38,6 @@ extension HLSVideoEngine {
                 return
             }
         }
-        // Counter updates inside the same restartLock section: they are
-        // touched by the pump threads of successive producers, and the
-        // lock both orders those accesses and pairs them with the
-        // provider snapshot.
         restartLock.lock()
         let segmentsNow = provider?.liveContinuationPoint().nextIndex ?? 0
         if segmentsNow == lastReopenSegmentCount {
@@ -88,20 +67,13 @@ extension HLSVideoEngine {
 
     private func performLiveReopen(failedProducer: HLSSegmentProducer) async {
         for attempt in 1...Self.liveReopenMaxAttempts {
-            // Abort silently when the session was torn down (stop() nils
-            // the producer) or someone else already replaced it.
             guard currentProducerIs(failedProducer) else { return }
 
-            // Capped exponential backoff: 0.5, 1, 2, 4, 8, 8 s (~23 s
-            // total). Enough to ride out a Jellyfin transcode respawn
-            // without hammering a dead tuner.
-            let delay = min(0.5 * pow(2.0, Double(attempt - 1)), 8.0)
+            let delay = min(0.5 * pow(2.0, Double(attempt - 1)), 8.0)  // capped exponential backoff: 0.5..8s (~23s total)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
 
             let dem = Demuxer()
-            // Register before the blocking open so stop() can abort it
-            // (markClosed); deregister identity-guarded below.
-            registerReopenDemuxer(dem)
+            registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
             defer { unregisterReopenDemuxer(dem) }
             do {
                 try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
@@ -113,11 +85,7 @@ extension HLSVideoEngine {
                 dem.close()
                 continue
             }
-            // Same channel URL must yield the same stream layout; the
-            // reopened producer reuses savedVideoConfig/savedAudioConfig,
-            // which embed stream indices and time bases from the
-            // original probe. A mismatch means the server handed us a
-            // different transcode shape: retry rather than corrupt.
+            // Reopened producer reuses savedVideoConfig/savedAudioConfig (stream indices + time bases from original probe); layout mismatch means server changed transcode shape.
             guard dem.videoStreamIndex == videoStreamIndex else {
                 EngineLog.emit(
                     "[HLSVideoEngine] live reopen attempt \(attempt): video stream index "
@@ -142,8 +110,7 @@ extension HLSVideoEngine {
         )
     }
 
-    /// Synchronous helper for the locked sections of the reopen (NSLock
-    /// is unavailable from async contexts).
+    /// NSLock unavailable from async contexts; this synchronous helper wraps the check.
     private func currentProducerIs(_ p: HLSSegmentProducer) -> Bool {
         restartLock.lock()
         defer { restartLock.unlock() }
@@ -164,8 +131,6 @@ extension HLSVideoEngine {
 
     private enum LiveReopenOutcome { case done, aborted, retry }
 
-    /// Swap the freshly opened demuxer in and bring up the continuation
-    /// producer. Synchronous (locked); called from the async retry loop.
     private func finishLiveReopen(failedProducer: HLSSegmentProducer,
                                   dem: Demuxer,
                                   attempt: Int) -> LiveReopenOutcome {
@@ -183,13 +148,7 @@ extension HLSVideoEngine {
                 baseIndex: nextIndex,
                 liveReopenOutputEndSeconds: outputEnd
             )
-            // The fresh connection joins the broadcast at "now":
-            // content and source clock jump relative to the last
-            // delivered segment, so the seam segment carries
-            // #EXT-X-DISCONTINUITY and the shift handoff is deferred
-            // to the seam (same mechanism as a program-boundary
-            // rebase; an immediate onVideoShiftKnown would jump the
-            // host clock while pre-loss content is still on screen).
+            // Fresh connection joins the broadcast at "now"; source clock jumps, so the seam carries #EXT-X-DISCONTINUITY. Shift handoff deferred to seam to avoid jumping the host clock while pre-loss content is on screen.
             newProd.firstSegmentDiscontinuous = true
             newProd.onVideoShiftKnown = { [weak self] shiftPts in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)

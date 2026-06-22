@@ -6,25 +6,10 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// Audio-only playback host. The lean sibling of `SoftwarePlaybackHost`:
-/// it drives FFmpeg decode -> `AVSampleBufferAudioRenderer` for sources
-/// with no video track (music, audiobooks), skipping the video decoder,
-/// the `SampleBufferRenderer`, the display layer, the HDR handshake, and
-/// the entire HLS / segment-producer / muxer / loopback stack the video
-/// paths carry.
-///
-/// The pipeline:
-///
-/// ```
-/// Demuxer -- audio pkt --► AudioDecoder --► CMSampleBuffer --► AudioOutput
-///                                            (AVSampleBufferRenderSynchronizer
-///                                             is the master clock)
-/// ```
-///
-/// The synchronizer is the clock; `AudioOutput.seekClock(to:rate:)` is
-/// called once on the first decoded audio packet to anchor it (matching
-/// the proven `SoftwarePlaybackHost` clock-arming pattern), then the
-/// `currentTime` mirror is polled at 4 Hz off the synchronizer.
+/// Audio-only playback host (lean sibling of `SoftwarePlaybackHost`): FFmpeg decode -> `AVSampleBufferAudioRenderer`
+/// for sources with no video track, skipping video decoder/display/HDR/HLS/muxer/loopback. The synchronizer is the
+/// master clock; `seekClock(to:rate:)` anchors it once on the first decoded packet (SoftwarePlaybackHost clock-arming
+/// pattern), then `currentTime` is polled at 4 Hz off the synchronizer.
 @MainActor
 final class AudioPlaybackHost {
 
@@ -43,64 +28,50 @@ final class AudioPlaybackHost {
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
 
-    /// Background queue the demux loop runs on. One per host so hosts
-    /// created across rapid load() calls don't fight over the same
-    /// execution context.
+    /// One demux queue per host so rapid load() calls don't fight over the same execution context.
     private let demuxQueue = DispatchQueue(label: "engine.audio.demux", qos: .userInitiated)
 
-    /// Lock guarding the playing / stop flags, read on the demux thread
-    /// every iteration, written on the main actor from play/pause/stop.
+    /// Guards playing/stop flags: read on demux thread every iteration, written on main actor.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
     nonisolated(unsafe) private var _stopRequested: Bool = false
 
-    /// Condition the demux thread waits on while paused so it doesn't
-    /// busy-loop reading packets that would just stack up.
+    /// Demux thread waits on this while paused so it doesn't busy-loop stacking up packets.
     private let demuxCondition = NSCondition()
 
     private var audioStreamIndex: Int32 = -1
 
-    /// Periodic mirror of `audioOutput.currentTimeSeconds` into the
-    /// published `currentTime`. 250 ms matches `SoftwarePlaybackHost`.
+    /// 250 ms mirror of currentTimeSeconds into published currentTime (matches SoftwarePlaybackHost).
     private var timeTimer: AnyCancellable?
 
-    /// Cached rate so resume() restores the right speed after a pause.
     private var lastRate: Float = 1.0
 
-    /// Source-position seconds the host opened at, captured so the demux
-    /// loop can align the synchronizer's master clock to the first
-    /// decoded sample's PTS. `.zero` on cold start; the resume offset on
-    /// a start-position load.
+    /// Source-position seconds the host opened at; the demux loop aligns the master clock to the first
+    /// decoded sample's PTS. `.zero` on cold start, resume offset on a start-position load.
     private var initialClockTime: CMTime = .zero
 
     /// Latched once the first `play()` has spun up the demux loop.
     private var demuxLoopStarted: Bool = false
 
-    /// True between a pause() and the next play(), so play() knows it must
-    /// resume the synchronizer rate the pause froze (mirrors
-    /// `SoftwarePlaybackHost.pausedByHost`).
+    /// True between pause() and next play() so play() resumes the synchronizer rate (mirrors SoftwarePlaybackHost.pausedByHost).
     private var pausedByHost: Bool = false
 
-    /// Shared clock-armed latch (mirrors `SoftwarePlaybackHost._clockArmed`).
-    /// The demux loop arms the clock once on the first decoded packet;
-    /// `seek()` anchors the clock directly and sets this so the loop does
-    /// not snap the clock back to the stale initial anchor afterwards.
+    /// Shared clock-armed latch (mirrors SoftwarePlaybackHost._clockArmed): demux loop arms once on first decoded
+    /// packet; seek() anchors directly and sets this so the loop doesn't snap back to the stale initial anchor.
     nonisolated(unsafe) private var _clockArmed = false
     nonisolated private var clockArmed: Bool {
         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _clockArmed }
         set { flagsLock.lock(); _clockArmed = newValue; flagsLock.unlock() }
     }
 
-    /// Bumped by every `seek()`. The demux loop resets its enqueue
-    /// high-water mark when it observes a change, so the back-pressure
+    /// Bumped by every seek(); demux loop resets its enqueue high-water mark on change so the back-pressure
     /// gate can't park against a pre-seek mark after a backward seek.
     nonisolated(unsafe) private var _seekGeneration: UInt64 = 0
     nonisolated private var seekGeneration: UInt64 {
         flagsLock.lock(); defer { flagsLock.unlock() }; return _seekGeneration
     }
 
-    /// Sync hop for `seek(to:)`: NSLock is unavailable directly from async
-    /// contexts.
+    /// Sync hop for seek(to:): NSLock is unavailable directly from async contexts.
     nonisolated private func bumpSeekGeneration() {
         flagsLock.lock(); _seekGeneration &+= 1; flagsLock.unlock()
     }
@@ -173,11 +144,9 @@ final class AudioPlaybackHost {
     // MARK: - Transport
 
     func play() {
-        // Resume the synchronizer a pause() froze (rate 0). Guarded on
-        // demuxLoopStarted so a pause() before the first play() doesn't
-        // eager-start the un-anchored synchronizer: the clock is armed off
-        // the first decoded sample, and an unguarded setRate would tick
-        // the clock through the spin-up and drop the first samples.
+        // Resume the synchronizer a pause() froze (rate 0). Guarded on demuxLoopStarted so a pause() before
+        // first play() doesn't eager-start the un-anchored synchronizer (would tick the clock through spin-up
+        // and drop the first samples; clock is armed off the first decoded sample).
         if pausedByHost {
             pausedByHost = false
             if demuxLoopStarted {
@@ -188,11 +157,8 @@ final class AudioPlaybackHost {
             demuxLoopStarted = true
             startDemuxLoop()
         }
-        // The demux loop calls `audioOutput.seekClock(to:rate:)` on the
-        // first decoded audio packet, so the master clock's time-zero
-        // aligns with that sample's PTS. Eager-starting here against an
-        // empty renderer queue would tick the clock forward through the
-        // loop's spin-up and drop the first samples (silent gap).
+        // Demux loop calls seekClock(to:rate:) on the first decoded packet so master-clock time-zero aligns
+        // with that sample's PTS. Eager-starting against an empty queue would drop the first samples (silent gap).
         rate = lastRate
         isPlaying = true
     }
@@ -221,33 +187,26 @@ final class AudioPlaybackHost {
         dem.seek(to: seconds)
         currentTime = seconds
 
-        // Tell the demux loop to drop its enqueue high-water mark; after a
-        // backward seek the stale mark would otherwise park the
-        // back-pressure gate until the clock walked back up to the
-        // pre-seek position (minutes of silence).
+        // Drop the demux loop's enqueue high-water mark; after a backward seek the stale mark would park the
+        // back-pressure gate until the clock walked back up to the pre-seek position (minutes of silence).
         bumpSeekGeneration()
 
         let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         guard demuxLoopStarted else {
-            // Cold seek (no play() yet): stash the target so the loop's
-            // first decoded packet anchors the clock there, not at .zero.
+            // Cold seek (no play() yet): stash target so the loop's first decoded packet anchors there, not at .zero.
             initialClockTime = targetTime
             return
         }
         if wasPlaying {
-            // Jump the master clock to the seek target so PTS-stamped
-            // samples decoded after the seek align with the clock.
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
         } else {
-            // Paused seek: anchor the clock at the target with rate 0 so
-            // play() resumes from the SEEK position instead of the stale
+            // Paused seek: anchor at target rate 0 so play() resumes from the SEEK position not the stale
             // pre-seek clock (mirrors SoftwarePlaybackHost's VOD path).
             audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
         }
-        // Either way the clock is now positioned; the demux loop must not
-        // re-arm it at the stale initial anchor.
+        // Clock is now positioned; demux loop must not re-arm it at the stale initial anchor.
         clockArmed = true
     }
 
@@ -317,10 +276,8 @@ final class AudioPlaybackHost {
         }
     }
 
-    /// Audio-only demux loop. Reads packets, decodes the audio stream,
-    /// enqueues the resulting CMSampleBuffers, and anchors the
-    /// synchronizer clock once on the first decoded packet. Non-audio
-    /// packets are discarded. EOF flushes the decoder and signals end.
+    /// Audio-only demux loop: reads packets, decodes audio, enqueues CMSampleBuffers, anchors the clock once on
+    /// the first decoded packet. Non-audio discarded; EOF flushes decoder and signals end.
     nonisolated private static func runDemuxLoop(
         demuxer: Demuxer,
         audioDecoder: AudioDecoder?,
@@ -337,29 +294,17 @@ final class AudioPlaybackHost {
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void
     ) {
-        // The clock-armed latch is SHARED with the host (not loop-local):
-        // anchor the clock exactly once, on the first decoded audio packet.
-        // seekClock is NOT idempotent (it re-sets rate + time), so calling
-        // it per packet would snap the clock back ~47x/sec and freeze
-        // playback. seek() arms the clock itself and sets the latch so the
-        // loop doesn't override the seek anchor with the stale initial one.
+        // Clock-armed latch is SHARED with the host: anchor the clock exactly once on the first decoded packet.
+        // seekClock is NOT idempotent (re-sets rate+time), so per-packet calls would snap the clock back ~47x/sec
+        // and freeze playback. seek() arms it itself so the loop doesn't override the seek anchor.
 
-        // Bound how far the demuxer may run ahead of the playback clock.
-        // Without this the loop reads the ENTIRE file's packets in a tight
-        // burst, enqueues them all into the renderer, hits readPacket()==nil
-        // (demuxer EOF) within a second or two, and fires onEnd() while the
-        // audio is still playing out of the renderer's buffer. The host then
-        // mistakes demuxer-EOF for end-of-track and advances early. Pacing
-        // the loop to keep at most `maxBufferAhead` seconds queued ahead of
-        // the synchronizer clock makes demuxer-EOF land near actual playback
-        // end and bounds the decoded-PCM memory held in the renderer.
+        // Bound how far the demuxer runs ahead of the clock. Without this the loop bursts the ENTIRE file's
+        // packets, hits readPacket()==nil (demuxer EOF) in ~1-2s, fires onEnd() while audio is still playing out
+        // of the renderer, and the host advances early. Pacing to maxBufferAhead lands demuxer-EOF near actual
+        // playback end and bounds decoded-PCM memory in the renderer.
         let maxBufferAhead: Double = 8.0
-        // Source-time (seconds) of the end of the last sample handed to the
-        // renderer. Drives both the back-pressure gate and the end-of-track
-        // drain below. lastEnqueuedEnd and currentTimeSeconds share the same
-        // source-PTS timeline (samples carry source PTS; the clock is
-        // anchored to initialClockTime), so their difference is the seconds
-        // of audio queued ahead of the playhead.
+        // Source-time seconds of the last sample handed to the renderer. lastEnqueuedEnd and currentTimeSeconds
+        // share the source-PTS timeline (clock anchored to initialClockTime), so their difference is seconds queued ahead.
         var lastEnqueuedEnd: Double = 0
         var seenSeekGeneration = seekGeneration()
 
@@ -373,18 +318,16 @@ final class AudioPlaybackHost {
                 continue
             }
 
-            // A seek invalidates the enqueue high-water mark: keeping the
-            // pre-seek value after a backward seek would park the gate
-            // below until the clock walked back up to the old position.
+            // A seek invalidates the enqueue high-water mark: a stale pre-seek value after a backward seek
+            // would park the gate below until the clock walked back up.
             let gen = seekGeneration()
             if gen != seenSeekGeneration {
                 seenSeekGeneration = gen
                 lastEnqueuedEnd = 0
             }
 
-            // Back-pressure: once the clock is running, don't outrun it by
-            // more than `maxBufferAhead` seconds. Skipped until the clock is
-            // armed so the initial buffer can prime.
+            // Back-pressure: once the clock runs, don't outrun it by more than maxBufferAhead. Skipped until
+            // the clock is armed so the initial buffer can prime.
             if clockArmed(), let aOut = audioOutput {
                 while !stopRequested() && isPlaying()
                     && (lastEnqueuedEnd - aOut.currentTimeSeconds) > maxBufferAhead {
@@ -404,18 +347,13 @@ final class AudioPlaybackHost {
 
             guard let packet else {
                 audioDecoder?.flush()
-                // Demuxer EOF is NOT end-of-track: the renderer still has up
-                // to `maxBufferAhead` seconds queued. Wait for the clock to
-                // play through everything enqueued before signaling the end,
-                // otherwise the host advances to the next track seconds early.
+                // Demuxer EOF is NOT end-of-track: renderer still has up to maxBufferAhead seconds queued.
+                // Wait for the clock to play through before signaling end, else host advances seconds early.
                 var seekedAway = false
                 while !stopRequested()
                     && (audioOutput?.currentTimeSeconds ?? lastEnqueuedEnd) < lastEnqueuedEnd - 0.25 {
-                    // A seek during the drain re-positions the demuxer, so
-                    // EOF no longer holds. Without this check the drain
-                    // played silence from the seek target up to the stale
-                    // high-water mark and then fired onEnd() anyway, which
-                    // skipped the track instead of playing the seek.
+                    // A seek during the drain re-positions the demuxer so EOF no longer holds. Without this check
+                    // the drain played silence up to the stale high-water mark then fired onEnd(), skipping the seek.
                     if seekGeneration() != seenSeekGeneration {
                         seekedAway = true
                         break
@@ -428,10 +366,8 @@ final class AudioPlaybackHost {
                 break
             }
 
-            // A seek landed while this packet was in flight: it predates
-            // the seek's renderer flush, and enqueueing it would park a
-            // stale-position buffer in the fresh queue. Discard and
-            // re-read at the new position.
+            // A seek landed while this packet was in flight: it predates the seek's renderer flush, so enqueueing
+            // would park a stale-position buffer in the fresh queue. Discard and re-read at the new position.
             if seekGeneration() != seenSeekGeneration {
                 av_packet_unref(packet)
                 av_packet_free_safe(packet)

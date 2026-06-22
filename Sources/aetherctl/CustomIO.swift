@@ -3,11 +3,7 @@ import AetherEngine
 
 // MARK: - customio
 
-/// A minimal `IOReader` over a local file, used to prove the custom-source
-/// load path. `forwardOnly` simulates a non-seekable source by refusing
-/// SEEK_SET/CUR/END (AVSEEK_SIZE still answers, so probing can size the file).
-/// `inMemory` loads the whole file into a Data buffer instead of streaming
-/// from the FileHandle.
+/// IOReader over a local file for testing the custom-source load path. `forwardOnly` refuses SEEK_SET/CUR/END (AVSEEK_SIZE still answers). `inMemory` buffers the whole file.
 final class FileHandleIOReader: IOReader, @unchecked Sendable {
     private let path: String
     private let data: Data?
@@ -17,8 +13,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
     private let forwardOnly: Bool
     private let lock = NSLock()
 
-    /// Counts cancel() invocations to verify the override is dynamically
-    /// dispatched (cancel() is now a protocol requirement, not extension-only).
+    /// Counts cancel() calls to verify dynamic dispatch (cancel() is a protocol requirement, not extension-only).
     nonisolated(unsafe) static var cancelCount = 0
 
     init(path: String, inMemory: Bool, forwardOnly: Bool) throws {
@@ -44,10 +39,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
     }
 
     func makeIndependentReader() -> IOReader? {
-        // A forward-only source cannot serve a second cursor (the concurrent
-        // features seek the clone), so report no clone, matching a real
-        // forward-only reader. A seekable file source clones to a fresh handle
-        // over the same path with an independent cursor.
+        // Forward-only sources cannot provide a second cursor (concurrent features seek the clone).
         if forwardOnly { return nil }
         return try? FileHandleIOReader(path: path, inMemory: false, forwardOnly: false)
     }
@@ -75,7 +67,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
         return Int32(chunk.count)
     }
 
-    /// FFmpeg AVSEEK_SIZE: a query for total size, not a reposition.
+    /// AVSEEK_SIZE queries total file size rather than repositioning.
     private static let avSeekSize: Int32 = 0x10000
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
@@ -96,10 +88,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
     }
 }
 
-/// Load media through the engine's custom IOReader source path and play
-/// it, printing the engine state once a second. Confirms load(source:)
-/// end-to-end on both the native path (seekable reader) and the software
-/// path (seekable or forward-only).
+/// Load media through load(source:) with a custom IOReader and print engine state once a second. Tests both native (seekable) and software (seekable or forward-only) paths.
 func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool) -> Int32 {
     EngineLog.handler = { print($0) }
     var modeDesc: String
@@ -150,10 +139,7 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
         return 1
     }
 
-    // Check state immediately after load returns (load is async and sets
-    // state to .playing before returning on both the native and software
-    // paths). A short file may complete and reset to .idle before the
-    // first poll tick, so capture the post-load snapshot immediately.
+    // Capture state immediately: a short file may reach .idle before the first poll tick.
     let postLoadState = engine.state
     let postLoadTime = engine.currentTime
     print(String(format: "  post-load state=%@ t=%.2fs dur=%.2fs",
@@ -166,8 +152,7 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
         engine.stop()
         return 1
     } else {
-        // State was .idle or .loading at load return; poll for up to 8s.
-        let maxTicks = 8
+        let maxTicks = 8 // poll up to 8s for .playing
         var reached = false
         for _ in 0..<maxTicks {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -244,9 +229,7 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
         await fx.shutdown()
     }
     engine.stop()
-    // Give the engine's demux teardown path (runs in a detached Task on the
-    // native path) time to call Demuxer.close() -> markClosed() ->
-    // reader.cancel() before we sample the counter.
+    // Wait for the native-path demux teardown (detached Task: Demuxer.close -> markClosed -> reader.cancel) before sampling the counter.
     try? await Task.sleep(nanoseconds: 3_500_000_000)
     print("cancel() override invocations: \(FileHandleIOReader.cancelCount)")
     return 0

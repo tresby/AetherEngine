@@ -1,10 +1,7 @@
 import Foundation
 @testable import AetherEngine
 
-/// Minimal ISO9660 image builder for tests. Sector size 2048. Layout:
-/// sector 16 = PVD, sector 17 = root dir, sector 18 = VIDEO_TS dir,
-/// sector 19+ = file data (one sector per declared file, content is the
-/// file's own name bytes repeated — enough to demux-sniff, not real video).
+/// Minimal ISO9660 image builder for tests. Sector 16=PVD, 17=root, 18=VIDEO_TS, 19+=file data (one sector each, MPEG-PS pattern bytes).
 enum ISO9660Fixture {
     static let sectorSize = 2048
 
@@ -44,9 +41,7 @@ enum ISO9660Fixture {
 
     /// Build a complete fixture image. Returns the bytes; wrap in DataIOReader.
     static func make(files: [FileSpec]) -> Data {
-        // Reserve fixed sectors; one data sector per file is enough for parsing
-        // (we declare the real `length` in the record but only fill 1 sector
-        // of bytes, which is all the unit tests read).
+        // Reserve fixed sectors; declares real `length` in the record but fills only 1 sector per file (all tests read).
         let rootLBA = 17, videoTsLBA = 18
         var fileLBA = 19
         var fileExtents: [(spec: FileSpec, lba: Int)] = []
@@ -86,9 +81,7 @@ enum ISO9660Fixture {
         put(root, atSector: rootLBA)
         put(videoTs, atSector: videoTsLBA)
         for fe in fileExtents {
-            // Fill the file's first sector with a recognizable pattern: an
-            // MPEG-PS pack-start code followed by the file name, so the concat
-            // and disc tests can assert byte identity at extent boundaries.
+            // MPEG-PS pack-start code + file name bytes, so concat/disc tests can assert byte identity at extent boundaries.
             var payload: [UInt8] = [0x00, 0x00, 0x01, 0xBA]
             payload += Array(fe.spec.name.utf8)
             put(payload, atSector: fe.lba)

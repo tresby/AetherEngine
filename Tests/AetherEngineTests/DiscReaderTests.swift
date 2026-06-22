@@ -11,8 +11,7 @@ final class DiscReaderTests: XCTestCase {
         let wrapped = try DiscReader.wrap(DataIOReader(data: data))
         let (reader, hint) = try XCTUnwrap(wrapped)
         XCTAssertEqual(hint, "mpeg")
-        // The first bytes must be the VOB payload the fixture wrote: MPEG-PS
-        // pack-start code 00 00 01 BA followed by the VOB name.
+        // First bytes must be the MPEG-PS pack-start code 00 00 01 BA written by the fixture.
         var buf = [UInt8](repeating: 0, count: 4)
         let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 4) }
         XCTAssertEqual(n, 4)

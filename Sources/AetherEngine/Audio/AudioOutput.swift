@@ -2,12 +2,8 @@ import Foundation
 import AVFoundation
 import CoreMedia
 
-/// Audio output using AVSampleBufferAudioRenderer + AVSampleBufferRenderSynchronizer.
-///
-/// The synchronizer serves as the **master clock** for the entire player:
-/// video frames check `synchronizer.currentTime()` to decide when to
-/// present. Audio is enqueued ahead of time and the synchronizer drives
-/// playback timing.
+/// Audio output via AVSampleBufferAudioRenderer + AVSampleBufferRenderSynchronizer. The synchronizer is the
+/// **master clock** for the whole player: video frames check synchronizer.currentTime() to decide presentation.
 final class AudioOutput: @unchecked Sendable {
 
     let renderer: AVSampleBufferAudioRenderer
@@ -20,24 +16,14 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer = AVSampleBufferRenderSynchronizer()
         synchronizer.addRenderer(renderer)
 
-        // Enable spatial audio for AirPods Pro/Max and HomePod.
-        // The renderer spatializes multichannel content automatically
-        // when the user has spatial audio enabled in system settings.
+        // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
         renderer.allowedAudioSpatializationFormats = .multichannel
     }
 
-    /// Add the video display layer to the synchronizer so Apple handles
-    /// A/V sync and frame pacing automatically.
-    ///
-    /// On iOS 18 / tvOS 18 / macOS 15 Apple split the queue rendering
-    /// surface off `AVSampleBufferDisplayLayer` onto a dedicated
-    /// `AVSampleBufferVideoRenderer` accessible via
-    /// `displayLayer.sampleBufferRenderer`. Direct `addRenderer(layer)`
-    /// still type-checks (the layer still conforms to
-    /// `AVQueuedSampleBufferRendering`), but on tvOS 26+ it's been
-    /// observed to fail with `FigVideoQueueRemote err=-12080` after
-    /// the first enqueue. Attaching the renderer instead of the layer
-    /// resolves it.
+    /// Add the video display layer to the synchronizer for automatic A/V sync + frame pacing. On iOS18/tvOS18/
+    /// macOS15+ Apple split the queue rendering surface onto displayLayer.sampleBufferRenderer; direct
+    /// addRenderer(layer) still type-checks but on tvOS 26+ fails with FigVideoQueueRemote err=-12080 after the
+    /// first enqueue, so attach the renderer instead.
     func attachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
             synchronizer.addRenderer(displayLayer.sampleBufferRenderer)
@@ -46,18 +32,11 @@ final class AudioOutput: @unchecked Sendable {
         }
     }
 
-    /// Remove the video display layer from the synchronizer and block
-    /// until the removal actually completes. AVSampleBufferRenderSynchronizer
-    /// does the detach asynchronously; if the caller immediately assigns
-    /// `displayLayer.controlTimebase` for a new Atmos session the layer
-    /// is briefly owned by both the synchronizer and a controlTimebase,
-    /// which Apple documents as undefined behavior. Symptom: on the
-    /// first PCM→Atmos switch after app launch, FigVideoQueueRemote
-    /// throws err=-12080 the instant we assign the new timebase and
-    /// the display layer stops rendering entirely (audio keeps going).
-    ///
-    /// A short semaphore wait on the calling thread is cheap (sub-100ms
-    /// in practice) and makes the handoff deterministic.
+    /// Remove the video display layer and block until removal completes. The synchronizer detaches asynchronously;
+    /// if the caller immediately assigns displayLayer.controlTimebase for a new Atmos session the layer is briefly
+    /// owned by both (Apple-documented UB). Symptom: first PCM->Atmos switch after launch throws FigVideoQueueRemote
+    /// err=-12080 and the display layer stops rendering (audio keeps going). The semaphore wait (sub-100ms) makes
+    /// the handoff deterministic.
     func detachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
         let semaphore = DispatchSemaphore(value: 0)
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
@@ -77,38 +56,29 @@ final class AudioOutput: @unchecked Sendable {
         #endif
     }
 
-    /// Playback volume (0.0 = mute, 1.0 = full).
     var volume: Float {
         get { renderer.volume }
         set { renderer.volume = newValue }
     }
 
-    /// Set playback speed (0.5–2.0). Takes effect immediately. The hosts
-    /// own the rate state (lastRate/pausedByHost); this object is
-    /// stateless about it.
+    /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
         synchronizer.setRate(rate, time: synchronizer.currentTime())
     }
 
-    /// Pause audio (and the master clock). Hosts resume via setRate
-    /// (the pausedByHost pattern); there is deliberately no resume()
-    /// here.
+    /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
         synchronizer.setRate(0.0, time: synchronizer.currentTime())
     }
 
-    /// Enqueue a decoded audio CMSampleBuffer for playback.
-    /// Always enqueues, the renderer buffers internally. Checking
-    /// isReadyForMoreMediaData caused early samples to be dropped
-    /// before the synchronizer started, resulting in silence.
+    /// Enqueue a decoded audio CMSampleBuffer. Always enqueues (renderer buffers internally); gating on
+    /// isReadyForMoreMediaData dropped early samples before the synchronizer started, giving silence.
     func enqueue(sampleBuffer: CMSampleBuffer) {
         renderer.enqueue(sampleBuffer)
 
         #if DEBUG
-        // Log exactly once per session: first successful enqueue and,
-        // if the renderer rejected it, the error. Lets us distinguish
-        // "no audio because nothing was enqueued" from "no audio
-        // because the renderer rejected our format".
+        // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
+        // "renderer rejected our format".
         if !_loggedFirstEnqueue {
             _loggedFirstEnqueue = true
             let fmt = CMSampleBufferGetFormatDescription(sampleBuffer).flatMap {
@@ -130,12 +100,10 @@ final class AudioOutput: @unchecked Sendable {
     private var _loggedRendererError = false
     #endif
 
-    /// The current playback time according to the audio synchronizer.
     var currentTime: CMTime {
         synchronizer.currentTime()
     }
 
-    /// Current playback time in seconds.
     var currentTimeSeconds: Double {
         let t = CMTimeGetSeconds(currentTime)
         return t.isFinite ? t : 0
@@ -148,7 +116,6 @@ final class AudioOutput: @unchecked Sendable {
         renderer.flush()
     }
 
-    /// Stop and tear down.
     func stop() {
         lock.lock()
         defer { lock.unlock() }
@@ -156,12 +123,9 @@ final class AudioOutput: @unchecked Sendable {
         renderer.flush()
     }
 
-    /// Jump the synchronizer's master clock to a specific time and
-    /// resume at the given rate atomically. The ONLY way the clock is
-    /// (re)anchored: the hosts' demux loops call it once on the first
-    /// decoded packet, and the seek paths call it directly. Avoids the
-    /// falling-through-time race windows that `pause → flush → setRate`
-    /// would expose.
+    /// Atomically jump the master clock to a time and resume at a rate. The ONLY way the clock is (re)anchored:
+    /// demux loops call it once on the first decoded packet, seek paths call it directly. Avoids the
+    /// falling-through-time races that pause -> flush -> setRate would expose.
     func seekClock(to time: CMTime, rate: Float) {
         lock.lock()
         defer { lock.unlock() }

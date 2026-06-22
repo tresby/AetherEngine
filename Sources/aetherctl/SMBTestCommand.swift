@@ -3,7 +3,6 @@ import AetherEngineSMB
 
 // MARK: - smbtest: sequential throughput + random-seek correctness harness
 
-/// Internal async core; called from `runSMBTest` via CFRunLoop bridge.
 @MainActor
 private func smbTestRun(_ args: [String]) async -> Int32 {
     guard let rawURL = args.first(where: { !$0.hasPrefix("--") }) else {
@@ -24,8 +23,7 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
         let total = reader.seek(offset: 0, whence: 65536) // AVSEEK_SIZE
         print("connected: \(u.path) size=\(total) bytes")
 
-        // Sequential pass.
-        let chunk = 1 << 20 // 1 MiB
+        let chunk = 1 << 20 // 1 MiB sequential read
         var buf = [UInt8](repeating: 0, count: chunk)
         var readBytes: Int64 = 0
         _ = reader.seek(offset: 0, whence: Int32(SEEK_SET))
@@ -44,8 +42,7 @@ private func smbTestRun(_ args: [String]) async -> Int32 {
             return 1
         }
 
-        // Random-seek correctness: read 16 bytes at random offsets, twice each,
-        // and verify the two reads agree (deterministic content).
+        // Random-seek correctness: two reads at each random offset must agree (deterministic content).
         var rng = SystemRandomNumberGenerator()
         for _ in 0..<randomReads {
             let off = Int64.random(in: 0..<max(1, total - 16), using: &rng)
@@ -80,8 +77,6 @@ private func smbParseIntFlag(_ args: [String], _ flag: String) -> Int? {
     return Int(args[i + 1])
 }
 
-/// Entry point for the `smbtest` subcommand. Synchronous: bridges the async
-/// core through a CFRunLoop, mirroring how `runSeekTest` bridges `seekTestRun`.
 func runSMBTest(_ args: [String]) -> Int32 {
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in

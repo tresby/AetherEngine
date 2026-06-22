@@ -7,17 +7,11 @@ struct RestartCoalescerTests {
     @Test("First request runs; concurrent requests coalesce to the latest target")
     func coalescesBurst() {
         var c = RestartCoalescer()
-        // First request becomes the in-flight worker.
         #expect(c.begin(10) == true)
-        // While in-flight, further requests do NOT start their own restart.
         #expect(c.begin(20) == false)
         #expect(c.begin(35) == false)   // latest target wins
-        // The in-flight worker just finished restarting to 10; next target
-        // is the latest coalesced request.
         #expect(c.next(justRan: 10) == 35)
-        // Worker restarts to 35; nothing newer arrived, so it is done.
         #expect(c.next(justRan: 35) == nil)
-        // After completion a brand-new request runs again.
         #expect(c.begin(40) == true)
     }
 

@@ -27,10 +27,7 @@ import AetherEngine
 
 // MARK: - RSS / footprint samplers (keeper for regression tracking)
 
-/// Physical footprint in bytes from task_vm_info. This is the
-/// jetsam-relevant metric on tvOS: it counts compressed + uncompressed
-/// memory the process actually occupies, unlike resident_size which
-/// can include kernel-shared pages. Returns -1 on failure.
+/// Physical footprint in bytes (task_vm_info). Jetsam-relevant on tvOS; excludes kernel-shared pages unlike resident_size. Returns -1 on failure.
 func physFootprintBytes() -> Int64 {
     var info = task_vm_info_data_t()
     var count = mach_msg_type_number_t(
@@ -44,9 +41,7 @@ func physFootprintBytes() -> Int64 {
     return kr == KERN_SUCCESS ? Int64(info.phys_footprint) : -1
 }
 
-/// Resident memory in bytes from mach_task_basic_info. Secondary
-/// metric: includes kernel-shared pages, so it's noisier than
-/// phys_footprint but historically what `ps RSS` reports.
+/// Resident memory in bytes (mach_task_basic_info). Includes kernel-shared pages; noisier than phys_footprint. Matches `ps RSS`.
 func residentBytes() -> Int64 {
     var info = mach_task_basic_info()
     var count = mach_msg_type_number_t(
@@ -60,11 +55,7 @@ func residentBytes() -> Int64 {
     return kr == KERN_SUCCESS ? Int64(info.resident_size) : -1
 }
 
-// Disable stdout buffering so `swift run aetherctl ... > log.txt` or
-// `2>&1 | grep` pipelines see engine prints in real time. Swift's
-// `print()` block-buffers when stdout isn't a tty, which masked the
-// engine's EngineLog output and only let FFmpeg's stderr through on
-// the first run.
+// Disable stdout buffering so pipe/redirect pipelines see engine prints in real time (Swift print() block-buffers when stdout is not a tty).
 setbuf(stdout, nil)
 
 // MARK: - Usage
@@ -212,7 +203,6 @@ if first == "--help" || first == "-h" || first == "help" {
 }
 
 
-// DVR matrix subcommand.
 if first == "dvr" {
     var rest = Array(args.dropFirst(2))
     let path    = takeStringFlag("--path",       from: &rest) ?? "both"
@@ -241,7 +231,6 @@ if first == "seektest" {
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
 }
 
-// SMB2/3 throughput + random-seek correctness harness.
 if first == "smbtest" {
     var rest = Array(args.dropFirst(2))
     let reads = takeIntFlag("--reads", from: &rest) ?? 64
@@ -280,7 +269,7 @@ if first == "dualsubs" {
     exit(runDualSubs(path: urlArg, primaryIndex: primary, secondaryIndex: secondary, seekTo: seekTo))
 }
 
-// Dolby Vision P7 -> 8.1 converter validation harness.
+// DV P7 -> 8.1 converter validation harness.
 if first == "dovitest" {
     var rest = Array(args.dropFirst(2))
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
@@ -293,20 +282,17 @@ if first == "dovitest" {
     exit(runDoviTest(url: parseSourceURL(urlArg)))
 }
 
-// HLS live fixture subcommand.
 if first == "hlsfixture" {
     let rest = Array(args.dropFirst(2))
     exit(runHLSFixture(args: rest))
 }
 
-// SSAI repro: serve real content+ad .ts segments through the actual
-// HLSLiveIngestReader → engine direct path.
+// SSAI repro via HLSLiveIngestReader (hlslive).
 if first == "hlslive" {
     let rest = Array(args.dropFirst(2))
     exit(runHLSLiveRepro(args: rest))
 }
 
-// Live subcommand: no URL positional (the fixture supplies its own URL).
 if first == "live" {
     var rest = Array(args.dropFirst(2))
     let seconds = takeDoubleFlag("--seconds", from: &rest) ?? 20.0
@@ -316,37 +302,22 @@ if first == "live" {
     let measureRSS = takeFlag("--measure-rss", from: &rest)
     let reportCacheBytes = takeFlag("--report-cache-bytes", from: &rest)
     let rewindTest = takeFlag("--rewind-test", from: &rest)
-    // --reload-test: warm up a live session, then exercise the live
-    // REJOIN path (reloadAtCurrentPosition) and verdict on whether the
-    // rejoined clock advances. Manual macOS repro for the tvOS
-    // live-reload frozen-frame stall; see liveReloadTest in LiveCmd.
+    // --reload-test: macOS repro for tvOS live-reload frozen-frame stall; see liveReloadTest in LiveCmd.
     let reloadTest = takeFlag("--reload-test", from: &rest)
-    // --sw forces the live source through SoftwarePlaybackHost regardless
-    // of codec (TEST-ONLY routing override). Lets the H.264 fixture
-    // exercise the SW live + DVR path end-to-end.
+    // --sw: TEST-ONLY force-SoftwarePlaybackHost routing for the H.264 fixture.
     let forceSW = takeFlag("--sw", from: &rest)
-    // --drop-after N: instruct LiveFixture to close the first client
-    // connection after N seconds, simulating a single recoverable mid-stream
-    // drop. AVIOReader should reconnect and playback should resume.
+    // --drop-after N: close the first connection after N seconds (recoverable drop); AVIOReader reconnects.
     let dropAfter = takeDoubleFlag("--drop-after", from: &rest)
-    // --discontinuity-at N: after ~N seconds of serving, the fixture jumps
-    // its rewritten PTS / PCR forward by a large delta ONCE, then continues
-    // monotonically (simulating a program boundary). The engine must keep
-    // playing and keep the session timeline monotonic.
+    // --discontinuity-at N: one-shot PTS/PCR forward jump after N seconds (program boundary); engine must keep the session timeline monotonic.
     let discontinuityAt = takeDoubleFlag("--discontinuity-at", from: &rest)
-    // --realtime paces the fixture output at ~1x wall-clock so the producer /
-    // AVPlayer cannot race ahead of real time, matching a genuine live feed.
-    // Default (absent): serve as fast as the socket drains (today's behaviour).
+    // --realtime paces fixture output at ~1x wall-clock; default is as-fast-as-socket-drains.
     let realtime = takeFlag("--realtime", from: &rest)
-    // --gen-highbitrate-seed: ensure a ~22 Mbps 1080p H.264 MPEG-TS seed exists
-    // in Fixtures/user/ (generating it with ffmpeg if absent) and exit. Used to
-    // prep the RSS-retention measurement seed. Honours --seed for the path.
+    // --gen-highbitrate-seed: generate ~22 Mbps 1080p H.264 MPEG-TS seed for RSS-retention measurement.
     if takeFlag("--gen-highbitrate-seed", from: &rest) {
         let path = seed ?? "Fixtures/user/highbitrate-1080p.ts"
         exit(ensureHighBitrateSeed(path: path) ? 0 : 1)
     }
-    // --sliding is accepted-and-ignored for backward compat: sliding is now
-    // the unconditional behaviour for a live session, so the flag is a no-op.
+    // --sliding: accepted but ignored; sliding is now unconditional for live sessions.
     _ = takeFlag("--sliding", from: &rest)
     rejectStrayFlags(rest, subcommand: "live")
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
@@ -357,7 +328,6 @@ if first == "live" {
                  discontinuityAt: discontinuityAt, realtime: realtime))
 }
 
-// Subcommand path: explicit subcommand + flags + url.
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {
     var rest = Array(args.dropFirst(2))
     let noDV = takeFlag("--no-dv", from: &rest)
@@ -374,8 +344,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
     let audioSeconds = takeDoubleFlag("--seconds", from: &rest) ?? 10
-    // Diagnostics affordance for native mov_text subtitle track (#55).
-    // Serve only; ignored by other subcommands.
+    // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
@@ -406,7 +375,6 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "audio":
         exit(runAudio(url: url, seconds: audioSeconds))
     case "customio":
-        // urlArg is a filesystem path, not a URL; use rest.first directly.
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag))
     default:
         printUsage()
@@ -414,6 +382,6 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     }
 }
 
-// Bare URL: backwards-compatible `aetherctl <url>` == `aetherctl serve <url>`.
+// Bare URL: backwards-compat alias for `serve`.
 let url = parseSourceURL(first)
 runServe(url: url, dvModeAvailable: true)

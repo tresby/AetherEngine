@@ -1,15 +1,10 @@
 import Foundation
 import Libavcodec
 
-/// Plain-text extraction from FFmpeg subtitle rects, shared by
-/// `SubtitleDecoder` (sidecar files) and `EmbeddedSubtitleDecoder`
-/// (in-container tracks). One source of truth so ASS parsing fixes
-/// don't have to be patched twice.
+/// Plain-text extraction from FFmpeg subtitle rects, shared by `SubtitleDecoder` (sidecar) and `EmbeddedSubtitleDecoder` (in-container) so ASS parsing fixes live in one place.
 enum SubtitleRectText {
 
-    /// Plain text for a rect: prefers the decoder's `text` field, falls
-    /// back to parsing the raw ASS `Dialogue:` line (strip the 8 header
-    /// fields, clean override tags + escapes).
+    /// Plain text for a rect: prefers `text` field, falls back to parsing the raw ASS `Dialogue:` line (strip 8 header fields, clean tags + escapes).
     static func plainText(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
         if let textPtr = rect.pointee.text {
             let s = String(cString: textPtr)
@@ -21,8 +16,7 @@ enum SubtitleRectText {
             if line.hasPrefix("Dialogue: ") {
                 line.removeFirst("Dialogue: ".count)
             }
-            // ASS dialogue layout: 9 comma-separated fields; the body
-            // is the 9th and may contain commas.
+            // ASS dialogue: 9 comma-separated fields; body is the 9th and may contain commas.
             let parts = line.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
             let raw = parts.count == 9 ? String(parts[8]) : line
             return cleanASSBody(raw)
@@ -30,13 +24,7 @@ enum SubtitleRectText {
         return nil
     }
 
-    /// Raw ASS event line for the rect, exactly as libavcodec hands
-    /// it over (the `ReadOrder,Layer,Style,...,Text` payload with all
-    /// override tags and escapes intact). Used by the
-    /// `preserveASSMarkup` opt-in path on both the embedded
-    /// (`EmbeddedSubtitleDecoder`) and sidecar (`SubtitleDecoder`)
-    /// readers; nil when the rect carries no ASS payload (bitmap
-    /// rects, plain-text-only rects).
+    /// Raw ASS event line exactly as libavcodec hands it over (`ReadOrder,Layer,Style,...,Text`, tags + escapes intact), for the `preserveASSMarkup` path; nil when the rect carries no ASS payload (bitmap or plain-text-only rects).
     static func rawASSLine(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
         guard let assPtr = rect.pointee.ass else { return nil }
         let line = String(cString: assPtr)

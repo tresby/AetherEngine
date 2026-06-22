@@ -1,10 +1,6 @@
 import Foundation
 
-/// In-memory `IOReader` over an immutable `Data` blob. Built for the live
-/// scrub-thumbnail path: the engine composes init.mp4 + one cached segment
-/// into a single buffer and demuxes it through `FrameExtractor(reader:)`,
-/// no filesystem or network involved. The lock makes read/seek safe from
-/// the extractor's demux thread.
+/// In-memory `IOReader` over an immutable `Data` blob. Used by the scrub-thumbnail path: engine composes init.mp4 + cached segment into one buffer and demuxes via `FrameExtractor(reader:)`. NSLock makes read/seek safe off the demux thread.
 final class DataIOReader: IOReader, @unchecked Sendable {
     private let data: Data
     private var position = 0

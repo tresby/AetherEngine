@@ -21,24 +21,20 @@ final class SubtitleBatchFlushTests: XCTestCase {
     }
 
     func test_sparseTrackFlushesPerEvent_spanAtOrPastWindow() {
-        // A sparse track advances the demux clock well past the window between
-        // cues, so each single pending event flushes immediately: no batching
-        // latency for normal dialogue.
+        // Sparse track: demux clock advances past the window per cue, so single events flush immediately.
         XCTAssertTrue(AetherEngine.shouldFlushSubtitleBatch(pendingCount: 1, batchSpanSeconds: window))
         XCTAssertTrue(AetherEngine.shouldFlushSubtitleBatch(pendingCount: 1, batchSpanSeconds: window + 5))
     }
 
     func test_densClusterHeldUntilWindowElapses() {
-        // Many events inside one window stay batched (held) until the demux
-        // position crosses the window boundary.
+        // Dense cluster: held until demux position crosses the window boundary.
         XCTAssertFalse(AetherEngine.shouldFlushSubtitleBatch(pendingCount: 5, batchSpanSeconds: 0))
         XCTAssertFalse(AetherEngine.shouldFlushSubtitleBatch(pendingCount: 5, batchSpanSeconds: window - 0.001))
         XCTAssertTrue(AetherEngine.shouldFlushSubtitleBatch(pendingCount: 5, batchSpanSeconds: window))
     }
 
     func test_countCapForcesFlushWhenSpanStalls() {
-        // A same-timestamp burst (span == 0, or span unknown) would never trip
-        // the window rule; the count cap bounds memory and hop size.
+        // Same-timestamp burst (span == 0 or nil) never trips the window rule; count cap bounds memory and hop size.
         XCTAssertFalse(AetherEngine.shouldFlushSubtitleBatch(pendingCount: cap - 1, batchSpanSeconds: 0))
         XCTAssertTrue(AetherEngine.shouldFlushSubtitleBatch(pendingCount: cap, batchSpanSeconds: 0))
         XCTAssertTrue(AetherEngine.shouldFlushSubtitleBatch(pendingCount: cap, batchSpanSeconds: noSpan))

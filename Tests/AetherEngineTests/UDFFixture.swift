@@ -80,13 +80,10 @@ enum UDFFixture {
             precondition((s+1)*ss <= image.count || bytes.count <= ss)
             for (i, v) in bytes.enumerated() where i < ss { image[s*ss + i] = v }
         }
-        // metadata-partition descriptors are addressed by VIRTUAL block but the
-        // tag's TagLocation must be the virtual block number (UDF: tags inside
-        // the metadata partition record their metadata-partition block).
+        // UDF: metadata-partition tags record the virtual block number in TagLocation.
         func putV(_ bytes: [UInt8], vblock: Int) { put(bytes, atSector: phys(vblock)) }
 
-        // m2ts fragmented data: two extents in the physical partition, after the
-        // metadata region. Pick physical blocks well past the metadata vblocks.
+        // m2ts: two physical extents past the metadata region (partition-relative blocks 40 and 50).
         let frag1Block = 40, frag2Block = 50   // partition-relative blocks
         let half = m2tsBytes.count / 2
         let m2tsExt1 = Array(m2tsBytes[0..<half])
@@ -102,8 +99,7 @@ enum UDFFixture {
         let m2tsADs = shortAD(lenBytes: m2tsExt1.count, block: frag1Block)
                     + shortAD(lenBytes: m2tsExt2.count, block: frag2Block)
         putV(efe(location: 12, fileType: 5, partRefOfSelf: 0, adType: 0, infoLen: m2tsBytes.count, ads: m2tsADs), vblock: 12)
-        // mpls EFE (vblock 10): one extent -> the mpls is in the METADATA partition,
-        // so use a long_ad into partition ref 1 (metadata), block 11. adType long_ad=1.
+        // mpls EFE (vblock 10): long_ad (adType=1) into metadata partition ref 1, block 11.
         putV(efe(location: 10, fileType: 5, partRefOfSelf: 1, adType: 1, infoLen: mplsBytes.count,
                  ads: longAD(lenBytes: mplsBytes.count, block: 11, partRef: 1)), vblock: 10)
 

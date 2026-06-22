@@ -1,24 +1,18 @@
 import Foundation
 import CoreGraphics
 
-/// Produces still images from a media URL via an isolated FFmpeg decode
-/// context, strictly separate from playback. Two modes share one decode
-/// core: `snapshot` (frame-accurate, full-res) and `thumbnail`
-/// (keyframe-snapped, low-res, fast).
-///
-/// Lifecycle is lazy: the decode context opens on first use. Blocking
-/// FFmpeg work runs on a dedicated serial queue, never on the
-/// cooperative thread pool.
-///
-/// Create one per URL. For the currently-playing item, prefer
-/// `AetherEngine.makeFrameExtractor()`.
+/// Produces still images from a media URL via an isolated FFmpeg decode context,
+/// separate from playback. Two modes share one decode core: `snapshot` (frame-accurate,
+/// full-res) and `thumbnail` (keyframe-snapped, low-res, fast). Lazy: context opens on
+/// first use; blocking FFmpeg work runs on a dedicated serial queue, not the cooperative pool.
+/// Create one per URL; for the playing item prefer `AetherEngine.makeFrameExtractor()`.
 public actor FrameExtractor {
     private let context: FrameDecodeContext
     private let cache: FrameCache
     private let decodeQueue: DispatchQueue
 
-    /// Cancellation flag for the in-flight decode. A new request flips
-    /// the previous token so a superseded scrub decode bails promptly.
+    /// Cancellation flag for the in-flight decode; a new request flips the previous
+    /// token so a superseded scrub decode bails promptly.
     private final class CancelToken: @unchecked Sendable {
         private let lock = NSLock()
         private var _cancelled = false
@@ -48,8 +42,8 @@ public actor FrameExtractor {
         self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .userInitiated)
     }
 
-    /// Construct an extractor over a custom `IOReader` source (a clone with its
-    /// own cursor). The extractor owns the reader and closes it on teardown.
+    /// Construct over a custom `IOReader` source (a clone with its own cursor).
+    /// The extractor owns the reader and closes it on teardown.
     public init(reader: IOReader, formatHint: String? = nil) {
         self.context = FrameDecodeContext(reader: reader, formatHint: formatHint)
         self.cache = FrameCache(
@@ -71,8 +65,8 @@ public actor FrameExtractor {
         await produce(at: seconds, mode: .snapshot, targetWidth: 0, maxSize: maxSize)
     }
 
-    /// Open the decode context ahead of the first request to hide
-    /// cold-start latency (e.g. at the start of a scrub gesture).
+    /// Open the decode context ahead of the first request to hide cold-start latency
+    /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {
         guard !isShutDown else { return }
         let context = self.context
@@ -80,12 +74,10 @@ public actor FrameExtractor {
         scheduleIdleClose()
     }
 
-    /// Permanently tear down the decode context and clear the cache.
-    /// Awaits the teardown on the decode queue, so when this returns the
-    /// FFmpeg demuxer / codec / sws resources are fully released. After
-    /// `shutdown()` the extractor is dead: further `thumbnail` /
-    /// `snapshot` / `prewarm` calls return nil / no-op and do NOT reopen
-    /// the context. Create a new `FrameExtractor` to extract again.
+    /// Permanently tear down the decode context and clear the cache. Awaits teardown on
+    /// the decode queue, so on return the FFmpeg demuxer/codec/sws are fully released.
+    /// After shutdown() the extractor is dead: thumbnail/snapshot/prewarm return nil/no-op
+    /// and do NOT reopen; create a new FrameExtractor to extract again.
     public func shutdown() async {
         idleTask?.cancel()
         isShutDown = true
@@ -130,8 +122,7 @@ public actor FrameExtractor {
         return result.image
     }
 
-    /// Run blocking work on the dedicated serial queue and await the
-    /// result without blocking the actor's executor.
+    /// Run blocking work on the serial queue, awaiting the result without blocking the actor's executor.
     private func runOnQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
         await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
             decodeQueue.async {
@@ -140,9 +131,8 @@ public actor FrameExtractor {
         }
     }
 
-    /// Restart the idle countdown. Called at the end of every request.
-    /// After `idleInterval` with no further request, the decode context
-    /// is closed and the cache cleared; the next request reopens lazily.
+    /// Restart the idle countdown (called after every request). After `idleInterval`
+    /// idle the context closes and cache clears; the next request reopens lazily.
     private func scheduleIdleClose() {
         idleTask?.cancel()
         idleTask = Task { [weak self, idleInterval] in
@@ -155,22 +145,18 @@ public actor FrameExtractor {
         }
     }
 
-    /// Transient teardown after idle: closes the decode context and
-    /// drops the cache. Distinct from `shutdown()`, this does NOT set
-    /// `isShutDown`, so the next request lazily reopens.
+    /// Transient teardown after idle: closes the context and drops the cache. Unlike
+    /// shutdown() this does NOT set `isShutDown`, so the next request lazily reopens.
     private func idleClose() {
         cache.clear()
         let context = self.context
-        // Fire-and-forget: idle teardown is best-effort and no caller
-        // awaits it. Using runOnQueue here (as shutdown does) would
-        // block the actor for no benefit.
+        // Fire-and-forget: best-effort, no caller awaits it; runOnQueue would block the actor for nothing.
         decodeQueue.async { context.close() }
     }
 }
 
-/// Wrapper so a CGImage? can cross the `runOnQueue` Sendable boundary
-/// without tripping Swift 6 concurrency checking. CGImage is immutable
-/// and already passed across domains in this module (see SubtitleImage).
+/// Wrapper so CGImage? crosses the `runOnQueue` Sendable boundary under Swift 6.
+/// CGImage is immutable and already passed across domains here (see SubtitleImage).
 private struct FrameResult: @unchecked Sendable {
     let image: CGImage?
 }

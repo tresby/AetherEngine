@@ -1,12 +1,6 @@
-// Tests/AetherEngineTests/DualSourceMergeOrderTests.swift
-//
-// Verifies the pure DTS ordering behind the producer's dual-demuxer
-// pull-merge (demuxed-audio HLS ingest): given the two lookahead
-// packets' ordering ticks and time bases, the side (audio rendition)
-// packet must be yielded exactly when its rescaled timestamp is
-// strictly lower, with ties going to the main (video) packet. The
-// blocking read mechanics around the decision are not testable without
-// demuxers; the ordering is the part past device bugs would live in.
+// Pure DTS ordering for the producer's dual-demuxer pull-merge (demuxed-audio HLS ingest).
+// Side packet yields when its rescaled timestamp is strictly lower; ties go to main. Blocking
+// read mechanics are not testable without demuxers.
 import XCTest
 import Libavutil
 @testable import AetherEngine
@@ -16,10 +10,7 @@ final class DualSourceMergeOrderTests: XCTestCase {
     private let ts90k = AVRational(num: 1, den: 90_000)
 
     func testInterleavesByDtsInSharedTimebase() {
-        // Both renditions on the MPEG-TS 90 kHz clock, video at 25 fps
-        // (3600-tick spacing), audio AAC at ~21.3 ms (1920-tick
-        // spacing). Walk one second of each cadence through the
-        // comparison and check the merge always picks the earlier one.
+        // 90 kHz clock: video 25fps (3600-tick spacing), audio AAC ~21.3ms (1920-tick spacing).
         var videoDts: Int64 = 0
         var audioDts: Int64 = 900   // intrinsic head-of-stream offset
         for _ in 0..<100 {
@@ -34,9 +25,6 @@ final class DualSourceMergeOrderTests: XCTestCase {
     }
 
     func testUnequalCadenceDrainsTheLaggingSource() {
-        // Audio packets are far denser than video: between two video
-        // packets the merge must keep yielding side packets until the
-        // side lookahead catches up past the main one.
         let videoDts: Int64 = 7200
         var audioDts: Int64 = 0
         var sideYields = 0
@@ -52,9 +40,7 @@ final class DualSourceMergeOrderTests: XCTestCase {
     }
 
     func testRescalesAcrossDifferentTimebases() {
-        // Main in 1/1000, side in 1/90000: 500 ms video vs 400 ms and
-        // 600 ms audio. The comparison must happen on a common clock,
-        // not on raw ticks (45000 raw ticks would dwarf 500).
+        // main=1/1000, side=1/90000: comparison must rescale to a common clock, not compare raw ticks.
         let ms = AVRational(num: 1, den: 1000)
         XCTAssertTrue(DualSourceMergeOrder.sideFirst(
             mainTicks: 500, mainTimeBase: ms,
@@ -67,8 +53,7 @@ final class DualSourceMergeOrderTests: XCTestCase {
     }
 
     func testTieYieldsMainFirst() {
-        // Equal timestamps: video leads the interleave (segment cuts
-        // key off video keyframes).
+        // Ties yield main first: segment cuts key off video keyframes.
         XCTAssertFalse(DualSourceMergeOrder.sideFirst(
             mainTicks: 3600, mainTimeBase: ts90k,
             sideTicks: 3600, sideTimeBase: ts90k
@@ -76,9 +61,7 @@ final class DualSourceMergeOrderTests: XCTestCase {
     }
 
     func testTimestamplessPacketYieldsImmediately() {
-        // Int64.min is the "no dts and no pts" key: such a packet is
-        // yielded right away instead of being rescaled (the pump's
-        // NOPTS repair downstream owns the actual fix-up).
+        // Int64.min == NOPTS: yield immediately without rescaling; downstream pump owns repair.
         XCTAssertTrue(DualSourceMergeOrder.sideFirst(
             mainTicks: 100, mainTimeBase: ts90k,
             sideTicks: Int64.min, sideTimeBase: ts90k

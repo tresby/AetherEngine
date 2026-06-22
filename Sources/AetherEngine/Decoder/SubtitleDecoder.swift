@@ -10,53 +10,27 @@ enum SubtitleDecoderError: Error {
     case codecOpenFailed(code: Int32)
 }
 
-/// Result of a sidecar decode: the cue list plus, for ASS/SSA files
-/// loaded under `preserveASSMarkup`, the script header (`[Script Info]`
-/// + `[V4+ Styles]` + `[Events]` Format line) extracted from the
-/// subtitle stream's extradata. `assHeader` is nil for non-ASS files
-/// and whenever markup preservation is off.
+/// Result of a sidecar decode: cue list plus, when preserveASSMarkup is set on an ASS/SSA file,
+/// the script header ([Script Info] + [V4+ Styles] + [Events] Format line) from the stream's extradata.
 struct SidecarDecodeResult {
     let cues: [SubtitleCue]
     let assHeader: String?
 }
 
-/// One-shot decoder for sidecar subtitle files (.srt / .ass / .vtt /
-/// .ssa next to the media). Opens the URL as its own AVFormatContext,
-/// finds the single subtitle stream, walks every packet, and returns
-/// the decoded cue list.
-///
-/// Distinct from the main demux loop's streaming decoder which routes
-/// subtitle packets that are *already* flowing for an embedded track,
-/// sidecars are separate small files that the main demuxer never sees,
-/// so they need their own context. Bandwidth-wise this is cheap: a
-/// typical SRT/ASS file is ~50–200 KB, served straight from the host
-/// (Jellyfin) with no extraction work.
+/// One-shot decoder for sidecar subtitle files (.srt/.ass/.vtt/.ssa).
+/// Opens the URL as its own AVFormatContext; sidecars are separate files the main demuxer never sees.
 enum SubtitleDecoder {
 
-    /// Decode every cue out of the subtitle file at `url`. Cancellable
-    /// via `Task.cancel()`; throws on open / codec failure. Returns
-    /// cues sorted by `startTime`, plus the ASS header when
-    /// `preserveASSMarkup` is set and the file is ASS/SSA.
-    ///
-    /// `preserveASSMarkup`: when true, ASS/SSA cues carry the raw
-    /// libavcodec event line (`ReadOrder,Layer,Style,...,Text`) as
-    /// their text body instead of stripped plain text, mirroring the
-    /// embedded `EmbeddedSubtitleDecoder` path so a whole-script
-    /// renderer (swift-ass-renderer via `ASSScriptBuilder`) can style
-    /// them. No effect on non-ASS files (SRT / VTT carry no ASS
-    /// payload, so the path falls back to plain text).
+    /// Decode every cue from the subtitle file at `url`, cancellable via Task.cancel().
+    /// When preserveASSMarkup is true, ASS/SSA cues carry the raw libavcodec event line
+    /// (ReadOrder,Layer,Style,...,Text) so ASSScriptBuilder can restyle them; no effect on SRT/VTT.
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false
     ) async throws -> SidecarDecodeResult {
-        // Task.cancel() does NOT propagate into a detached task (and
-        // `Task.isCancelled` inside it refers to the detached task, so it
-        // was always false): a superseded sidecar load used to decode the
-        // whole file to the end, HTTP traffic included. Bridge the
-        // caller's cancellation explicitly: the handler trips a shared
-        // flag the decode loop polls, and aborts the AVIO reader so a
-        // read blocked on a stalled source unwinds promptly.
+        // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
+        // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
@@ -70,9 +44,7 @@ enum SubtitleDecoder {
         }
     }
 
-    /// Thread-safe cancellation token bridged into the detached decode
-    /// task (cf. `FrameExtractor.CancelToken`). Also aborts a registered
-    /// AVIO reader so cancellation isn't stuck behind a blocked read.
+    /// Thread-safe cancellation token for the detached decode task; also aborts any registered AVIO reader.
     private final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
@@ -111,14 +83,9 @@ enum SubtitleDecoder {
         var avioReader: AVIOReader?
 
         if isHTTP {
-            // Auth headers (WebDAV-hosted sidecars and friends, #32)
-            // ride the same AVIO reader path as the media source.
             let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
-            // Register BEFORE open(): open does a synchronous network
-            // probe (up to ~60 s against a stalled origin), and a
-            // superseded load cancelled during it must be able to abort
-            // via markClosed instead of holding the connection + the
-            // detached task until the probe times out.
+            // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
+            // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
             cancel.register(reader)
             try reader.open()
             avioReader = reader
@@ -161,9 +128,7 @@ enum SubtitleDecoder {
             throw SubtitleDecoderError.openFailed(code: probeRet)
         }
 
-        // Sidecar containers usually expose exactly one subtitle stream
-        // at index 0, but probe defensively in case a container wraps
-        // multiple sub tracks or an unrelated stream sneaks in.
+        // Probe defensively; sidecars usually have one stream at index 0 but containers can have extras.
         var subStreamIndex: Int = -1
         for i in 0..<Int(fmt.pointee.nb_streams) {
             guard let stream = fmt.pointee.streams[i],
@@ -181,12 +146,8 @@ enum SubtitleDecoder {
             throw SubtitleDecoderError.noSubtitleStream
         }
 
-        // ASS / SSA sidecars carry their script header ([Script Info] +
-        // [V4+ Styles] + the [Events] Format line) as codec extradata,
-        // exactly like embedded tracks (mirrors Demuxer.trackInfo). Hosts
-        // that opt into raw ASS event lines need it to resolve style
-        // references. Only surfaced under preserveASSMarkup; the raw
-        // event-line path below is the only consumer.
+        // ASS/SSA script header is in codec extradata (mirrors Demuxer.trackInfo for embedded tracks).
+        // Only surfaced under preserveASSMarkup; the raw event-line path is the only consumer.
         let codecID = codecpar.pointee.codec_id
         let isASS = codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA
         let keepMarkup = preserveASSMarkup && isASS
@@ -195,9 +156,7 @@ enum SubtitleDecoder {
            let extradata = codecpar.pointee.extradata,
            codecpar.pointee.extradata_size > 0 {
             let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
-            // Strip NUL bytes: extradata is frequently NUL-terminated and
-            // libass parses C-string-style, so a single embedded NUL would
-            // hide every line a host appends after the header.
+            // Strip NUL bytes: extradata is often NUL-terminated; libass parses C-string-style and a NUL hides everything after it.
             assHeader = String(data: bytes, encoding: .utf8)?
                 .replacingOccurrences(of: "\0", with: "")
         }
@@ -225,15 +184,9 @@ enum SubtitleDecoder {
 
         var cues: [SubtitleCue] = []
         var nextID = 0
-        // PTS anchor for events surfaced by the post-loop flush, which
-        // have no packet of their own.
-        var lastPktPTS: Double = 0
+        var lastPktPTS: Double = 0  // PTS anchor for flush events that have no packet of their own
 
-        // Body extraction honours preserveASSMarkup: under it keep the
-        // raw ASS event line (so the host can rebuild a styled script
-        // via ASSScriptBuilder), otherwise strip to plain text. The
-        // raw line carries its own timing in the cue's start/end, which
-        // ASSScriptBuilder re-stamps, so the merged join below is safe.
+        // Under preserveASSMarkup: keep raw ASS event line (ASSScriptBuilder re-stamps timing); otherwise plain text.
         let lineForRect: (UnsafeMutablePointer<AVSubtitleRect>) -> String? = { rect in
             keepMarkup ? SubtitleRectText.rawASSLine(for: rect) : textForRect(rect)
         }
@@ -303,13 +256,8 @@ enum SubtitleDecoder {
             trackedPacketFree(&pktPtr)
         }
 
-        // Flush: ASS/SSA decoders can buffer events. Loop until the
-        // decoder reports nothing more and run the SAME cue extraction
-        // as the main loop. The old code decoded exactly one buffered
-        // event and threw it away unextracted, so whenever the decoder
-        // really did buffer, the file's last cue silently vanished.
-        // Timing anchor: a flushed event has no packet of its own, the
-        // last packet's PTS is the only plausible base.
+        // Flush ASS/SSA buffered events (old code decoded one event and discarded it, silently losing the last cue).
+        // Flushed events have no packet; use lastPktPTS as the timing anchor.
         while !cancel.isCancelled {
             var flushPkt = AVPacket()
             flushPkt.data = nil

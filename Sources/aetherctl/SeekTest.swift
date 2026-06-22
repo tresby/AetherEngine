@@ -3,20 +3,10 @@ import AetherEngine
 
 // MARK: - seektest: rapid-seek burst repro (issue #35)
 
-/// Drives a real AVPlayer (native loopback-HLS path) through a burst of
-/// rapid seeks and measures the producer-restart behavior, the longest
-/// "wedge" (state == .playing but the clock frozen), the final settle
-/// accuracy, and any non-monotonic clock jumps.
-///
-/// This is the headless macOS analogue of the device repro for #35: the
-/// restart machinery (`requestRestart` / `performRestart` / the segment
-/// provider's restart handler) is platform-agnostic, so the cascade-vs-
-/// coalesced difference is directly observable here via the engine log
-/// tallies, even though macOS AVPlayer's HLS tuning differs from tvOS.
+/// Headless macOS analogue of the #35 device repro: drives AVPlayer through a rapid-seek burst and tallies producer restarts vs. RestartCoalescer coalesces to measure cascade-vs-coalesced behavior.
 @MainActor
 private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double) async -> Int32 {
-    // Tally the restart / coalesce log lines that distinguish the cascade
-    // (pre-#35) from the coalesced behavior (post-#35).
+    // Tally log lines distinguishing cascade (pre-#35) vs. RestartCoalescer behavior (post-#35).
     let tally = UncheckedBox<[String: Int]>([:])
     EngineLog.handler = { line in
         let t = ISO8601DateFormatter.string(
@@ -57,9 +47,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         return 1
     }
 
-    // Wait for playback to begin AND for AVPlayer's item duration to
-    // propagate (it lags state == .playing by a beat, arriving via the
-    // host.$duration sink once the item is ready). Up to 15 s.
+    // Wait for state .playing AND duration > 0 (duration lags .playing via the host.$duration sink). Up to 15s.
     var waited = 0.0
     while (engine.state != .playing || engine.duration <= 0), waited < 15.0 {
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -72,18 +60,11 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         print("VERDICT: seektest FAIL: duration too short (\(duration)s); need > 30s of seekable VOD")
         return 1
     }
-    // Let playback settle for a moment before the burst.
-    try? await Task.sleep(nanoseconds: 1_500_000_000)
+    try? await Task.sleep(nanoseconds: 1_500_000_000) // brief settle before burst
 
-    // ---- #37/#38 probe: single backward seek with a concurrent sampler ----
-    // A 20 ms sampler records (currentTime, isSeeking) across one backward
-    // seek. Pre-fix the engine clock bounces back through the pre-seek
-    // position before AVPlayer's seek physically lands (the 100 ms time
-    // observer overwrites the optimistic target with the stale clock);
-    // post-fix the host suppresses that stale publish so the clock holds the
-    // target, and isSeeking spans the real landing. Runs the sampler for a
-    // fixed window so it catches both the in-flight hold (post-fix, inside
-    // the await) and the post-return bounce (pre-fix, after the await).
+    // #37/#38 probe: single backward seek with a 20ms concurrent sampler.
+    // Pre-fix: clock bounces back through pre-seek position (100ms observer overwrites optimistic target).
+    // Post-fix: host suppresses stale publish so clock holds target; isSeeking spans real landing.
     let probeHi = duration * 0.85
     let probeLo = duration * 0.10
     await engine.seek(to: probeHi)
@@ -124,21 +105,12 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         samples.append(Sample(
             wall: Date().timeIntervalSince(t0),
             ct: engine.currentTime,
-            // sourceTime tracks the rendered frame; ct - src is the published
-            // clock running ahead of the picture (issue #49 clockLead). On a
-            // fast headless AVPlayer the seek lands almost immediately, so this
-            // stays ~0 here; the metric exists to quantify the on-device
-            // rebuffer-stall window where it blows out.
-            src: engine.sourceTime,
+            src: engine.sourceTime, // ct - src = clockLead (issue #49); ~0 on headless, meaningful on device
             playing: engine.state == .playing
         ))
     }
 
-    // Back-and-forth scrub between a low and a high anchor. Backward jumps
-    // (hi -> lo) land outside the resident cache window and force a
-    // producer restart, which is exactly the cascade trigger. A small
-    // per-iteration offset keeps every target distinct so no two seeks
-    // dedupe to a no-op.
+    // Back-and-forth hi<->lo scrub: backward jumps (hi->lo) fall outside the cache window, forcing a producer restart. Per-iteration offset avoids seek deduplication.
     let lo = duration * 0.10
     let hi = duration * 0.85
     print(String(format: "  burst: %d seeks alternating ~%.1f <-> ~%.1f, gap=%dms", seeks, lo, hi, gapMs))
@@ -157,8 +129,6 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         }
     }
 
-    // One final settle seek to mid-file, then sample the clock as it
-    // recovers.
     let finalTarget = (duration * 0.5).rounded()
     print(String(format: "  settle: final seek to %.1f, sampling %.1fs", finalTarget, settleSeconds))
     await engine.seek(to: finalTarget)
@@ -169,9 +139,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         sample()
     }
 
-    // ---- Analysis ----
-    // Longest wedge: the longest contiguous wall-clock interval where the
-    // engine reported .playing but the clock did not advance (>= 0.05 s).
+    // Longest contiguous interval where state=.playing but clock did not advance by >= 0.05s.
     var maxWedge = 0.0
     var runStart: Double?
     for k in 1..<max(1, samples.count) {
@@ -188,10 +156,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         maxWedge = max(maxWedge, last.wall - rs)
     }
 
-    // Non-monotonic jumps during the settle phase: the clock stepping
-    // BACKWARD by more than 1 s between consecutive samples (the #35
-    // "146.7 -> 271.9" signature is a forward jump, but any large
-    // unexpected step is suspect; we report both directions).
+    // Clock stepping backward by > 1s between samples, or large forward leaps; both reported.
     var backwardJumps = 0
     var maxForwardStep = 0.0
     for k in 1..<max(1, samples.count) {
@@ -200,8 +165,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         maxForwardStep = max(maxForwardStep, step)
     }
 
-    // clockLead: how far the published clock (ct) runs ahead of the rendered
-    // frame (src) across the burst. Peak + post-settle residual (issue #49).
+    // clockLead (issue #49): peak and post-settle residual of ct ahead of rendered frame.
     var maxClockLead = 0.0
     for s in samples { maxClockLead = max(maxClockLead, s.ct - s.src) }
     let settleClockLead = (samples.last.map { $0.ct - $0.src }) ?? 0
@@ -237,7 +201,6 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     return 0
 }
 
-/// Entry point for the `seektest` subcommand.
 func runSeekTest(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double) -> Int32 {
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in

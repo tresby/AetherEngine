@@ -2,30 +2,10 @@ import Foundation
 import Libavfilter
 import Libavutil
 
-/// Persistent bwdif/yadif deinterlacing graph for the software-decode
-/// path.
-///
-/// Interlaced H.264 routes to native AVPlayer, which deinterlaces
-/// itself (device-verified on a 1080i channel). Interlaced MPEG-2 /
-/// VC-1 / MPEG-4 (DVD rips, SD broadcast channels) decode through
-/// libavcodec and would render with combing artifacts otherwise; this
-/// graph weaves them into clean progressive frames.
-///
-/// Unlike the FrameExtractor's one-shot tone-map graph, this one is
-/// PERSISTENT: bwdif/yadif are temporal filters that reference the
-/// previous and next frames, so the graph must see a continuous frame
-/// stream. The decoder engages it on the first interlaced frame and
-/// from then on routes EVERY frame through it; `deint=interlaced`
-/// makes the filter pass progressive frames through untouched, so
-/// mixed content stays correct. Purely progressive sessions never
-/// build a graph and pay zero overhead.
-///
-/// `mode=send_frame` emits one output frame per input frame (no field
-/// rate doubling), so the playback frame rate and the renderer's
-/// pacing are unaffected. The filter buffers one frame of lookahead;
-/// the decoder tears the graph down on flush (seek) so stale temporal
-/// references never bleed across a discontinuity, and lazily rebuilds.
-///
+/// Persistent bwdif/yadif deinterlacing graph for the software-decode path (MPEG-2/VC-1/MPEG-4; interlaced H.264 stays on AVPlayer).
+/// MUST be persistent: bwdif/yadif are temporal filters that need a continuous frame stream.
+/// `deint=interlaced` passes progressive frames through untouched; `mode=send_frame` avoids field-rate doubling.
+/// Torn down on seek so stale temporal references never cross a discontinuity; lazily rebuilt on the next interlaced frame.
 /// Not thread-safe; the owning decoder serializes access with its lock.
 final class DeinterlaceFilter {
 
@@ -37,21 +17,15 @@ final class DeinterlaceFilter {
     private var pixFmt: Int32 = -1
     private var loggedUnavailable = false
 
-    /// The stream time_base the graph was configured with. bwdif/yadif
-    /// halve their output link's time_base (and scale frame PTS by 2),
-    /// so `pull` rescales pulled PTS back into this base before handing
-    /// frames to the decoder, which timestamps on the stream time_base.
+    /// bwdif/yadif halve their output link's time_base (and scale frame PTS by 2); `pull` rescales back to this base
+    /// to avoid interlaced PTS arriving at 2x real time (half-speed playback + far-future resume seek freeze).
     private var inputTimeBase = AVRational(num: 0, den: 1)
 
-    /// True once a graph has been configured for this session; the
-    /// decoder uses this to keep routing frames through the filter
-    /// after the first interlaced one engaged it.
     var isActive: Bool { graph != nil }
 
-    /// Build (or rebuild after a parameter change) the graph for the
-    /// given frame's geometry. Returns false when no deinterlacer is
-    /// compiled into the linked FFmpeg build or graph setup fails; the
-    /// caller then renders the frame directly (combing, but playing).
+    /// Build (or rebuild after a parameter change) the graph for the given frame's geometry.
+    /// Returns false when no deinterlacer is compiled into the linked FFmpeg build or graph setup fails;
+    /// the caller then renders the frame directly (combing, but playing).
     func ensureGraph(frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) -> Bool {
         if graph != nil,
            width == frame.pointee.width,
@@ -61,8 +35,7 @@ final class DeinterlaceFilter {
         }
         teardown()
 
-        // bwdif is the primary (better edge reconstruction); yadif the
-        // fallback so an older linked framework still deinterlaces.
+        // bwdif is the primary (better edge reconstruction); yadif the fallback for older linked frameworks.
         let filterName: String
         if avfilter_get_by_name("bwdif") != nil {
             filterName = "bwdif"
@@ -151,27 +124,18 @@ final class DeinterlaceFilter {
         return true
     }
 
-    /// Feed a decoded frame. Takes ownership of the frame's references
-    /// (the frame struct is reset; the caller's next receive_frame
-    /// refills it).
+    /// Feed a decoded frame (takes ownership; frame is reset after the call).
     func push(_ frame: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let src = srcCtx else { return -1 }
         return av_buffersrc_add_frame_flags(src, frame, 0)
     }
 
-    /// Pull the next filtered frame into `out`. Returns >= 0 on
-    /// success, AVERROR(EAGAIN) when the filter needs more input (its
-    /// one-frame temporal lookahead), any other negative on error.
+    /// Pull the next filtered frame into `out`. Returns >= 0 on success, AVERROR(EAGAIN) when the filter needs more input.
     func pull(into out: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let sink = sinkCtx else { return -1 }
         let ret = av_buffersink_get_frame(sink, out)
         guard ret >= 0 else { return ret }
-        // bwdif/yadif configure their output link with time_base =
-        // input/2 and emit frame PTS in that halved base (pts *= 2 even
-        // in send_frame mode). The decoder timestamps every frame on the
-        // stream time_base, so without this rescale interlaced PTS arrive
-        // at 2x their real time: playback runs at half speed and a resume
-        // seek lands frames in the far future, freezing the picture.
+        // Rescale from the sink's halved time_base back to inputTimeBase (see property doc).
         let sinkTB = av_buffersink_get_time_base(sink)
         if out.pointee.pts != Int64.min {  // AV_NOPTS_VALUE
             out.pointee.pts = av_rescale_q(out.pointee.pts, sinkTB, inputTimeBase)
@@ -182,9 +146,7 @@ final class DeinterlaceFilter {
         return ret
     }
 
-    /// Free the graph. Called on flush (seek discontinuity: the
-    /// temporal references are stale) and close; `ensureGraph` lazily
-    /// rebuilds on the next interlaced frame.
+    /// Free the graph. Called on seek (stale temporal references) and close; `ensureGraph` lazily rebuilds.
     func teardown() {
         if graph != nil {
             avfilter_graph_free(&graph)

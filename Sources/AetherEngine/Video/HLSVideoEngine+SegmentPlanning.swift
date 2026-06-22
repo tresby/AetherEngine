@@ -11,23 +11,13 @@ extension HLSVideoEngine {
         let endPts: Int64
         let startSeconds: Double
         let durationSeconds: Double
-        /// True when this segment opened at a detected live PTS
-        /// discontinuity (program boundary). The playlist builder prefixes
-        /// such a segment with `#EXT-X-DISCONTINUITY`. Always false for VOD
-        /// (the precomputed plan has no discontinuities).
+        /// True at a live PTS discontinuity (program boundary); causes `#EXT-X-DISCONTINUITY` in the playlist. Always false for VOD.
         var discontinuous: Bool = false
     }
 
     // MARK: - Segment planning
 
-    /// Build a uniform-duration segment plan from the source's
-    /// reported duration. Used only as a fallback when libavformat's
-    /// keyframe index is too sparse for the keyframe-aligned plan.
-    /// The hls muxer will still snap actual cut points to real
-    /// keyframes, so EXTINF / actual-duration drift accumulates with
-    /// each segment in this fallback path. Phase B's restart machinery
-    /// renegotiates timeline alignment after scrubs, so the drift
-    /// stays bounded within one playback span.
+    /// Uniform-duration fallback plan when the keyframe index is too sparse. The muxer still snaps cuts to real keyframes, so EXTINF drift accumulates per segment; restart machinery renegotiates alignment after scrubs.
     func buildUniformSegmentPlan(
         videoTimeBase: AVRational,
         sourceDurationSeconds: Double
@@ -55,22 +45,7 @@ extension HLSVideoEngine {
         return plan
     }
 
-    /// Build a segment plan from real keyframes using libavformat's
-    /// hls muxer cut algorithm: segment N ends at the first keyframe
-    /// whose absolute distance from `start_pts` reaches `(N+1) *
-    /// targetSegmentDuration`. `start_pts` is taken as the first
-    /// keyframe in the index (sorted ascending), which matches the
-    /// muxer's behaviour of latching `vs->start_pts` to the first
-    /// packet's pts.
-    ///
-    /// This algorithm replaces the previous one which walked the
-    /// keyframe list with a relative threshold per segment. The
-    /// relative walk diverged from libavformat's cut algorithm on
-    /// sources with irregular GOPs (e.g. keyframes at 0, 5.8, 11.5,
-    /// 17.4, 23.3 produce 3 segments under absolute thresholds but
-    /// only 2 under the relative walk), which would translate into
-    /// playlist drift the moment the muxer actually cut differently
-    /// from what we'd advertised.
+    /// Keyframe-aligned plan mirroring libavformat's hls muxer cut algorithm: segment N ends at the first keyframe where `(keyframe_pts - start_pts) >= (N+1) * targetDuration`. Absolute thresholds match the muxer; relative per-segment thresholds diverged on irregular GOPs.
     func buildKeyframeSegmentPlan(
         keyframes: [Int64],
         videoTimeBase: AVRational,
@@ -107,12 +82,7 @@ extension HLSVideoEngine {
                 segEndSeconds = Double(segEndPts - startPts0) * tb
             } else {
                 segEndSeconds = sourceDurationSeconds
-                // startPts0-anchored like every startPts: a bare
-                // duration/tb sat on the from-zero axis while the rest of
-                // the plan is absolute source PTS. Harmless today only
-                // because segmentIndex() clamps past-the-end PTS into the
-                // last segment; any new consumer of endPts would inherit
-                // an off-by-one-GOP skew.
+                // GOTCHA: final endPts is startPts0-anchored; consumers must not use it raw: segmentIndex() clamps past-the-end PTS into the last segment.
                 segEndPts = startPts0 + Int64(sourceDurationSeconds / tb)
             }
 
@@ -130,31 +100,7 @@ extension HLSVideoEngine {
         return plan
     }
 
-    /// When the source HEVC's `hvcC` (in `codecpar.extradata`) carries
-    /// the configuration header but no VPS / SPS / PPS arrays, scan
-    /// the first packets for in-band parameter sets and return a
-    /// rebuilt `hvcC` byte sequence with those arrays populated.
-    /// Returns nil when the source already has parameter set arrays,
-    /// when the source uses a non-4-byte NALU length size, or when
-    /// the scan exhausts the budget without finding all three NAL
-    /// types.
-    ///
-    /// Some DV Profile 5 MP4 encoders write only the 23-byte hvcC
-    /// header (`numOfArrays = 0`) and leave VPS / SPS / PPS in-band
-    /// in every IRAP packet (issue #19 Wandering Earth 2 WEB-DL).
-    /// FFmpeg's mp4 muxer stream-copies that hvcC through, so the
-    /// output fMP4 has a `dvh1` sample entry that AVPlayer cannot
-    /// build a `CMVideoFormatDescription` from. AVPlayer's symptom is
-    /// `item.tracks count=2` but `fourCC=<no fdesc>` and
-    /// `item.status .failed` with `CoreMediaErrorDomain -4`. The
-    /// matroska demuxer doesn't hit this because matroska parameter
-    /// sets are in the `CodecPrivate` block which FFmpeg lifts into
-    /// `codecpar.extradata` as a complete annex-B sequence that the
-    /// mp4 muxer's `ff_isom_write_hvcc` then rebuilds properly.
-    ///
-    /// Caller is expected to seek the demuxer back to a known
-    /// position after this returns, since extracting consumes
-    /// packets.
+    /// Scan packets for in-band VPS/SPS/PPS when hvcC `numOfArrays=0` (DV P5 MP4 encoders, e.g. Wandering Earth 2 WEB-DL, issue #19). AVPlayer symptom: `item.tracks count=2`, `fourCC=<no fdesc>`, `CoreMediaErrorDomain -4`. Caller must seek back after this consumes packets.
     func rebuildHEVCExtradataWithInBandParameterSets(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
@@ -163,13 +109,8 @@ extension HLSVideoEngine {
         guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else { return nil }
         let extradataSize = Int(codecpar.pointee.extradata_size)
         guard extradataSize >= 23, let extradata = codecpar.pointee.extradata else { return nil }
-        // hvcC byte 22 is numOfArrays. Non-zero means parameter sets
-        // already in the configuration record; nothing to do.
-        guard extradata[22] == 0 else { return nil }
-        // hvcC byte 21 lower 2 bits + 1 is NALU length size. Anything
-        // other than 4 is exotic enough that we bail rather than risk
-        // mis-parsing.
-        let naluLengthSize = Int(extradata[21] & 0x03) + 1
+        guard extradata[22] == 0 else { return nil }  // hvcC byte 22 = numOfArrays; non-zero means already populated
+        let naluLengthSize = Int(extradata[21] & 0x03) + 1  // hvcC byte 21 lower 2 bits + 1
         guard naluLengthSize == 4 else { return nil }
 
         var vps: [UInt8]?
@@ -187,12 +128,7 @@ extension HLSVideoEngine {
             }
             guard let pkt = readResult else { break }
             defer {
-                // trackedPacketFree, not raw av_packet_free: readPacket
-                // allocs via trackedPacketAlloc, and a raw free here left
-                // the PacketBalanceTracker's pktAlive permanently high
-                // (+N per DV5/empty-hvcC session), defeating the very
-                // leak diagnostic the counter exists for. free() unrefs
-                // internally, so no separate av_packet_unref needed.
+                // trackedPacketFree not raw av_packet_free: readPacket allocs via trackedPacketAlloc; raw free leaves PacketBalanceTracker.pktAlive permanently high.
                 var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
                 trackedPacketFree(&maybePkt)
             }
@@ -209,10 +145,7 @@ extension HLSVideoEngine {
                 }
                 offset += naluLengthSize
                 if nalLen == 0 || offset + nalLen > pktSize { break }
-                // HEVC NAL header: byte 0 = forbidden_zero_bit(1) +
-                // nal_unit_type(6) + layer_id high bit(1). NAL unit
-                // type is bits 1..6 of byte 0.
-                let nalType = (Int(pktData[offset]) >> 1) & 0x3F
+                let nalType = (Int(pktData[offset]) >> 1) & 0x3F  // HEVC NAL type: bits 1..6 of byte 0
                 let nalBytes = Array(UnsafeBufferPointer(start: pktData + offset, count: nalLen))
                 switch nalType {
                 case 32: if vps == nil { vps = nalBytes }
@@ -228,12 +161,7 @@ extension HLSVideoEngine {
 
         guard let vps, let sps, let pps else { return nil }
 
-        // Assemble a proper hvcC: keep the source's 22-byte header
-        // (configurationVersion + profile / level / chroma / temporal
-        // layer fields), set numOfArrays = 3, then append VPS / SPS /
-        // PPS arrays. Each array: 1 byte (arrayCompleteness=1 +
-        // reserved=0 + nalUnitType), 2 bytes numNalus = 1, 2 bytes
-        // nalUnitLength, NAL bytes.
+        // Assemble hvcC: keep source 22-byte header, set numOfArrays=3, append VPS/SPS/PPS arrays (1-byte type, 2-byte numNalus=1, 2-byte nalUnitLength, NAL bytes).
         var hvcC: [UInt8] = []
         hvcC.reserveCapacity(22 + 1 + 5 * 3 + vps.count + sps.count + pps.count)
         for i in 0..<22 { hvcC.append(extradata[i]) }
@@ -251,14 +179,7 @@ extension HLSVideoEngine {
         return hvcC
     }
 
-    /// AAC carried as ADTS (the typical MPEG-TS shape) arrives with no
-    /// AudioSpecificConfig in `extradata`, so the fMP4 `mp4a`/`esds` sample
-    /// entry can't be written and the mux fails. Synthesise a 2-byte ASC from
-    /// the codecpar's sample rate / channel count and install it as extradata,
-    /// and clear the codec_tag the mpegts demuxer leaves (the mov muxer rejects
-    /// the TS tag). Returns true when it applied the fix — the caller flags the
-    /// pump to strip the per-frame ADTS header. No-op (false) for non-AAC or
-    /// AAC that already carries an ASC (then the existing copy path works).
+    /// ADTS AAC from MPEG-TS arrives without an AudioSpecificConfig in `extradata`; the fMP4 `mp4a`/`esds` sample entry can't be written. Synthesizes a 2-byte ASC, installs it, and clears the TS codec_tag the mov muxer rejects. Returns true when applied; caller strips per-frame ADTS headers.
     static func prepareAACForFMP4(
         _ codecpar: UnsafeMutablePointer<AVCodecParameters>
     ) -> Bool {
@@ -268,20 +189,16 @@ extension HLSVideoEngine {
                                   24000, 22050, 16000, 12000, 11025, 8000, 7350]
         guard let freqIdx = freqTable.firstIndex(of: codecpar.pointee.sample_rate) else { return false }
         let channels = max(1, Int(codecpar.pointee.ch_layout.nb_channels))
-        // AudioSpecificConfig channelConfiguration: 1-6 map 1:1, 7 means
-        // EIGHT channels (7.1), and 7-channel audio has no config value
-        // at all. The old `channels <= 7 ? channels : 2` declared 8-ch
-        // sources as stereo (decoder garbage) and 6.1 as 7.1.
+        // ASC channelConfiguration: 1-6 map 1:1, 7 = 8ch (7.1); 7-ch has no ASC value. Old `channels<=7?channels:2` mapped 8ch as stereo and 6.1 as 7.1.
         let chanConfig: Int
         switch channels {
         case 1...6: chanConfig = channels
         case 8:     chanConfig = 7
-        default:    return false  // 7-ch (or >8): no ASC representation; let the bridge handle it
+        default:    return false  // 7-ch or >8: no ASC representation; bridge handles it
         }
-        // audioObjectType: basic AAC profiles map profile→profile+1 (LC = 2);
-        // default to 2 (AAC-LC, the mp4a.40.2 the engine advertises) otherwise.
         let profile = Int(codecpar.pointee.profile)
-        let aot = (profile >= 0 && profile <= 3) ? profile + 1 : 2
+        // audioObjectType: profile maps profile+1 (LC=2); default to 2 (mp4a.40.2) for unknown profiles.
+        let aot = (profile >= 0 && profile <= 3) ? profile + 1 : 2  // audioObjectType
         let asc: [UInt8] = [
             UInt8((aot << 3) | (freqIdx >> 1)),
             UInt8(((freqIdx & 1) << 7) | (chanConfig << 3)),
@@ -300,25 +217,7 @@ extension HLSVideoEngine {
         return true
     }
 
-    /// Whether an AAC source must take the `AudioBridge` (decode → re-encode)
-    /// instead of fMP4 stream-copy because it is HE-AAC (SBR) / HE-AACv2 (PS)
-    /// AND carries no AudioSpecificConfig in `extradata`.
-    ///
-    /// HE-AAC stream-copies cleanly whenever the source already ships an ASC
-    /// (any movie container: MP4 `esds`, MKV `CodecPrivate`). The ASC encodes
-    /// the true core sample rate plus the SBR/PS signaling; AVPlayer reads it
-    /// from the fMP4 init segment and decodes HE-AAC/HE-AACv2 natively
-    /// (AetherEngine#33), exactly as a manual or Jellyfin server-side remux
-    /// does. Bridging those was an unnecessary EAC3/FLAC re-encode.
-    ///
-    /// It only has to bridge when the ASC is ABSENT — live ADTS / MPEG-TS,
-    /// where `prepareAACForFMP4` synthesizes a 2-byte ASC from the codecpar.
-    /// That synthesized ASC declares plain LC at the SBR OUTPUT rate (e.g.
-    /// mp4a.40.2 @ 48 kHz for a 24 kHz core), which AudioToolbox decodes as
-    /// garbage (AVFoundationErrorDomain -11821, device repro: NBC HE-AAC).
-    /// `find_stream_info` decodes a frame before this runs, so `profile`
-    /// (4 = HE, 28 = HE-AACv2) and `frameSize` (SBR doubles the LC frame to
-    /// 2048 samples) are both populated; either one flags HE-AAC.
+    /// HE-AAC (SBR, profile=4) and HE-AACv2 (PS, profile=28) stream-copy cleanly when an ASC is present (MP4 esds, MKV CodecPrivate). Bridge only when ASC is absent (live ADTS/MPEG-TS): the synthesized 2-byte ASC declares LC at the SBR output rate, which AudioToolbox decodes as garbage (-11821; device repro: NBC HE-AAC). frameSize=2048 also flags SBR.
     static func aacRequiresBridge(profile: Int32, frameSize: Int32, hasASC: Bool) -> Bool {
         guard !hasASC else { return false }
         return profile == 4        // FF_PROFILE_AAC_HE

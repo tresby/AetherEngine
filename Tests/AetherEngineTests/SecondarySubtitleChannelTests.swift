@@ -17,14 +17,11 @@ final class SecondarySubtitleChannelTests: XCTestCase {
 
     @MainActor
     func testSecondaryChannelDefaultsAndIndependentClear() throws {
-        // AetherEngine.init() is `throws` and @MainActor.
         let engine = try AetherEngine()
-        // Defaults.
         XCTAssertEqual(engine.secondarySubtitleCues.count, 0)
         XCTAssertFalse(engine.isSecondarySubtitleActive)
         XCTAssertFalse(engine.isLoadingSecondarySubtitles)
-        // Clearing the secondary channel must not flip primary flags and
-        // vice versa (the two channels are fully independent).
+        // Clearing one channel must not flip the other's flags.
         engine.clearSecondarySubtitle()
         XCTAssertFalse(engine.isSecondarySubtitleActive)
         engine.clearSubtitle()

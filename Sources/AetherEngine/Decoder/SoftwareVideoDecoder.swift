@@ -6,59 +6,34 @@ import Libavcodec
 import Libavutil
 import Libswscale
 
-/// FFmpeg software video decoder fallback for codecs without
-/// VideoToolbox hardware support (e.g. AV1 on Apple TV).
-///
-/// Uses sws_scale (SIMD-optimized) for YUV→NV12/P010 conversion
-/// instead of manual per-pixel loops. This is critical for AV1
-/// where decode + conversion must hit 24fps at 1080p.
+/// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
+/// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.
 final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
-    // FFmpeg 8.x exposes `SwsContext` as a real struct in Swift, where 7.x
-    // surfaced it as an `OpaquePointer`. The function signatures (sws_get
-    // CachedContext / sws_scale / sws_freeContext) follow suit, so the
-    // stored pointer type has to match or every call site mismatches.
+    // FFmpeg 8.x exposes SwsContext as a real struct (7.x was OpaquePointer); pointer type must match or call sites miscompile.
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
 
-    /// One-shot detection of HDR10+ dynamic metadata on a decoded
-    /// frame's side data. Mirrors the VT path's flag so the engine
-    /// can flip its published videoFormat to `.hdr10Plus` regardless
-    /// of which decoder backend processed the stream.
+    /// Fires once (demux thread) on first HDR10+ side data; engine flips videoFormat to .hdr10Plus.
     private var seenHDR10Plus = false
-
-    /// Fires once per session, on the demux thread, the first time
-    /// HDR10+ dynamic metadata appears on a decoded frame. Engine
-    /// hooks this up the same way it hooks VideoDecoder's callback.
     var onFirstHDR10PlusDetected: (() -> Void)?
 
-    /// True when the source stream is >8-bit (HDR10, AV1 HDR).
+    /// True when the source is >8-bit (HDR10, AV1 HDR).
     private var use10Bit = false
 
-    /// Source pixel aspect ratio (SAR), captured from the stream at
-    /// open() as a fallback for any frame that doesn't carry its own.
-    /// Anamorphic DVD / SD content (NTSC 720x480 stored at 4:3, PAL
-    /// 720x576, widescreen DVDs) encodes non-square pixels; without
-    /// applying the SAR the picture renders horizontally squished
-    /// ("flattened"). The native VideoToolbox path gets this from the
-    /// container automatically; the software path has to attach it.
+    /// Container-declared SAR fallback for anamorphic DVD/SD content (NTSC 720x480, PAL 720x576, widescreen DVDs).
+    /// Native VideoToolbox gets this from the container automatically; the software path must attach it explicitly.
     private var streamSAR = AVRational(num: 1, den: 1)
 
-    /// Pixel buffer pool, reuses allocations instead of creating per frame.
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
 
-    /// After a seek, skip frames before this PTS to avoid the
-    /// "fast forward" effect. Decoded for reference but not converted.
-    ///
-    /// Guarded by its own `skipLock` (not the main `lock`: `emit()` runs
-    /// WITH the main lock held, so a same-lock accessor would deadlock).
-    /// The host writes from the seek path while the demux thread reads
-    /// in `emit`; CMTime is a multi-word struct, so the old
-    /// unsynchronized access was a torn-read candidate.
+    /// Skip pre-seek frames; decoded for reference but not converted.
+    /// Guarded by `skipLock` not `lock`: emit() runs with `lock` held, so a same-lock accessor would deadlock.
+    /// CMTime is multi-word: old unsynchronized access was a torn-read candidate.
     var skipUntilPTS: CMTime? {
         get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
         set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
@@ -75,15 +50,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         skipLock.unlock()
     }
 
-    /// Protects codecContext from concurrent access between the demux
-    /// thread (decode) and the main thread (close/flush).
+    /// Protects codecContext across the demux thread (decode) and main thread (close/flush).
     private let lock = NSLock()
 
-    /// Deinterlacer for interlaced MPEG-2 / VC-1 / MPEG-4 sources (DVD
-    /// rips, SD broadcast channels), which would otherwise render with
-    /// combing. Engaged lazily by the first interlaced frame; from then
-    /// on every frame routes through it (temporal filter, see the class
-    /// doc). Guarded by `lock`.
+    /// Deinterlacer for interlaced MPEG-2/VC-1/MPEG-4 (DVD rips, SD broadcast); see DeinterlaceFilter class doc.
+    /// Engaged lazily on first interlaced frame; every subsequent frame routes through it. Guarded by `lock`.
     private let deinterlacer = DeinterlaceFilter()
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
@@ -95,10 +66,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         timeBase = stream.pointee.time_base
 
-        // Capture the container-declared SAR up front. Frames usually
-        // carry their own sample_aspect_ratio (MPEG-2 seq header, set
-        // from frame 1), but this is the fallback when a frame reports
-        // an unset 0:0 / 1:1 ratio. See `streamSAR`.
+        // Container SAR fallback; see streamSAR. Frames usually carry their own (MPEG-2 seq header, from frame 1).
         streamSAR = codecpar.pointee.sample_aspect_ratio
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
@@ -114,7 +82,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.noCodecParameters
         }
 
-        // Force pure software decode, disable all hardware acceleration.
+        // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
         ctx.pointee.get_format = { _, fmts in
             guard let fmts = fmts else { return AV_PIX_FMT_NONE }
             var i = 0
@@ -127,11 +95,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             return AV_PIX_FMT_YUV420P
         }
 
-        // Use all available CPU cores for software decode.
         ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
-        // Disable hwaccel via codec options, some decoders ignore get_format
+        // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
         av_dict_set(&opts, "hwaccel", "none", 0)
 
@@ -141,16 +108,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_dict_free(&opts)
 
-        // Use 10-bit output for HDR content to preserve dynamic range.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
 
-        // Release-visible: this is the only line that tells a
-        // diagnostic-overlay reader whether the SW decoder opened at
-        // all. Removing the #if DEBUG gate so TestFlight users (and
-        // DrHurt #4 MPEG-4 black-screen reports) can see decoder
-        // init outcome from the in-app log buffer.
+        // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
     }
 
@@ -173,22 +135,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
 
-            // Deinterlace routing, still under `lock` (flush()/close()
-            // tear the graph down from another thread). The first
-            // interlaced frame engages the graph; afterwards EVERY
-            // frame routes through it so the temporal references stay
-            // continuous (deint=interlaced passes progressive frames
-            // through untouched). Progressive-only sessions never enter
-            // this branch.
             let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
             if isInterlaced || deinterlacer.isActive {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered {
-                        // The filter holds one frame of lookahead, so a
-                        // push can yield zero frames (EAGAIN) or one.
-                        while deinterlacer.pull(into: out) >= 0 {
+                        while deinterlacer.pull(into: out) >= 0 {  // filter holds one frame lookahead; push can yield EAGAIN
                             emit(out)
                             av_frame_unref(out)
                         }
@@ -196,14 +149,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                     lock.unlock()
                     continue
                 }
-                // No deinterlacer in the linked build / graph failure:
-                // fall through and render the frame as-is (combing,
-                // but playing).
+                // No deinterlacer in linked build or graph failure: fall through and render as-is (combing, but playing).
             }
-            // emit() under the lock on the direct path too: it reads AND
-            // reassigns swsContext / pixelBufferPool, which close() frees
-            // under the same lock from another thread; emitting unlocked
-            // raced a stop() into a use-after-free of the sws context.
+            // emit() must stay under `lock`: close() frees swsContext/pixelBufferPool under the same lock;
+            // emitting unlocked raced a stop() into a use-after-free of the sws context.
             emit(f)
             lock.unlock()
         }
@@ -212,14 +161,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         if filtered != nil { av_frame_free(&filtered) }
     }
 
-    /// Convert + deliver one decoded (or deinterlaced) frame: skip
-    /// threshold, pixel-buffer conversion, HDR10+ side-data extraction,
-    /// onFrame callback. Factored out of the receive loop so the direct
-    /// and deinterlaced paths share it.
+    /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, sws_scale, HDR10+ side data, onFrame.
+    /// Shared by the direct and deinterlaced paths.
     private func emit(_ f: UnsafeMutablePointer<AVFrame>) {
-        // Skip pre-seek frames, decoded for reference but not converted.
-        // This avoids the expensive sws_scale + display for frames the
-        // renderer would drop anyway via skipUntilPTS.
         if let threshold = skipUntilPTS, f.pointee.pts != Int64.min {
             let framePTS = CMTimeMake(
                 value: f.pointee.pts * Int64(timeBase.num),
@@ -228,9 +172,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if CMTimeCompare(framePTS, threshold) < 0 {
                 return
             }
-            // Compare-and-clear: a host seek can install a NEW threshold
-            // between the read above and this clear; blindly nil-ing
-            // would discard it and flash pre-seek frames.
+            // Compare-and-clear: a concurrent seek can install a new threshold; blindly nil-ing would discard it.
             clearSkip(ifStillAt: threshold)
         }
 
@@ -247,11 +189,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             cmPTS = .invalid
         }
 
-        // HDR10+, software path reads the dynamic metadata off
-        // the post-decode AVFrame side data and serialises to T.35
-        // SEI bytes the same way the VT path does. We can't reuse
-        // the VT path's packet-side stash because the software
-        // decoder owns its own packet flow.
+        // HDR10+: read dynamic metadata from post-decode AVFrame side data (T.35 SEI bytes).
+        // Can't reuse the VT path's packet-side stash; this decoder owns its own packet flow.
         let hdr10PlusData = extractHDR10PlusBytes(from: f)
         if hdr10PlusData != nil, !seenHDR10Plus {
             seenHDR10Plus = true
@@ -264,18 +203,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func flush() {
         lock.lock()
         defer { lock.unlock() }
-        // The deinterlacer's temporal references are stale across a
-        // seek/discontinuity; drop the graph (lazily rebuilt by the
-        // next interlaced frame).
+        // Deinterlacer temporal references are stale across seeks; drop the graph (lazily rebuilt on next interlaced frame).
         deinterlacer.teardown()
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
 
-    /// Extract HDR10+ dynamic metadata from a decoded AVFrame's side
-    /// data and serialise to T.35 SEI bytes (the format Apple's
-    /// `kCMSampleAttachmentKey_HDR10PlusPerFrameData` expects).
-    /// Returns nil when the frame carries no HDR10+ side data.
+    /// Serialise HDR10+ dynamic metadata from AVFrame side data to T.35 SEI bytes (kCMSampleAttachmentKey_HDR10PlusPerFrameData).
+    /// Returns nil when the frame carries no AV_FRAME_DATA_DYNAMIC_HDR_PLUS side data.
     private func extractHDR10PlusBytes(
         from frame: UnsafeMutablePointer<AVFrame>
     ) -> Data? {
@@ -296,11 +231,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 let result = av_dynamic_hdr_plus_to_t35(recordPtr, &dataPtr, &size)
                 guard result >= 0, let buf = dataPtr, size > 0 else { return nil }
                 let data = Data(bytes: buf, count: size)
-                // FFmpeg owns the allocation, free via av_free() so the
-                // matching allocator is used (plain free() happens to
-                // work on Apple platforms today but the contract isn't
-                // guaranteed across libavutil's allocator backends).
-                av_free(buf)
+                av_free(buf)  // use av_free, not plain free(): libavutil allocator contract
                 return data
             }
         }
@@ -321,10 +252,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
-        // Inside the locked section: emit() reads onFrame under the same
-        // lock from the demux thread, and an unsynchronized closure write
-        // (multi-word + release of the old value) against that read is a
-        // data race with crash potential on a stop mid-decode.
+        // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
         lock.unlock()
     }
@@ -335,9 +263,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)
 
-    /// Convert a decoded AVFrame to an NV12 CVPixelBuffer using sws_scale.
-    /// sws_scale is SIMD-optimized (NEON on ARM), much faster than
-    /// manual per-pixel loops, critical for AV1 at 1080p.
     private func convertFrameToPixelBuffer(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
         let width = Int(frame.pointee.width)
         let height = Int(frame.pointee.height)
@@ -345,11 +270,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
 
-        // Use P010LE (10-bit) for HDR sources, NV12 (8-bit) for SDR.
-        // P010 preserves HDR10 dynamic range; NV12 saves memory for SDR.
         let dstFmt = use10Bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12
 
-        // Get or create sws context (cached for same dimensions/format)
         swsContext = sws_getCachedContext(
             swsContext,
             Int32(width), Int32(height), srcFmt,
@@ -360,7 +282,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard swsContext != nil else { return nil }
 
-        // Get pixel buffer from pool (or create pool on first call / resolution change)
         let cvPixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -385,22 +306,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
         guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
 
-        // Attach color space metadata from FFmpeg so AVSampleBufferDisplayLayer
-        // renders with correct primaries/transfer/matrix (critical for HDR).
         attachColorSpace(from: frame, to: pb)
-
-        // Attach the pixel aspect ratio so anamorphic SD content (DVD
-        // rips: NTSC 720x480 at 4:3, PAL 720x576, widescreen DVDs) is
-        // un-squished. CMVideoFormatDescriptionCreateForImageBuffer in
-        // the renderer folds this into the format description's
-        // PixelAspectRatio extension, which AVSampleBufferDisplayLayer
-        // honors when sizing the picture.
         attachPixelAspectRatio(from: frame, to: pb)
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
 
-        // Set up destination pointers for NV12 (2 planes: Y + CbCr)
         let yPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!
             .assumingMemoryBound(to: UInt8.self)
         let cbcrPlane = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!
@@ -417,7 +328,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         dstLinesize.0 = Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 0))
         dstLinesize.1 = Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 1))
 
-        // sws_scale: SIMD-optimized conversion (handles 8-bit, 10-bit, any format → NV12)
         withUnsafePointer(to: &frame.pointee.data) { srcDataPtr in
             withUnsafePointer(to: &frame.pointee.linesize) { srcLinesizePtr in
                 withUnsafeMutablePointer(to: &dstData) { dstPtr in
@@ -447,9 +357,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Color Space Metadata
 
-    /// Map FFmpeg color metadata to CVPixelBuffer attachments.
-    /// This tells AVSampleBufferDisplayLayer the correct color space
-    /// for rendering, critical for HDR10 (BT.2020 + PQ).
+    /// Map FFmpeg color metadata to CVPixelBuffer attachments for correct HDR10 rendering (BT.2020 + PQ).
     private func attachColorSpace(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
         let primaries = ColorAttachments.primaries(frame.pointee.color_primaries)
         let transfer = ColorAttachments.transfer(frame.pointee.color_trc)
@@ -468,12 +376,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
 
-    /// Attach the source SAR as `kCVImageBufferPixelAspectRatioKey` so
-    /// anamorphic content displays at its intended aspect. Prefers the
-    /// frame's own `sample_aspect_ratio`, falling back to the stream's
-    /// `streamSAR`. A 0:0 or 1:1 ratio means square pixels (no
-    /// correction needed), so we skip the attachment in that case and
-    /// let the buffer render at its native dimensions.
+    /// Attach SAR as kCVImageBufferPixelAspectRatioKey for anamorphic content.
+    /// Prefers frame's own SAR, falls back to streamSAR; skips attachment for square pixels (0:0 or 1:1).
     private func attachPixelAspectRatio(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
         var sar = frame.pointee.sample_aspect_ratio
         if sar.num <= 0 || sar.den <= 0 {

@@ -3,13 +3,9 @@ import AVFoundation
 import Combine
 import MediaPlayer
 
-/// Native audio-only playback host: hands the source URL directly to an
-/// AVPlayer (no HLS, no loopback, no display layer). Used for audio whose
-/// codec AVPlayer can decode natively (AAC, MP3, ALAC, FLAC, AC-3, ...),
-/// for hardware-accelerated, energy-efficient playback and native system
-/// integration. Codecs AVPlayer cannot decode use AudioPlaybackHost
-/// (FFmpeg) instead. Mirrors AudioPlaybackHost's published surface so the
-/// engine wires both paths the same way.
+/// Native audio-only host: source URL straight to an AVPlayer (no HLS/loopback/display layer) for codecs AVPlayer
+/// decodes natively (AAC, MP3, ALAC, FLAC, AC-3). Others use AudioPlaybackHost (FFmpeg). Mirrors AudioPlaybackHost's
+/// published surface so the engine wires both paths the same way.
 @MainActor
 final class AudioAVPlayerHost {
 
@@ -19,36 +15,25 @@ final class AudioAVPlayerHost {
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    /// Mirrors `avPlayer.timeControlStatus` so the engine can reconcile its
-    /// transport state when the system (Control Center, Siri Remote, AirPods)
-    /// plays/pauses the AVPlayer directly rather than through our play()/
-    /// pause(). Without this our `state` goes stale and the play/pause toggle
-    /// is swallowed (looks like "only pause works").
+    /// Mirrors avPlayer.timeControlStatus so the engine reconciles transport when the system (Control Center,
+    /// Siri Remote, AirPods) plays/pauses the AVPlayer directly. Without it `state` goes stale and the play/pause
+    /// toggle is swallowed (looks like "only pause works").
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     @Published private(set) var failureMessage: String?
     @Published private(set) var didReachEnd: Bool = false
 
     // MARK: - Output
 
-    /// The underlying AVPlayer. Created once and reused across
-    /// `replaceCurrentItem` swaps for the lifetime of this host.
+    /// Created once, reused across replaceCurrentItem swaps for the host's lifetime.
     let avPlayer = AVPlayer()
 
     #if os(tvOS) || os(iOS)
-    /// The Now-Playing session bound to THIS player. On tvOS 14+ the SHARED
-    /// MPRemoteCommandCenter / MPNowPlayingInfoCenter are not reliably bound
-    /// to a bare AVPlayer: while actively rendering the system tolerates the
-    /// shared center enough to deliver pauseCommand, but the moment output
-    /// stops in the background (pause -> rate 0) the app is dropped as the
-    /// active Now-Playing app and the shared center stops receiving ANY
-    /// command (so the play button never comes back). Binding a session to
-    /// the player keeps that ownership across a pause. The full WWDC22
-    /// guidance is "MPNowPlayingSession shouldn't be used on tvOS WHEN USING
-    /// AVKit" (AVKit owns its own session) -- for a bare AVPlayer with custom
-    /// UI, owning the session explicitly is the sanctioned path. The host app
-    /// registers commands on `nowPlayingSession.remoteCommandCenter` and
-    /// writes metadata to `nowPlayingSession.nowPlayingInfoCenter`; mixing in
-    /// the shared singletons is what produces the half-working state.
+    /// Now-Playing session bound to THIS player. The SHARED MPRemoteCommandCenter / MPNowPlayingInfoCenter aren't
+    /// reliably bound to a bare AVPlayer: on background pause (rate 0) the app is dropped as active Now-Playing app
+    /// and the shared center stops receiving ANY command (play button never returns). Binding a session keeps
+    /// ownership across pause. WWDC22 guidance is "don't use MPNowPlayingSession on tvOS WHEN USING AVKit" (AVKit
+    /// owns its own); for a bare AVPlayer with custom UI, owning the session explicitly is sanctioned. Mixing in the
+    /// shared singletons is what produces the half-working state.
     let nowPlayingSession: MPNowPlayingSession
     #endif
 
@@ -62,18 +47,13 @@ final class AudioAVPlayerHost {
     private var endObserver: NSObjectProtocol?
     private var failObserver: NSObjectProtocol?
 
-    /// Cached rate so play() restores the right speed after a pause.
     private var lastRate: Float = 1.0
 
-    /// Start-position seconds stashed at load(); performed once the item
-    /// reaches readyToPlay, then cleared.
+    /// Start-position seconds stashed at load(); performed once readyToPlay, then cleared.
     private var pendingSeek: Double?
 
-    /// Now-playing metadata (title / artist / album / artwork as
-    /// AVMetadataItems) applied to each loaded AVPlayerItem's
-    /// externalMetadata, so it survives a back-to-back item swap. The host
-    /// app additionally publishes Now-Playing through the session's
-    /// nowPlayingInfoCenter.
+    /// Now-playing metadata applied to each loaded item's externalMetadata so it survives a back-to-back swap.
+    /// The host app additionally publishes Now-Playing through the session's nowPlayingInfoCenter.
     private var pendingExternalMetadata: [AVMetadataItem] = []
 
     // MARK: - Init
@@ -81,18 +61,14 @@ final class AudioAVPlayerHost {
     init() {
         #if os(tvOS) || os(iOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
-        // Become the active Now-Playing app. We deliberately do NOT enable
-        // automaticallyPublishesNowPlayingInfo: the host app writes the
-        // metadata + accurate elapsed/rate to nowPlayingSession.nowPlayingInfo-
-        // Center itself (it owns the queue + artwork).
+        // Deliberately NOT enabling automaticallyPublishesNowPlayingInfo: the host app writes metadata +
+        // accurate elapsed/rate to nowPlayingSession.nowPlayingInfoCenter itself (it owns the queue + artwork).
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
 
-    /// Re-assert this session as the active Now-Playing app. Called when a
-    /// track starts so the player reclaims Now-Playing ownership if it was
-    /// lost (the binding is what keeps the Home overlay + remote commands
-    /// alive across a background pause).
+    /// Re-assert this session as active Now-Playing app on track start, reclaiming ownership if lost (keeps the
+    /// Home overlay + remote commands alive across a background pause).
     func becomeActiveNowPlaying() {
         #if os(tvOS) || os(iOS)
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
@@ -102,8 +78,7 @@ final class AudioAVPlayerHost {
     // MARK: - Load
 
     func load(url: URL, startPosition: Double?, httpHeaders: [String: String]) async throws {
-        // Clean any prior session's observers before swapping in a new
-        // item, so a back-to-back load() doesn't leak or double-fire.
+        // Clean prior observers before swapping in a new item so a back-to-back load() doesn't leak or double-fire.
         teardownObservers()
 
         let asset: AVURLAsset
@@ -113,9 +88,7 @@ final class AudioAVPlayerHost {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
         let item = AVPlayerItem(asset: asset)
-        // AVPlayerItem.externalMetadata is unavailable on macOS (the package
-        // builds there for tests/aetherctl). Music now-playing is a device
-        // concern anyway.
+        // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
         #endif
@@ -140,9 +113,8 @@ final class AudioAVPlayerHost {
             category: .swPlayback
         )
 
-        // Status KVO: readyToPlay publishes duration + isReady and performs
-        // the pending seek; failed publishes the error description. The
-        // observer hops to its own queue, so round-trip back to MainActor.
+        // Status KVO: readyToPlay publishes duration + isReady and performs the pending seek; failed publishes the
+        // error. Observer hops to its own queue, so round-trip back to MainActor.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             switch item.status {
             case .readyToPlay:
@@ -151,8 +123,7 @@ final class AudioAVPlayerHost {
                     let itemDuration = CMTimeGetSeconds(item.duration)
                     var resolved = itemDuration.isFinite && itemDuration > 0 ? itemDuration : 0
                     if resolved == 0 {
-                        // item.duration can still be indefinite at the first
-                        // readyToPlay edge; try the asset's loaded duration.
+                        // item.duration can still be indefinite at the first readyToPlay edge; try the asset's.
                         if let assetDuration = try? await item.asset.load(.duration) {
                             let s = CMTimeGetSeconds(assetDuration)
                             if s.isFinite, s > 0 { resolved = s }
@@ -179,8 +150,7 @@ final class AudioAVPlayerHost {
             }
         }
 
-        // Mirror the player's rate into the published `rate`. timeControlStatus
-        // and rate move together; observing rate is the simplest source.
+        // Mirror player rate into published `rate`. timeControlStatus and rate move together; rate is simplest.
         rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
             let r = player.rate
             Task { @MainActor [weak self] in
@@ -188,8 +158,7 @@ final class AudioAVPlayerHost {
             }
         }
 
-        // Mirror timeControlStatus so the engine reconciles transport state
-        // on system-driven play/pause (Control Center / remote / AirPods).
+        // Mirror timeControlStatus so the engine reconciles transport on system-driven play/pause.
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             Task { @MainActor [weak self] in
@@ -240,9 +209,7 @@ final class AudioAVPlayerHost {
 
     // MARK: - Transport
 
-    /// Set the now-playing metadata applied to the current and subsequent
-    /// AVPlayerItems' `externalMetadata`. The session's auto-publishing then
-    /// surfaces it to the system Now-Playing UI.
+    /// Set now-playing metadata applied to current and subsequent items' externalMetadata.
     func setExternalMetadata(_ items: [AVMetadataItem]) {
         pendingExternalMetadata = items
         #if !os(macOS)
@@ -252,7 +219,7 @@ final class AudioAVPlayerHost {
 
     func play() {
         avPlayer.play()
-        // AVPlayer.play() sets rate to 1.0; restore a non-default speed.
+        // play() forces rate 1.0; restore a non-default speed.
         if lastRate != 1.0 {
             avPlayer.rate = lastRate
         }
@@ -287,12 +254,9 @@ final class AudioAVPlayerHost {
         avPlayer.replaceCurrentItem(with: nil)
         isReady = false
         playerItem = nil
-        // The host is persistent across tracks; clear the published
-        // terminal flags so the next load's subscriptions (wired before
-        // host.load) don't replay them: a stale didReachEnd=true fired
-        // the engine's .idle edge mid-load (queue auto-advance hosts
-        // would double-skip), a stale failureMessage flipped the new
-        // track to .error before it started.
+        // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before
+        // host.load) don't replay them: stale didReachEnd=true fired .idle mid-load (double-skip on auto-advance
+        // hosts), stale failureMessage flipped the new track to .error before it started.
         didReachEnd = false
         failureMessage = nil
     }
@@ -304,10 +268,8 @@ final class AudioAVPlayerHost {
 
     // MARK: - Internal
 
-    /// Remove the periodic time observer, invalidate the KVO observations,
-    /// and unregister the notification observers. Idempotent: each handle
-    /// is niled after removal so a second call (e.g. load() then stop())
-    /// can't double-remove.
+    /// Remove time observer, invalidate KVO, unregister notification observers. Idempotent: each handle is niled
+    /// after removal so a second call (load() then stop()) can't double-remove.
     private func teardownObservers() {
         if let timeObserver {
             avPlayer.removeTimeObserver(timeObserver)

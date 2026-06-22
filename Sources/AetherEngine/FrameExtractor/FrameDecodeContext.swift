@@ -6,18 +6,15 @@ import Libavcodec
 import Libavutil
 import Libswscale
 
-/// Isolated, single-threaded FFmpeg decode context for still-image
-/// extraction. Owns its own `Demuxer`, `AVCodecContext` (forced
-/// software), and `SwsContext`, strictly separate from playback. Lazy:
-/// `ensureOpen()` opens on first use; `close()` releases everything and
-/// is safe to call repeatedly. NOT thread-safe; `FrameExtractor`
-/// serializes all access on its decode queue.
+/// Isolated, single-threaded FFmpeg decode context for still-image extraction.
+/// Owns its own Demuxer, AVCodecContext (forced software), and SwsContext, separate
+/// from playback. Lazy: ensureOpen() opens on first use, close() is idempotent.
+/// NOT thread-safe; FrameExtractor serializes all access on its decode queue.
 final class FrameDecodeContext: @unchecked Sendable {
     private let url: URL
     private let httpHeaders: [String: String]
-    /// When non-nil, the context opens from this independent reader (a custom
-    /// source clone) instead of the URL. The context owns it and closes it at
-    /// deinit (NOT in close(), which only tears down the demuxer/decoder so the
+    /// When non-nil, opens from this independent reader (custom source clone) not the URL.
+    /// Closed at deinit, NOT in close() (which tears down only demuxer/decoder so the
     /// idle-reopen path can rebuild over the still-alive reader).
     private let reader: IOReader?
     private let formatHint: String?
@@ -27,16 +24,14 @@ final class FrameDecodeContext: @unchecked Sendable {
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var videoStreamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 90000)
-    /// Source sample aspect ratio (pixel width/height), read from the stream
-    /// at open. Anamorphic sources (NTSC/PAL DVD, anamorphic Blu-ray) store
-    /// non-square pixels; without this the thumbnail draws square-pixel and
-    /// looks horizontally stretched. Defaults to 1:1 (square) when unset.
+    /// Source SAR (sample aspect ratio) read from the stream at open. Anamorphic
+    /// sources (NTSC/PAL DVD, anamorphic Blu-ray) store non-square pixels; without
+    /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
     private var streamSAR = AVRational(num: 1, den: 1)
     private(set) var isOpen = false
     private(set) var isHDR = false
 
-    /// PQ (ST 2084) and HLG transfers mean the decoded frame is HDR and
-    /// needs tone-mapping to SDR before display as a thumbnail.
+    /// PQ (ST 2084) / HLG transfers mean the frame is HDR and needs tone-mapping to SDR.
     static func isHDRTransfer(_ trc: AVColorTransferCharacteristic) -> Bool {
         ColorAttachments.isHDRTransfer(trc)
     }
@@ -61,8 +56,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         reader?.close()
     }
 
-    /// Open demuxer + decoder if not already open. Throws on failure
-    /// and leaves the context fully closed (no partial state to leak).
+    /// Open demuxer + decoder if not already open. Throws on failure, leaving the
+    /// context fully closed (no partial state to leak).
     func ensureOpen() throws {
         guard !isOpen else { return }
         do {
@@ -111,9 +106,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         guard let codecpar = stream.pointee.codecpar else {
             throw FrameDecodeError.noCodecParameters
         }
-        // Prefer the container/stream SAR; the software decoder does not
-        // reliably attach SAR to its output frames (see SoftwareVideoDecoder),
-        // so the per-frame value is only a fallback in convertToCGImage.
+        // Prefer container/stream SAR; the SW decoder does not reliably attach SAR
+        // to output frames (see SoftwareVideoDecoder), so per-frame is fallback-only.
         let parSAR = codecpar.pointee.sample_aspect_ratio
         if parSAR.num > 0, parSAR.den > 0 {
             streamSAR = parSAR
@@ -141,20 +135,16 @@ final class FrameDecodeContext: @unchecked Sendable {
         ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
-        // Still extraction never needs deblocked output or full-rate decode
-        // quality; skip the loop filter and enable the fast/inaccurate decode
-        // path to cut per-frame CPU on big HEVC/AV1 keyframes.
-        // AV_CODEC_FLAG2_FAST is a C #define (1 << 0) and does not bridge
-        // directly to Swift, so we define it locally.
+        // Still extraction needs no deblock or full-rate quality: skip loop filter
+        // and enable the fast/inaccurate path to cut per-frame CPU on big HEVC/AV1 keyframes.
+        // AV_CODEC_FLAG2_FAST is a C #define (1 << 0) that does not bridge to Swift.
         let AV_CODEC_FLAG2_FAST_VALUE: Int32 = 1 << 0
         ctx.pointee.skip_loop_filter = AVDISCARD_ALL
         ctx.pointee.flags2 |= AV_CODEC_FLAG2_FAST_VALUE
 
         var opts: OpaquePointer?
-        // Software decode is actually forced by the get_format callback
-        // above (it rejects AV_PIX_FMT_VIDEOTOOLBOX). The "hwaccel" dict
-        // entry is a no-op at avcodec_open2 level but is kept for parity
-        // with SoftwareVideoDecoder.
+        // SW decode is forced by the get_format callback above (rejects VIDEOTOOLBOX).
+        // The "hwaccel" entry is a no-op at avcodec_open2, kept for parity with SoftwareVideoDecoder.
         av_dict_set(&opts, "hwaccel", "none", 0)
         guard avcodec_open2(ctx, codec, &opts) >= 0 else {
             av_dict_free(&opts)
@@ -169,16 +159,11 @@ final class FrameDecodeContext: @unchecked Sendable {
 
     /// Decode one frame at/after `seconds`.
     ///
-    /// - thumbnail mode: returns the first decoded frame after the seek
-    ///   (the keyframe), downscaled so its width is `targetWidth`.
-    /// - snapshot mode: decodes forward, skipping frames until
-    ///   `frame.pts >= seconds`, then returns that frame at `maxSize`
-    ///   (aspect-preserved) or native size when `maxSize` is nil.
+    /// - thumbnail: first frame after the seek (keyframe), downscaled to `targetWidth`.
+    /// - snapshot: decode forward until pts >= seconds, return at `maxSize` (aspect-preserved) or native.
     ///
-    /// `isCancelled` is polled between packets and before conversion so
-    /// a superseded scrub request bails promptly. Returns nil on EOF,
-    /// decode failure, or cancellation. Frees every FFmpeg allocation
-    /// on every path.
+    /// `isCancelled` is polled between packets and before conversion so a superseded scrub
+    /// bails promptly. Returns nil on EOF / decode failure / cancellation. Frees all FFmpeg allocs.
     func decodeFrame(
         at seconds: Double,
         mode: FrameMode,
@@ -190,11 +175,9 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         avcodec_flush_buffers(ctx)
 
-        // AVDISCARD_DEFAULT for both modes. Thumbnail returns the first frame
-        // after the seek and stops, so discarding non-key frames buys nothing,
-        // and AVDISCARD_NONKEY actively breaks streams whose seek lands mid-GOP
-        // past a sparse keyframe (decoder discards every packet -> EAGAIN, nil
-        // frame). Snapshot must keep all frames to decode forward to the exact PTS.
+        // AVDISCARD_DEFAULT for both modes. AVDISCARD_NONKEY breaks streams whose seek
+        // lands mid-GOP past a sparse keyframe (every packet discarded -> EAGAIN, nil frame);
+        // thumbnail gains nothing from it, and snapshot must keep all frames to reach exact PTS.
         ctx.pointee.skip_frame = AVDISCARD_DEFAULT
 
         demuxer.seek(to: seconds)
@@ -225,8 +208,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 continue
             }
 
-            // The receive loop below drains the decoder before each send,
-            // so the decoder's input queue is always empty here; send-side EAGAIN cannot occur.
+            // Receive loop below drains before each send, so send-side EAGAIN cannot occur here.
             let sendRet = avcodec_send_packet(ctx, packet)
             av_packet_unref(packet)
             av_packet_free_safe(packet)
@@ -239,10 +221,9 @@ final class FrameDecodeContext: @unchecked Sendable {
                 if recvRet == FFmpegErr.eof { return nil } // decoder drained
                 guard recvRet >= 0, let f = frame else { break }       // real error: try next packet
 
-                // Skip frames before the requested PTS for frame-accuracy.
-                // A frame with no PTS (AV_NOPTS_VALUE == Int64.min) is
-                // accepted as-is, so on PTS-less streams snapshot degrades
-                // gracefully to the first frame after the seek.
+                // Skip frames before targetPTS for frame-accuracy. No-PTS frames
+                // (AV_NOPTS_VALUE == Int64.min) are accepted, so PTS-less streams
+                // degrade to the first frame after the seek.
                 if mode == .snapshot,
                    f.pointee.pts != Int64.min,
                    f.pointee.pts < targetPTS {
@@ -259,19 +240,17 @@ final class FrameDecodeContext: @unchecked Sendable {
                         defer { av_frame_free(&toned) }
                         if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
                     }
-                    // tone-map failed: fall through to the sws path (degraded but non-nil)
+                    // tone-map failed: fall through to sws path (degraded but non-nil)
                 }
                 return convertToCGImage(frame: f, targetWidth: width)
             }
         }
     }
 
-    /// Compute the output pixel dimensions for a target display width,
-    /// applying the source sample aspect ratio so anamorphic frames draw at
-    /// their true display shape. `targetWidth` is treated as the display
-    /// width and is capped to the coded width; the height is derived from the
-    /// display aspect ratio (coded aspect scaled by SAR). Square pixels
-    /// (sar 1:1) reduce to the coded aspect. Exposed for regression testing.
+    /// Output pixel displayDimensions for a target display width, applying source SAR
+    /// so anamorphic frames draw at true shape. `targetWidth` is the display width capped
+    /// to coded width; height derives from coded aspect scaled by SAR (1:1 = coded aspect).
+    /// Exposed for regression testing.
     static func displayDimensions(srcW: Int, srcH: Int, sar: AVRational, targetWidth: Int) -> (Int, Int) {
         let dstW = min(targetWidth, srcW)
         let sarNum = sar.num > 0 ? Double(sar.num) : 1
@@ -281,8 +260,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         return (dstW, dstH)
     }
 
-    /// Output width for snapshot mode: native width, optionally capped
-    /// to `maxSize` while preserving aspect ratio.
+    /// Snapshot output width: native width, optionally capped to `maxSize` (aspect-preserved).
     private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, maxSize: CGSize?) -> Int {
         let nativeW = Int(frame.pointee.width)
         let nativeH = Int(frame.pointee.height)
@@ -293,9 +271,8 @@ final class FrameDecodeContext: @unchecked Sendable {
         return max(1, Int((CGFloat(nativeW) * scale).rounded()))
     }
 
-    /// Wrap an RGBA AVFrame (e.g. the tone-mapper output) into a CGImage by
-    /// copying its pixels into an owned buffer. Honors linesize (row stride
-    /// may exceed width*4).
+    /// Copy an RGBA AVFrame (e.g. tone-mapper output) into an owned-buffer CGImage.
+    /// Honors linesize (row stride may exceed width*4).
     private static func cgImageFromRGBAFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CGImage? {
         let w = Int(frame.pointee.width)
         let h = Int(frame.pointee.height)
@@ -319,28 +296,21 @@ final class FrameDecodeContext: @unchecked Sendable {
                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 
-    /// sws_scale the frame to RGBA at `targetWidth` (height derived from
-    /// source aspect) and wrap it in a CGImage with an owned byte
-    /// buffer. Mirrors the sws tuple-pointer dance in
-    /// SoftwareVideoDecoder and the CGImage idiom in
-    /// EmbeddedSubtitleDecoder.
+    /// sws_scale the frame to RGBA at `targetWidth` (height from source aspect) into an
+    /// owned-buffer CGImage. Mirrors the sws tuple-pointer dance in SoftwareVideoDecoder.
     private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int) -> CGImage? {
         let srcW = Int(frame.pointee.width)
         let srcH = Int(frame.pointee.height)
         guard srcW > 0, srcH > 0, targetWidth > 0 else { return nil }
 
-        // Resolve the sample aspect ratio: the stream value (read at open) is
-        // authoritative, with the per-frame value as a fallback. For square
-        // pixels both are 1:1 and the output keeps the coded aspect.
+        // Resolve SAR: stream value (read at open) is authoritative, per-frame is fallback.
         let frameSAR = frame.pointee.sample_aspect_ratio
         let sar = (streamSAR.num > 1 || streamSAR.den > 1)
             ? streamSAR
             : (frameSAR.num > 0 && frameSAR.den > 0 ? frameSAR : AVRational(num: 1, den: 1))
 
-        // targetWidth is the intended display width; derive the display height
-        // from the source display aspect ratio (coded aspect scaled by SAR) so
-        // anamorphic sources draw at their true shape, e.g. NTSC DVD 720x480
-        // SAR 8:9 -> 4:3 instead of a stretched 3:2.
+        // Display height from coded aspect scaled by SAR so anamorphic draws true,
+        // e.g. NTSC DVD 720x480 SAR 8:9 -> 4:3 not stretched 3:2.
         let (dstW, dstH) = Self.displayDimensions(
             srcW: srcW, srcH: srcH, sar: sar, targetWidth: targetWidth)
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
@@ -392,8 +362,7 @@ final class FrameDecodeContext: @unchecked Sendable {
               let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             return nil
         }
-        // sws_scale into RGBA yields straight, fully-opaque pixels (alpha
-        // = 0xFF), so the alpha byte is ignorable rather than premultiplied.
+        // sws_scale RGBA yields opaque pixels (alpha 0xFF), so alpha is ignorable not premultiplied.
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
         return CGImage(
             width: dstW, height: dstH,

@@ -1,22 +1,12 @@
 import Foundation
 
-/// First-segment format of a live HLS rendition, classified from the
-/// segment's leading bytes. The MAIN variant reader only accepts
-/// `.mpegts`; a companion AUDIO rendition additionally accepts Apple's
-/// packed-audio shape (raw ADTS AAC, per the HLS spec each segment
-/// prefixed with an ID3v2 tag carrying the program-clock PRIV frame).
+/// First-segment format classified from leading bytes. Main variant: `.mpegts` only. Companion audio also accepts Apple packed audio.
 enum LiveSegmentFormat: Equatable {
-    /// MPEG-TS: sync byte 0x47.
-    case mpegts
-    /// Raw ADTS AAC with no leading ID3 tag: syncword 0xFFF, layer 0
-    /// (first byte 0xFF, second byte & 0xF6 == 0xF0).
-    case adtsAAC
-    /// ID3v2-prefixed packed audio ("ID3" magic). Apple's packed-audio
-    /// segments all start like this; the ADTS frames follow the tag.
-    case id3PackedAudio
+    case mpegts          // sync byte 0x47
+    case adtsAAC         // 0xFF, second byte & 0xF6 == 0xF0 (raw ADTS, no ID3 prefix)
+    case id3PackedAudio  // "ID3" magic; ADTS frames follow the tag
 
-    /// Classify a segment's leading bytes; nil for anything else
-    /// (fMP4 `ftyp`, WebVTT, garbage).
+    /// nil for fMP4 `ftyp`, WebVTT, or garbage.
     static func classify(_ bytes: Data) -> LiveSegmentFormat? {
         let head = [UInt8](bytes.prefix(3))
         guard !head.isEmpty else { return nil }
@@ -27,49 +17,25 @@ enum LiveSegmentFormat: Equatable {
     }
 }
 
-/// Parser for the ID3v2 tag Apple's HLS packed-audio spec puts at the
-/// start of every packed segment. The only frame we care about is the
-/// PRIV frame with owner "com.apple.streaming.transportStreamTimestamp",
-/// whose 8-byte big-endian payload is the segment's first sample's
-/// presentation time on the variant's shared 90 kHz program clock
-/// (masked to 33 bits like an MPEG-TS PCR/PTS).
-///
-/// FFmpeg's raw "aac" demuxer skips these tags without surfacing the
-/// timestamp, so the ingest parses it here and the producer anchors a
-/// synthesized side-audio clock on it (see
-/// `HLSSegmentProducer.PackedAudioSynthClock`).
+/// ID3v2 tag parser for Apple HLS packed-audio segments. Extracts the PRIV frame "com.apple.streaming.transportStreamTimestamp" (8-byte big-endian 90 kHz PTS masked to 33 bits). FFmpeg's "aac" demuxer discards these tags; the ingest parses them here to anchor `HLSSegmentProducer.PackedAudioSynthClock`.
 enum PackedAudioID3 {
 
-    /// Owner string of Apple's program-clock PRIV frame.
     static let appleTimestampOwner = "com.apple.streaming.transportStreamTimestamp"
 
-    /// Extract the Apple transport-stream timestamp from an
-    /// ID3v2-prefixed segment, in 90 kHz ticks masked to 33 bits.
-    /// Handles ID3v2.4 (syncsafe frame sizes) and ID3v2.3 (plain
-    /// big-endian frame sizes). Returns nil when the tag is absent,
-    /// malformed, unsynchronised (Apple never sets that flag), or
-    /// carries no PRIV frame with the Apple owner.
+    /// Returns 90 kHz program-clock timestamp (33-bit) from the first segment. Handles ID3v2.3 and v2.4. Returns nil if the tag is absent, malformed, unsynchronised, or has no matching PRIV frame.
     static func transportStreamTimestamp90k(in segment: Data) -> Int64? {
-        // The tag sits at the very head of the segment and is tiny in
-        // practice (Apple writes ~73 bytes); 4 KB is a generous bound
-        // that still avoids copying a whole segment.
+        // Apple writes ~73 bytes; 4 KB is a generous cap that avoids copying the whole segment.
         let b = [UInt8](segment.prefix(4096))
         guard b.count >= 10, b[0] == 0x49, b[1] == 0x44, b[2] == 0x33 else { return nil }
         let major = b[3]
-        // v2.2 uses 3-byte frame IDs/sizes and never appears in HLS
-        // packed audio; only handle the v2.3 / v2.4 layouts.
-        guard major == 3 || major == 4 else { return nil }
+        guard major == 3 || major == 4 else { return nil } // v2.2 uses 3-byte IDs/sizes and never appears in HLS packed audio
         let flags = b[5]
-        // Unsynchronisation would require de-escaping 0xFF 0x00 pairs;
-        // no packed-audio producer sets it. Bail rather than mis-parse.
-        guard flags & 0x80 == 0 else { return nil }
+        guard flags & 0x80 == 0 else { return nil } // unsynchronisation requires 0xFF 0x00 de-escaping; no packed-audio producer sets it
         guard let tagSize = syncsafe32(b, at: 6) else { return nil }
         var pos = 10
         let end = min(b.count, 10 + tagSize)
 
-        // Skip the extended header if present. v2.4's size field is
-        // syncsafe and INCLUDES itself; v2.3's is plain big-endian and
-        // EXCLUDES its own 4 bytes.
+        // Skip extended header: v2.4 size is syncsafe and includes itself; v2.3 is plain big-endian and excludes its own 4 bytes.
         if flags & 0x40 != 0 {
             if major == 4 {
                 guard let extSize = syncsafe32(b, at: pos) else { return nil }
@@ -102,8 +68,7 @@ enum PackedAudioID3 {
         return nil
     }
 
-    /// PRIV body = owner string, NUL terminator, private payload. For
-    /// the Apple owner the payload is an 8-byte big-endian timestamp.
+    /// PRIV body: owner string + NUL + 8-byte big-endian timestamp.
     private static func appleTimestamp(privBody: ArraySlice<UInt8>) -> Int64? {
         guard let nul = privBody.firstIndex(of: 0) else { return nil }
         let owner = String(decoding: privBody[privBody.startIndex..<nul], as: UTF8.self)
@@ -118,7 +83,7 @@ enum PackedAudioID3 {
         return Int64(value & 0x1_FFFF_FFFF)
     }
 
-    /// 4-byte syncsafe integer (7 bits per byte, high bit must be 0).
+    /// 4-byte syncsafe integer (ID3v2.4): 7 bits per byte, high bit must be 0.
     private static func syncsafe32(_ b: [UInt8], at index: Int) -> Int? {
         guard index + 4 <= b.count else { return nil }
         let bytes = b[index..<(index + 4)]
@@ -126,7 +91,7 @@ enum PackedAudioID3 {
         return bytes.reduce(0) { ($0 << 7) | Int($1) }
     }
 
-    /// 4-byte plain big-endian integer (ID3v2.3 frame sizes).
+    /// 4-byte plain big-endian integer (ID3v2.3).
     private static func plain32(_ b: [UInt8], at index: Int) -> Int {
         guard index + 4 <= b.count else { return 0 }
         return (Int(b[index]) << 24) | (Int(b[index + 1]) << 16)

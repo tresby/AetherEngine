@@ -3,21 +3,11 @@ import Libavutil
 import Libavfilter
 @testable import AetherEngine
 
-/// Regression for anamorphic SD content (DVD rips: NTSC 720x480 stored at
-/// 4:3, PAL 720x576, widescreen DVDs) rendering "flattened" (horizontally
-/// squished).
-///
-/// Interlaced DVD MPEG-2 decodes through the software path and is
-/// deinterlaced (bwdif/yadif). The picture only displays at the correct
-/// aspect if the source sample aspect ratio (SAR) survives the filter and
-/// gets attached to the output pixel buffer. `DeinterlaceFilter` declares
-/// the SAR on its buffer source (`pixel_aspect`), and bwdif/yadif must
-/// carry it through to the pulled frame's `sample_aspect_ratio` — that's
-/// the value `SoftwareVideoDecoder.attachPixelAspectRatio` reads to set
-/// `kCVImageBufferPixelAspectRatioKey`.
+/// Regression: anamorphic DVD rips rendered "flattened" because SAR (pixel_aspect on the buffer
+/// source) was not carried through bwdif/yadif to sample_aspect_ratio on the output frame, which
+/// SoftwareVideoDecoder.attachPixelAspectRatio reads for kCVImageBufferPixelAspectRatioKey.
 struct DeinterlaceSARTests {
 
-    /// Allocate a small interlaced YUV420P frame carrying a SAR.
     private func makeFrame(pts: Int64, sar: AVRational) -> UnsafeMutablePointer<AVFrame> {
         let f = av_frame_alloc()!
         f.pointee.width = 64
@@ -56,10 +46,7 @@ struct DeinterlaceSARTests {
             while filter.pull(into: out) >= 0 {
                 sawOutput = true
                 let outSAR = out.pointee.sample_aspect_ratio
-                // The deinterlacer must not flatten the SAR to 0:0 or 1:1;
-                // it has to match the source the buffer source was told
-                // about. Pre-fix the SW decoder never read this anyway, so
-                // even a preserved SAR rendered square.
+                // Pre-fix: SW decoder never read SAR, so even a preserved SAR rendered square.
                 #expect(outSAR.num == sourceSAR.num && outSAR.den == sourceSAR.den,
                         "deinterlaced SAR \(outSAR.num):\(outSAR.den) lost the source \(sourceSAR.num):\(sourceSAR.den)")
                 av_frame_unref(out)

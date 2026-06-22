@@ -3,19 +3,10 @@ import AetherEngine
 
 // MARK: - audio
 
-/// Load a source through the engine's audio-only path and play it,
-/// printing the synchronizer clock once a second. Confirms FFmpeg
-/// decode -> AVSampleBufferAudioRenderer works end-to-end on macOS.
+/// Load a source through the audio-only path and play it, printing the synchronizer clock once a second. Smoke-tests FFmpeg decode -> AVSampleBufferAudioRenderer on macOS.
 func runAudio(url: URL, seconds playSeconds: Double) -> Int32 {
     print("aetherctl audio: \(url.absoluteString) (play \(playSeconds)s)")
-    // AetherEngine is @MainActor, so it must be driven on the main thread
-    // under a live run loop, NOT through the main-thread-blocking
-    // `runBlocking` semaphore: that would deadlock the instant the engine
-    // needs the main actor (the main thread would be parked on the
-    // semaphore and could never service the MainActor executor). Running
-    // CFRunLoopRun keeps the main actor executor AND the
-    // Timer.publish(on: .main) clock mirror alive while the @MainActor
-    // task drives playback, then the task stops the run loop when done.
+    // Must use CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
         box.value = await audioSmokeTest(url: url, seconds: playSeconds)
@@ -61,9 +52,7 @@ private func audioSmokeTest(url: URL, seconds playSeconds: Double) async -> Int3
         print("FAIL: clock did not advance (t=\(finalTime)); decode or render path is silent")
         return 1
     }
-    // If we stopped sampling well before the file's end, the engine MUST
-    // still be playing. If it already reached .idle, the demuxer raced to
-    // EOF and ended the track early (the missing-back-pressure regression).
+    // If sampling stopped well before EOF, the engine must still be .playing; .idle here means the demuxer raced to EOF (missing-back-pressure regression).
     if duration > 0, playSeconds < duration - 1.0 {
         if case .playing = endState {
             // expected

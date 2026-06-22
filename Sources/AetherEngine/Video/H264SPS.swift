@@ -1,22 +1,12 @@
 import Foundation
 
-/// Minimal H.264 SPS reader: extracts coded width/height from a raw SPS
-/// NAL. Needed for SSAI direct play — an ad creative arrives on a new
-/// video PID whose libavformat codecpar is unparsed (width/height == 0)
-/// mid-stream, and the fMP4 muxer needs explicit dimensions. The SPS is
-/// available in-band in the ad keyframe, so we parse it ourselves rather
-/// than calling avformat_find_stream_info (which would block the live
-/// pump). Field order per ITU-T H.264 §7.3.2.1.1 (matches FFmpeg
-/// libavcodec/h264_ps.c). Only the fields needed to reach width/height
-/// + crop are decoded.
+/// Minimal H.264 SPS reader for SSAI direct play: ad creatives arrive mid-stream on a new PID with unparsed codecpar (width/height==0); calling avformat_find_stream_info would block the live pump. Field order per ITU-T H.264 §7.3.2.1.1.
 enum H264SPS {
 
-    /// Parse coded (cropped) dimensions from a raw SPS NAL (including its
-    /// 1-byte NAL header, e.g. 0x67). Returns nil on a malformed SPS.
+    /// Parse cropped dimensions from a raw SPS NAL (with 1-byte NAL header, e.g. 0x67). Returns nil on malformed input.
     static func dimensions(fromNAL nal: [UInt8]) -> (width: Int, height: Int)? {
         guard nal.count > 1, (nal[0] & 0x1f) == 7 else { return nil }
-        // Strip NAL header byte + emulation-prevention (00 00 03 -> 00 00).
-        let rbsp = unescape(Array(nal[1...]))
+        let rbsp = unescape(Array(nal[1...]))  // strip NAL header + emulation-prevention (00 00 03 -> 00 00)
         var r = BitReader(rbsp)
 
         guard let profileIdc = r.u(8) else { return nil }
@@ -88,9 +78,7 @@ enum H264SPS {
         return (width, height)
     }
 
-    /// Scan an Annex-B byte stream (an ad keyframe access unit) for the
-    /// first SPS (NAL type 7) and PPS (NAL type 8), returning each NAL
-    /// WITH its 1-byte header (no start code). nil if either is missing.
+    /// Scan Annex-B for the first SPS (NAL type 7) and PPS (NAL type 8), returned with their 1-byte NAL header.
     static func extractSPSandPPS(fromAnnexB data: UnsafeBufferPointer<UInt8>) -> (sps: [UInt8], pps: [UInt8])? {
         var sps: [UInt8]?
         var pps: [UInt8]?
@@ -106,7 +94,6 @@ enum H264SPS {
             if sc == 0 { i += 1; continue }
             let start = i + sc
             guard start < n else { break }
-            // Find the next start code.
             var j = start
             while j < n, startCode(at: j) == 0 { j += 1 }
             let type = data[start] & 0x1f
@@ -119,17 +106,13 @@ enum H264SPS {
         return nil
     }
 
-    /// Build Annex-B extradata (`00 00 00 01 <SPS> 00 00 00 01 <PPS>`) the
-    /// mov muxer accepts directly and packs into avcC itself (FFmpeg
-    /// ff_isom_write_avcc sniffs the start code). NALs are passed WITH
-    /// their header byte.
+    /// Build Annex-B extradata the mov muxer accepts directly; ff_isom_write_avcc sniffs the start code and packs avcC.
     static func annexBExtradata(sps: [UInt8], pps: [UInt8]) -> [UInt8] {
         let sc: [UInt8] = [0, 0, 0, 1]
         return sc + sps + sc + pps
     }
 
-    /// Remove emulation-prevention bytes (00 00 03 -> 00 00).
-    private static func unescape(_ b: [UInt8]) -> [UInt8] {
+    private static func unescape(_ b: [UInt8]) -> [UInt8] {  // remove emulation-prevention bytes (00 00 03 -> 00 00)
         var out = [UInt8](); out.reserveCapacity(b.count)
         var zeros = 0
         var i = 0
@@ -156,8 +139,7 @@ enum H264SPS {
         }
     }
 
-    /// Big-endian bit reader with Exp-Golomb (ue/se) support.
-    struct BitReader {
+    struct BitReader {  // big-endian bit reader with Exp-Golomb (ue/se) support
         private let bytes: [UInt8]
         private var bit = 0
         init(_ b: [UInt8]) { bytes = b }

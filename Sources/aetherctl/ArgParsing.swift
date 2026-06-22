@@ -2,19 +2,14 @@
 
 import Foundation
 
-/// Pluck a boolean flag out of the rest-args list, returning whether
-/// it was present. Modifies `rest` in place. Unknown args stay in
-/// `rest` so the URL positional ends up there.
+/// Remove a boolean flag from `rest` in place; returns whether it was present.
 func takeFlag(_ name: String, from rest: inout [String]) -> Bool {
     guard let idx = rest.firstIndex(of: name) else { return false }
     rest.remove(at: idx)
     return true
 }
 
-/// Pluck a `--key value` pair out of the rest-args list, returning
-/// the value as Int. Returns nil if absent; exits 64 on a present but
-/// missing/unparseable value (silently falling back to the default AND
-/// leaving the flag token in `rest` used to corrupt the URL positional).
+/// Remove `--key value` from `rest`, returning the Int value. Exits 64 if the flag is present but the value is missing or non-integer.
 func takeIntFlag(_ name: String, from rest: inout [String]) -> Int? {
     guard let idx = rest.firstIndex(of: name) else { return nil }
     guard idx + 1 < rest.count, let value = Int(rest[idx + 1]) else {
@@ -26,8 +21,7 @@ func takeIntFlag(_ name: String, from rest: inout [String]) -> Int? {
     return value
 }
 
-/// Pluck a `--key value` pair out of the rest-args list, returning
-/// the value as String. Returns nil if absent or value-less.
+/// Remove `--key value` from `rest`, returning the String value. Returns nil if absent.
 func takeStringFlag(_ name: String, from rest: inout [String]) -> String? {
     guard let idx = rest.firstIndex(of: name),
           idx + 1 < rest.count else { return nil }
@@ -36,14 +30,11 @@ func takeStringFlag(_ name: String, from rest: inout [String]) -> String? {
     return value
 }
 
-/// Pluck a `--key value` pair out of the rest-args list, returning
-/// the value as Double. Returns nil if absent; exits 64 on a present
-/// but missing/unparseable value (see `takeIntFlag`).
+/// Remove `--key value` from `rest`, returning the Double value. Exits 64 if present but non-finite or missing.
 func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
     guard let idx = rest.firstIndex(of: name) else { return nil }
     guard idx + 1 < rest.count, let value = Double(rest[idx + 1]), value.isFinite else {
-        // isFinite: Double("nan")/"inf"/"1e300" parse successfully and
-        // then trap in every downstream Int(Double) conversion.
+        // isFinite rejects "nan"/"inf" that parse as Double but trap in downstream Int(Double).
         let got = idx + 1 < rest.count ? "'\(rest[idx + 1])'" : "nothing"
         print("ERROR: \(name) expects a finite numeric value, got \(got)")
         exit(64)
@@ -52,9 +43,7 @@ func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
     return value
 }
 
-/// Reject leftover `--flags` after a subcommand's known flags were
-/// plucked: a typo'd flag otherwise either vanished silently or, worse,
-/// became the URL positional and produced a misleading open error.
+/// Exit 64 with an error message if any `--flag` remains in `rest` after plucking known flags (typos would silently become the URL positional otherwise).
 func rejectStrayFlags(_ rest: [String], subcommand: String) {
     if let stray = rest.first(where: { $0.hasPrefix("--") }) {
         print("ERROR: unknown flag '\(stray)' for subcommand '\(subcommand)'")

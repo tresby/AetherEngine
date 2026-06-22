@@ -26,11 +26,8 @@ final class HLSLiveIngestDecryptIntegrationTests: XCTestCase {
         let reader = HLSLiveIngestReader(playlistURL: url)
         defer { reader.close() }
 
-        // Pull ~64 KB on a background thread (read() blocks on the FIFO),
-        // bounded by an expectation so a dead upstream fails fast. The
-        // accumulator is a reference type so the closure captures the box,
-        // not a mutable local (the expectation fulfill/wait pair gives the
-        // happens-before edge for the main thread's read after wait).
+        // read() blocks on the FIFO; Box is a reference type so the closure captures it
+        // across the thread boundary (expectation provides the happens-before edge).
         final class Box: @unchecked Sendable { var data = Data() }
         let want = 64 * 1024
         let box = Box()
@@ -41,7 +38,7 @@ final class HLSLiveIngestDecryptIntegrationTests: XCTestCase {
                 let n = buf.withUnsafeMutableBufferPointer {
                     reader.read($0.baseAddress, size: Int32($0.count))
                 }
-                if n <= 0 { break } // EOF / error / cancelled
+                if n <= 0 { break }
                 box.data.append(contentsOf: buf[0..<Int(n)])
             }
             done.fulfill()
@@ -52,8 +49,7 @@ final class HLSLiveIngestDecryptIntegrationTests: XCTestCase {
         XCTAssertNil(reader.terminalError, "ingest went terminal: \(String(describing: reader.terminalError))")
         XCTAssertGreaterThan(got.count, 188 * 4, "too few bytes to judge TS structure")
 
-        // First byte must be the TS sync, and the sync must recur every
-        // 188 bytes across the buffer: that only holds for decrypted TS.
+        // 0x47 sync at 188-byte cadence only holds for decrypted TS; ciphertext would score ~1/256.
         XCTAssertEqual(got.first, 0x47, "stream does not start with the MPEG-TS sync byte (decrypt failed?)")
         var packets = 0
         var hits = 0
@@ -64,8 +60,6 @@ final class HLSLiveIngestDecryptIntegrationTests: XCTestCase {
             offset += 188
         }
         XCTAssertGreaterThan(packets, 8)
-        // Allow a little slack for the occasional non-188 boundary, but
-        // ciphertext would score near chance (1/256), not ~100%.
         XCTAssertGreaterThan(Double(hits) / Double(packets), 0.95,
                              "TS sync cadence \(hits)/\(packets) too low; segments likely still encrypted")
     }

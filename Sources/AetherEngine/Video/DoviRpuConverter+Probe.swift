@@ -3,13 +3,7 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// Extract every parameter-set NAL (VPS / SPS / PPS, plus any other
-/// array entries) from an hvcC extradata blob, returned as raw NAL unit
-/// byte arrays (no length prefix, no start code).
-///
-/// hvcC layout: a 22-byte fixed header, then byte 22 = numOfArrays.
-/// Each array: 1 byte (array_completeness + NAL_unit_type), 2 bytes
-/// numNalus, then per NAL: 2 bytes nalUnitLength + the NAL bytes.
+/// Extract VPS/SPS/PPS NALs from hvcC extradata (22-byte header + numOfArrays arrays). Returns raw NAL bytes without length prefix or start code.
 private func parseHVCCParameterSets(_ ed: UnsafePointer<UInt8>, _ size: Int) -> [[UInt8]] {
     guard size > 23 else { return [] }
     var out: [[UInt8]] = []
@@ -17,7 +11,6 @@ private func parseHVCCParameterSets(_ ed: UnsafePointer<UInt8>, _ size: Int) -> 
     var p = 23
     for _ in 0..<numArrays {
         guard p + 3 <= size else { break }
-        // ed[p] holds array_completeness + reserved + NAL_unit_type.
         let numNalus = (Int(ed[p + 1]) << 8) | Int(ed[p + 2])
         p += 3
         for _ in 0..<numNalus {
@@ -45,19 +38,7 @@ extension AetherEngine {
 
     // MARK: - Dovi convert probe (aetherctl dovitest)
 
-    /// Walk every packet on a source's HEVC video stream, run
-    /// `DoviRpuConverter.convertPacketToProfile81` on each, and append the
-    /// (converted) NAL units to `outputPath` in Annex-B form so external
-    /// tooling (`dovi_tool extract-rpu`) can validate the rewritten RPU.
-    ///
-    /// Annex-B conversion: each 4-byte AVCC big-endian length prefix is
-    /// replaced with the start code `00 00 00 01`. The NAL unit bytes
-    /// (including their 2-byte HEVC header) are written verbatim, so the
-    /// emulation-prevention bytes libdovi left in place stay intact.
-    ///
-    /// `convertPacketToProfile81` returning `false` is counted as a
-    /// failure; the original (unconverted) packet is still emitted so the
-    /// output stays a valid elementary stream.
+    /// Walk every HEVC video packet, run `convertPacketToProfile81`, and write Annex-B output (AVCC length prefix replaced by `00 00 00 01`) for validation with `dovi_tool extract-rpu`. False returns are counted as failures but still emitted.
     public nonisolated static func doviConvertProbe(
         url: URL,
         outputPath: String,
@@ -75,7 +56,6 @@ extension AetherEngine {
             )
         }
 
-        // Fresh output file.
         FileManager.default.createFile(atPath: outputPath, contents: nil)
         guard let handle = FileHandle(forWritingAtPath: outputPath) else {
             throw AetherEngineError.noVideoStream
@@ -84,12 +64,7 @@ extension AetherEngine {
 
         let startCode: [UInt8] = [0x00, 0x00, 0x00, 0x01]
 
-        // The MP4 demuxer keeps VPS / SPS / PPS in the stream's hvcC
-        // extradata, not in-band. dovi_tool's HEVC parser needs those
-        // parameter sets in the elementary stream to walk it, so emit
-        // them once up front as Annex-B NALs (start code + NAL bytes).
-        // This is purely a harness concern: production wiring keeps the
-        // packet payloads in AVCC and lets the muxer carry the hvcC.
+        // MP4 hvcC keeps VPS/SPS/PPS out-of-band; emit them once as Annex-B so dovi_tool's parser can walk the stream.
         if let cp = stream.pointee.codecpar,
            let ed = cp.pointee.extradata, cp.pointee.extradata_size > 0 {
             let edSize = Int(cp.pointee.extradata_size)
@@ -120,8 +95,6 @@ extension AetherEngine {
                 } else {
                     failures += 1
                 }
-                // Emit the (possibly rewritten) packet as Annex-B: replace
-                // each 4-byte length prefix with a start code.
                 if let data = packet.pointee.data, packet.pointee.size > 4 {
                     let size = Int(packet.pointee.size)
                     var off = 0

@@ -1,13 +1,9 @@
 import Foundation
 
-/// Stateless builder for tx3g (mov_text) sample payloads (#55). A
-/// mov_text sample is a uint16 big-endian byte-length prefix followed
-/// by the UTF-8 text (style boxes omitted; plain text for broad
-/// AVPlayer compatibility). Pure, no engine state.
+/// Stateless tx3g (mov_text) sample builder (#55): uint16 BE byte-length prefix + UTF-8 text, no style boxes (plain text for broad AVPlayer compat).
 enum MovTextSampleBuilder {
 
-    /// `[uint16 BE byte-length][UTF-8 text]` for a cue, ASS markup
-    /// stripped. Empty text produces the empty sample.
+    /// `[uint16 BE byte-length][UTF-8 text]`, ASS markup stripped.
     static func sample(text: String) -> Data {
         let clean = sanitize(text)
         let utf8 = Array(clean.utf8)
@@ -17,14 +13,12 @@ enum MovTextSampleBuilder {
         return data
     }
 
-    /// `[0x00, 0x00]`: a zero-length mov_text sample, used to fill the
-    /// gaps between cues so the track stays contiguous.
+    /// Zero-length mov_text sample fills gaps between cues so the track stays contiguous.
     static func emptySample() -> Data {
         Data([0x00, 0x00])
     }
 
-    /// Strip ASS/SSA override blocks (`{\...}`) and normalize the inline
-    /// escapes mov_text cannot carry. Conservative: plain text only.
+    /// Strip ASS/SSA override blocks (`{\...}`) and normalize inline escapes mov_text cannot carry; plain text only.
     static func sanitize(_ assText: String) -> String {
         var s = assText
         while let open = s.firstIndex(of: "{"), let close = s[open...].firstIndex(of: "}") {

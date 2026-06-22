@@ -27,7 +27,6 @@ func runHLSLiveRepro(args: [String]) -> Int32 {
     let segSeconds = takeIntFlag("--segment-seconds", from: &rest) ?? 5
     let discFlag = takeStringFlag("--disc", from: &rest)
 
-    // Load each file as one 188-aligned slice (a whole segment).
     var slices: [[UInt8]] = []
     for p in paths {
         guard let raw = try? Data(contentsOf: URL(fileURLWithPath: p)) else {
@@ -38,7 +37,7 @@ func runHLSLiveRepro(args: [String]) -> Int32 {
         slices.append([UInt8](raw.prefix(aligned)))
     }
 
-    // Discontinuity indices: explicit --disc, else auto (file changed).
+    // Discontinuity indices: explicit --disc, else auto-detect on file change.
     var discSet: Set<Int> = []
     if let discFlag {
         for s in discFlag.split(separator: ",") { if let i = Int(s) { discSet.insert(i) } }
@@ -87,8 +86,7 @@ private func hlsLiveRun(entryURL: String, seconds: Int, server: HLSFixtureServer
     }
     print(String(format: "  post-load state=%@ isLive=%@", "\(engine.state)", "\(engine.isLive)"))
 
-    // Poll once a second; the EngineLog stream shows "live seg-N finalized".
-    var stalled = false
+    var stalled = false // EngineLog stream shows "live seg-N finalized"
     for tick in 0..<seconds {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         if case .error(let m) = engine.state {

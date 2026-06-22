@@ -17,11 +17,7 @@ final class HLSSegmentDecryptorTests: XCTestCase {
 
     // MARK: - AES-128-CBC/PKCS7 decryption
 
-    /// Ground-truth vector produced by:
-    ///   openssl enc -aes-128-cbc -K <key> -iv <iv> -in pt -out ct
-    /// (OpenSSL applies PKCS7 padding, the same scheme CommonCrypto's
-    /// kCCOptionPKCS7Padding expects). The decryptor must reproduce the
-    /// exact plaintext bytes.
+    // Ground-truth vector: openssl enc -aes-128-cbc -K <key> -iv <iv> with PKCS7 padding.
     func testDecryptsKnownAES128CBCVector() throws {
         let key = hex("000102030405060708090a0b0c0d0e0f")
         let iv = hex("101112131415161718191a1b1c1d1e1f")
@@ -80,9 +76,7 @@ final class HLSSegmentDecryptorTests: XCTestCase {
     }
 
     func testDerivesSequenceIVWhenKeyHasNoIV() throws {
-        // No IV attribute: RFC 8216 default is the 16-byte big-endian
-        // media-sequence number of the segment. MEDIA-SEQUENCE=5, first
-        // segment -> IV ends in 0x05.
+        // RFC 8216: no IV -> 16-byte big-endian media-sequence number (MEDIA-SEQUENCE=5 -> IV ends 0x05).
         let media = try parseMedia("""
         #EXTM3U
         #EXT-X-TARGETDURATION:5
@@ -114,8 +108,8 @@ final class HLSSegmentDecryptorTests: XCTestCase {
         c.ts
         """)
         XCTAssertNotNil(media.segments[0].crypt)
-        XCTAssertNotNil(media.segments[1].crypt) // sticky from the tag above
-        XCTAssertNil(media.segments[2].crypt)    // cleared by METHOD=NONE
+        XCTAssertNotNil(media.segments[1].crypt)  // sticky from the tag above
+        XCTAssertNil(media.segments[2].crypt)     // cleared by METHOD=NONE
     }
 
     func testSampleAESMarksUnsupported() throws {

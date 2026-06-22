@@ -4,9 +4,6 @@ import AetherEngine
 // MARK: - serve
 
 func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil) -> Never {
-    // Mirror what the tvOS app does: route every engine log to stdout
-    // instead of into a host overlay buffer, so the CLI session reads
-    // linearly.
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -25,9 +22,7 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil) -> N
         url: url,
         dvModeAvailable: dvModeAvailable
     )
-    // Diagnostics affordance (#55): request the native mov_text track
-    // before start() so the muxer's init moov declares the subtitle
-    // stream. Must precede start().
+    // Request native mov_text track before start() so the muxer's init moov declares it (#55). Must precede start().
     if nativeSubsIndex != nil {
         engine.requestNativeSubtitleTrack()
     }
@@ -38,11 +33,7 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil) -> N
         print("ERROR: \(error)")
         exit(1)
     }
-    // Attach one cue store per declared text track after start (#55,
-    // all-tracks). The stores start empty; in a full AetherEngine session
-    // the native multi-decode reader feeds them via the side demuxer. The
-    // legacy `--native-subs N` index argument is kept for CLI compatibility
-    // but ALL non-bitmap subtitle streams are now declared, not just N.
+    // Attach cue stores for all declared text tracks after start (#55 all-tracks). Legacy --native-subs N kept for CLI compat; ALL non-bitmap tracks are now declared.
     if nativeSubsIndex != nil {
         let languages = engine.attachAllNativeSubtitleStores()
         print("[native-subs] \(languages.count) mov_text track(s) declared in init moov, cue stores attached")
@@ -58,9 +49,7 @@ func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil) -> N
     print("Engine is parked. Hit Ctrl-C to tear down.")
     print("")
 
-    // Trap SIGINT to clean up so the next run can rebind the same
-    // (ephemeral) port if needed and so the demuxer's HTTP session
-    // doesn't leak.
+    // Trap SIGINT to release the ephemeral port and avoid demuxer HTTP session leak.
     signal(SIGINT, SIG_IGN)
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     sigintSource.setEventHandler {
@@ -127,9 +116,7 @@ func runValidate(url: URL, dvModeAvailable: Bool) -> Int32 {
         return 1
     }
 
-    // Read the combined output BEFORE waiting for exit: the validator can
-    // emit more than the kernel pipe buffer (~64 KB), and waiting first
-    // deadlocks (child blocked on write, parent blocked in waitUntilExit).
+    // Read output before waitUntilExit: mediastreamvalidator can exceed the ~64 KB pipe buffer, causing deadlock if you wait first.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     if let text = String(data: data, encoding: .utf8), !text.isEmpty {

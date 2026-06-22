@@ -6,8 +6,7 @@ final class UDFReaderTests: XCTestCase {
         // tiny mpls (2s clip 00001) + a recognizable m2ts payload
         func be16(_ v: Int) -> [UInt8] { [UInt8((v>>8)&0xff), UInt8(v&0xff)] }
         func be32(_ v: Int) -> [UInt8] { [UInt8((v>>24)&0xff),UInt8((v>>16)&0xff),UInt8((v>>8)&0xff),UInt8(v&0xff)] }
-        // Incremental += build (not one long + chain) to keep the Swift type
-        // checker fast (chained form trips "unable to type-check in reasonable time").
+        // Incremental += build avoids Swift type-checker timeout on long + chains.
         var pi: [UInt8] = []
         pi += Array("00001".utf8); pi += Array("M2TS".utf8); pi += be16(0); pi.append(0)
         pi += be32(0); pi += be32(90000); pi += [UInt8](repeating: 0, count: 8)
@@ -38,7 +37,6 @@ final class UDFReaderTests: XCTestCase {
         let mpls = try XCTUnwrap(pl.first { $0.name == "00000.mpls" })
         let extents = try udf.extents(of: mpls)
         XCTAssertFalse(extents.isEmpty)
-        // read the bytes via a ConcatIOReader over those extents; must start with "MPLS"
         let reader = ConcatIOReader(base: DataIOReader(data: image()), extents: extents)
         var buf = [UInt8](repeating: 0, count: 4)
         _ = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 4) }
@@ -64,8 +62,7 @@ final class UDFReaderTests: XCTestCase {
     }
 
     func test_truncatedImageThrowsNotTrap() throws {
-        // A valid UDF image truncated before its volume structure must throw,
-        // not trap. Build the full fixture then cut it to just past the AVDP.
+        // UDF image truncated before VDS (AVDP present at sector 256, VDS cut off): must throw, not trap.
         func be16(_ v: Int) -> [UInt8] { [UInt8((v>>8)&0xff), UInt8(v&0xff)] }
         func be32(_ v: Int) -> [UInt8] { [UInt8((v>>24)&0xff),UInt8((v>>16)&0xff),UInt8((v>>8)&0xff),UInt8(v&0xff)] }
         var pi: [UInt8] = []

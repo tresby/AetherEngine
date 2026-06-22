@@ -6,7 +6,7 @@ import AetherEngine
 
 // MARK: - extract
 
-/// Drive an async actor call to completion from the synchronous CLI.
+/// Bridge an async call to the synchronous CLI via semaphore.
 private func runBlocking<T: Sendable>(_ work: @escaping @Sendable () async -> T) -> T {
     let semaphore = DispatchSemaphore(value: 0)
     let box = UncheckedBox<T?>(nil)
@@ -38,11 +38,7 @@ func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWi
     let start = Date()
     let effectiveLoops = max(1, loops)
     for i in 0..<effectiveLoops {
-        // Cycle positions within a bounded in-range window so every
-        // iteration really decodes (and short clips do not run past
-        // EOF). 8 distinct 1 s buckets is enough to defeat trivial
-        // cache short-circuiting, especially in snapshot mode where the
-        // cache holds only 2 entries.
+        // 8 distinct 1s buckets defeat cache short-circuiting (snapshot cache holds only 2 entries).
         let pos = seconds + Double(i % 8) * 1.0
         let image: CGImage? = runBlocking {
             switch mode {
@@ -66,8 +62,7 @@ func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: Int, maxWi
     }
     let elapsed = Date().timeIntervalSince(start)
 
-    // Deterministic teardown so a `leaks --atExit` run sees a fully
-    // released context (no lingering demuxer / connection / FFmpeg alloc).
+    // Deterministic teardown so `leaks --atExit` sees a fully released context.
     runBlocking { await extractor.shutdown() }
 
     print("")

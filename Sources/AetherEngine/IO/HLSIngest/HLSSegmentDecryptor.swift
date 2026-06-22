@@ -1,19 +1,10 @@
 import Foundation
 import CommonCrypto
 
-/// AES-128-CBC clear-key decryption for HLS segments (EXT-X-KEY
-/// METHOD=AES-128). This is the standard clear-key scheme used by FAST
-/// providers (Pluto / Samsung TV+ etc.): a 16-byte key fetched in the
-/// clear over HTTPS plus a per-segment IV, the whole TS segment
-/// encrypted as one AES-CBC message with PKCS7 padding. It is NOT a DRM
-/// system (no FairPlay/Widevine); decrypting it is ordinary HLS client
-/// behaviour, the same step AVPlayer and ffmpeg perform natively.
+/// AES-128-CBC/PKCS7 clear-key decryption for HLS EXT-X-KEY METHOD=AES-128 segments (Pluto/Samsung-TV+ style). Not a DRM system; standard HLS client behavior.
 enum HLSSegmentDecryptor {
 
-    /// Decrypt one AES-128-CBC/PKCS7 segment. `key` and `iv` must each be
-    /// exactly 16 bytes. Returns nil on a malformed key/IV length or a
-    /// CommonCrypto failure (caller treats it as a terminal decrypt error
-    /// and the host falls back to the server-muxed route).
+    /// Returns nil on malformed key/IV length or CommonCrypto failure; caller treats as terminal (host falls back to server-muxed route).
     static func decryptAES128CBC(_ ciphertext: Data, key: Data, iv: Data) -> Data? {
         guard key.count == kCCKeySizeAES128, iv.count == kCCBlockSizeAES128 else { return nil }
         guard !ciphertext.isEmpty, ciphertext.count % kCCBlockSizeAES128 == 0 else { return nil }

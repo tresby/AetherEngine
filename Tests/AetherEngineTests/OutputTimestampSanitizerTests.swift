@@ -7,7 +7,6 @@ final class OutputTimestampSanitizerTests: XCTestCase {
 
     func testMonotonicAudioPassThroughUnchanged() {
         var s = OutputTimestampSanitizer()
-        // Audio: pts == dts, strictly increasing by a frame each call.
         for i in 0..<5 {
             let t = Int64(1000 + i * 1024)
             let out = s.sanitize(streamIndex: 1, pts: t, dts: t)
@@ -18,7 +17,6 @@ final class OutputTimestampSanitizerTests: XCTestCase {
 
     func testVideoBFramePtsAboveDtsPreserved() {
         var s = OutputTimestampSanitizer()
-        // B-frame reordering: pts > dts must be preserved, not flattened.
         let out = s.sanitize(streamIndex: 0, pts: 2000, dts: 1000)
         XCTAssertEqual(out.dts, 1000)
         XCTAssertEqual(out.pts, 2000)
@@ -48,26 +46,20 @@ final class OutputTimestampSanitizerTests: XCTestCase {
     }
 
     func testBackwardDtsResetIsForcedMonotonic() {
-        // SSAI creative restarts source clock at 2^33; after rescale the
-        // muxer-domain dts can land far below the last written value.
+        // SSAI creative restarts source clock at 2^33; rescaled dts can land far below the last written value.
         var s = OutputTimestampSanitizer()
         _ = s.sanitize(streamIndex: 1, pts: 10_000, dts: 10_000)
-        // Big backward jump (ad creative): must not go backward at output.
         let out = s.sanitize(streamIndex: 1, pts: 2_000, dts: 2_000)
         XCTAssertEqual(out.dts, 10_001)
         XCTAssertEqual(out.pts, 10_001)
     }
 
     func testWholeAdBurstStaysMonotonicAndPtsGEDts() {
-        // Replay the shape of the stall: a run of audio packets whose dts
-        // collides/regresses and whose pts trails dts. Every emitted
-        // packet must satisfy the muxer invariants.
+        // Replays the Beverly Hills 90210 / Pluto stall shape: dts collides/regresses, pts trails dts; both pathologies at once.
         var s = OutputTimestampSanitizer()
         _ = s.sanitize(streamIndex: 1, pts: 6679425, dts: 6679425)
         var lastDts = Int64.min
         for i in 0..<200 {
-            // pts trails dts (the bug), dts barely moves (was bumped to
-            // last+1 upstream): both pathologies at once.
             let pts = Int64(6391809 + i * 1024)
             let dts = Int64(6679425) // constant, colliding
             let out = s.sanitize(streamIndex: 1, pts: pts, dts: dts)
@@ -81,8 +73,6 @@ final class OutputTimestampSanitizerTests: XCTestCase {
 
     func testStreamsTrackedIndependently() {
         var s = OutputTimestampSanitizer()
-        // Audio (stream 1) and video (stream 0) interleave; one stream's
-        // dts must not bump the other's.
         let a = s.sanitize(streamIndex: 1, pts: 5000, dts: 5000)
         let v = s.sanitize(streamIndex: 0, pts: 100, dts: 100)
         XCTAssertEqual(a.dts, 5000)

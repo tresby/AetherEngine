@@ -1,37 +1,12 @@
 import Foundation
 
-/// Pure cursor over successive refreshes of a live media playlist.
-/// Feed it each freshly parsed playlist; it returns the segments to fetch,
-/// in order, exactly once each. Handles the three live realities:
-/// initial join (start near the live edge), normal forward growth, and the
-/// provider window sliding past our cursor (rejoin at the edge, flagged as
-/// a discontinuity so downstream timestamp rebase has a deterministic cue).
-/// Policy notes: joins target a duration COVERAGE, not a segment count:
-/// the join takes the newest segments until their summed duration reaches
-/// `max(minJoinCoverageSeconds, 1.5 * playlist.targetDuration)`, capped at
-/// `edgeOffset` segments (always at least one). Joining on segment count
-/// alone burst up to 36s of backlog on providers with long segments, which
-/// made the local live playlist grow many times faster than real time and
-/// reliably tripped a one-time AVPlayer pacing stall a few seconds into
-/// every direct session (device repro 2026-06-11); the ~8s floor keeps the
-/// startup shape close to the proven stall-free server-remux cushion. The
-/// 1.5x-targetDuration term raises the coverage for long-segment upstreams
-/// (e.g. 10s segments -> two segments / 20s) so AVPlayer always holds at
-/// least one upstream-cadence worth of buffer across the bursty
-/// inter-batch arrival gap (device repro 2026-06-11: ~5s stalls every
-/// ~20s with a single-segment join). A rejoin after a window slide resets
-/// `stallCount`; a playlist that SHRINKS (spec-violating server) is
-/// indistinguishable from a stall and counts as one, which is the desired
-/// pressure toward the stall budget.
+/// Pure cursor over successive live playlist refreshes. Returns each segment exactly once. Handles join, forward growth, and window-slide (rejoin + discontinuity flag for downstream PTS rebase).
+///
+/// Join policy: target duration coverage `max(minJoinCoverageSeconds, 1.5 * targetDuration)`, capped at `edgeOffset` segments. Count-only join burst up to 36s of backlog on long-segment providers, which caused a one-time AVPlayer pacing stall a few seconds into every direct session (device repro 2026-06-11). The 1.5x term ensures at least one upstream cadence of buffer across the bursty inter-batch arrival gap (device repro 2026-06-11: ~5s stalls every ~20s with a single-segment join). A shrinking playlist (spec-violating server) is treated as a stall.
 struct HLSPlaylistTracker {
-    /// Hard cap on how many segments behind the live edge to start.
-    private let edgeOffset: Int
-    /// Floor for the join's duration-coverage target; the effective target
-    /// is `max(minJoinCoverageSeconds, 1.5 * playlist.targetDuration)`.
-    private let minJoinCoverageSeconds: Double
-    /// Next media-sequence number we have NOT yet returned. nil until primed.
-    private(set) var nextSequence: Int?
-    /// Consecutive refreshes that produced no new segment.
+    private let edgeOffset: Int          // max segments behind the live edge on join
+    private let minJoinCoverageSeconds: Double // floor for the duration-coverage target
+    private(set) var nextSequence: Int?  // next media-sequence not yet returned; nil until primed
     private(set) var stallCount = 0
 
     init(edgeOffset: Int = 3, minJoinCoverageSeconds: Double = 8) {
@@ -57,13 +32,6 @@ struct HLSPlaylistTracker {
             return result
         }
 
-        /// Join sequence: walk back from the live edge, taking the newest
-        /// segments until the summed duration REACHES the coverage target
-        /// `max(minJoinCoverageSeconds, 1.5 * targetDuration)`, capped at
-        /// `edgeOffset` segments. Always at least one segment. For 4s
-        /// upstreams this is the previous behaviour exactly (2 segments /
-        /// 8s); for 10s upstreams it takes 2 segments / 20s so the buffer
-        /// rides out the ~10s bursty inter-batch gap.
         func joinStart() -> Int {
             let coverage = max(minJoinCoverageSeconds, 1.5 * playlist.targetDuration)
             var taken = 0
@@ -78,13 +46,12 @@ struct HLSPlaylistTracker {
         }
 
         guard let cursor = nextSequence else {
-            // Initial join near the live edge, duration-capped.
             nextSequence = windowEnd
             return segments(from: joinStart(), markFirstDiscontinuity: false)
         }
 
         if cursor < windowStart {
-            // Window slid past us: rejoin near the edge, mark the seam.
+            // Window slid past cursor: rejoin and mark the seam.
             nextSequence = windowEnd
             stallCount = 0
             return segments(from: joinStart(), markFirstDiscontinuity: true)

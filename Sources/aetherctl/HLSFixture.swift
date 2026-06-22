@@ -62,7 +62,6 @@ private let slowRefreshDelay: Double = 8.0
 func runHLSFixture(args: [String]) -> Int32 {
     var rest = args
 
-    // Required positional: the input .ts file.
     guard !rest.isEmpty, !rest[0].hasPrefix("-") else {
         print("ERROR: hlsfixture requires <input.ts> as first argument")
         print("Usage: aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]")
@@ -74,8 +73,7 @@ func runHLSFixture(args: [String]) -> Int32 {
 
     let port          = takeIntFlag("--port", from: &rest) ?? 8090
     let segSeconds    = takeIntFlag("--segment-seconds", from: &rest) ?? 4
-    // 0 made currentSequence() divide by zero (Int(inf) traps on the
-    // first playlist request); negatives produced a nonsense playlist.
+    // 0 causes divide-by-zero in currentSequence(); negatives produce a nonsense playlist.
     guard segSeconds >= 1 else {
         print("ERROR: --segment-seconds must be >= 1 (got \(segSeconds))")
         return 64
@@ -101,7 +99,6 @@ func runHLSFixture(args: [String]) -> Int32 {
     }
     print("[HLSFixture] slices=\(slices.count) segmentSeconds=\(segSeconds)")
 
-    // Build + start the server.
     let config = HLSFixtureConfig(
         slices: slices,
         segmentSeconds: segSeconds,
@@ -113,8 +110,7 @@ func runHLSFixture(args: [String]) -> Int32 {
         fmp4: fmp4
     )
     let server = HLSFixtureServer(config: config)
-    // exactly: the blind UInt16(port) conversion trapped on
-    // out-of-range user input (e.g. --port 70000) instead of erroring.
+    // UInt16(exactly:) rejects out-of-range port values instead of wrapping silently.
     guard let preferredPort = UInt16(exactly: port) else {
         print("ERROR: --port must be 0-65535 (got \(port))")
         return 64
@@ -135,7 +131,6 @@ func runHLSFixture(args: [String]) -> Int32 {
         return runSelfTest(entryURL: entryURL, server: server)
     }
 
-    // Default: park until killed.
     signal(SIGINT, SIG_IGN)
     let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     sig.setEventHandler {
@@ -200,13 +195,7 @@ private func runSelfTest(entryURL: String, server: HLSFixtureServer) -> Int32 {
 
 // MARK: - File slicing
 
-/// Load `path` and split into 188-aligned chunks.
-///
-/// Strategy: fixed 1 MB target chunk size, rounded DOWN to the nearest
-/// 188-byte multiple. If the file is smaller than one 188-byte packet we
-/// throw; if the computed chunk size is < 188 we clamp to 188. The last
-/// chunk is whatever bytes remain (also 188-aligned because the whole file
-/// must be a multiple of 188). Segments cycle so the server never runs out.
+/// Load `path` and split into ~1 MB 188-byte-aligned chunks. Throws if file is not a whole-packet MPEG-TS. Segments cycle so the server never runs out.
 private func loadAndSlice(path: String) throws -> [[UInt8]] {
     let fm = FileManager.default
     guard fm.fileExists(atPath: path) else {
@@ -225,8 +214,7 @@ private func loadAndSlice(path: String) throws -> [[UInt8]] {
                           "file size \(raw.count) is not a multiple of 188; not a raw MPEG-TS"])
     }
 
-    // Target ~1 MB per chunk, aligned to 188.
-    let targetBytes = 1 * 1024 * 1024
+    let targetBytes = 1 * 1024 * 1024 // ~1 MB per chunk, aligned to 188
     let rawChunk = targetBytes - (targetBytes % tsPacketSize)
     let chunkSize = max(tsPacketSize, rawChunk <= raw.count ? rawChunk : raw.count)
 
@@ -268,9 +256,7 @@ struct HLSFixtureConfig {
 
 // MARK: - HTTP server
 
-/// A minimal blocking HTTP server for the HLS live fixture.
-/// One thread per accepted connection. The playlist is generated fresh on
-/// each /media.m3u8 request using wall-clock time to advance the sequence number.
+/// Minimal blocking HTTP/HLS fixture server. Thread-per-connection; playlist advances via wall-clock sequence number.
 final class HLSFixtureServer: @unchecked Sendable {
     private let config: HLSFixtureConfig
     private var listenFd: Int32 = -1
@@ -279,7 +265,6 @@ final class HLSFixtureServer: @unchecked Sendable {
     private var clientFds = Set<Int32>()
     private(set) var port: UInt16 = 0
 
-    /// Monotonic start time (for computing which segment is "current").
     private var startTime: Date = Date()
 
     private let acceptQueue = DispatchQueue(
@@ -316,8 +301,7 @@ final class HLSFixtureServer: @unchecked Sendable {
             }
         }
         if bindRC != 0 {
-            // Preferred port busy: let kernel pick one.
-            addr.sin_port = 0
+            addr.sin_port = 0 // preferred port busy: let kernel pick
             let rc2 = withUnsafePointer(to: &addr) { ptr in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                     Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -390,7 +374,7 @@ final class HLSFixtureServer: @unchecked Sendable {
                 let e = errno
                 if e == EBADF || e == EINVAL { return }
                 if e == EINTR || e == EAGAIN { continue }
-                // Unexpected errno: say so (see LiveFixture.acceptLoop).
+                // Unexpected errno (e.g. EMFILE): print so it is not silently confused with an engine-side connect failure.
                 print("[HLSFixture] accept failed: errno=\(e); accept loop exiting")
                 return
             }
@@ -431,9 +415,7 @@ final class HLSFixtureServer: @unchecked Sendable {
 
         case "/media.m3u8":
             if config.slowRefresh {
-                // Park for 8 seconds before answering (stall exercise).
-                Thread.sleep(forTimeInterval: slowRefreshDelay)
-                // Check if server was stopped while sleeping.
+                Thread.sleep(forTimeInterval: slowRefreshDelay) // stall exercise
                 lock.lock(); let stopping = shouldStop; lock.unlock()
                 if stopping { return }
             }
@@ -442,9 +424,7 @@ final class HLSFixtureServer: @unchecked Sendable {
 
         case _ where path.hasPrefix("/seg") && path.hasSuffix(".ts"):
             let indexStr = path.dropFirst("/seg".count).dropLast(".ts".count)
-            // index >= 0: Swift's % is sign-preserving, so a manual
-            // curl typo like /seg-1.ts indexed slices[-1] and crashed
-            // the whole fixture process mid-debugging-session.
+            // index >= 0: Swift % is sign-preserving; a negative index would crash the process.
             guard let index = Int(indexStr), index >= 0 else { send404(fd: fd); return }
             if let drop = config.dropSegment, drop == index {
                 send404(fd: fd)
@@ -460,8 +440,7 @@ final class HLSFixtureServer: @unchecked Sendable {
 
     // MARK: - Playlist generation
 
-    /// Compute the current media-sequence number based on wall-clock elapsed time.
-    /// Advances by 1 each `segmentSeconds` seconds, starting at 0.
+    /// Media-sequence number derived from wall-clock elapsed time; advances by 1 per segmentSeconds.
     private func currentSequence() -> Int {
         let elapsed = Date().timeIntervalSince(startTime)
         return max(0, Int(elapsed / Double(config.segmentSeconds)))
@@ -552,11 +531,9 @@ final class HLSFixtureServer: @unchecked Sendable {
             }
             if n <= 0 { return nil }
             received.append(contentsOf: buf[0..<n])
-            // Look for the end of the first request line.
             if let crlfIdx = received.firstRange(of: [0x0D, 0x0A]) {
                 let requestLine = String(bytes: received[..<crlfIdx.lowerBound], encoding: .utf8) ?? ""
-                // "GET /path HTTP/1.1"
-                let parts = requestLine.split(separator: " ", maxSplits: 3)
+                let parts = requestLine.split(separator: " ", maxSplits: 3) // "GET /path HTTP/1.1"
                 guard parts.count >= 2 else { return nil }
                 return String(parts[1])
             }

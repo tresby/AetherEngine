@@ -3,11 +3,7 @@ import AetherEngine
 
 // MARK: - dovitest
 
-/// Validate `DoviRpuConverter.convertPacketToProfile81` against dovi_tool
-/// ground truth. Walks the source's HEVC video stream, converts every
-/// packet's DV metadata from Profile 7 to Profile 8.1, and writes the
-/// result to /tmp/aetherctl-dovitest.hevc in Annex-B form so it can be
-/// fed to `dovi_tool extract-rpu`.
+/// Validate DoviRpuConverter.convertPacketToProfile81 against dovi_tool ground truth. Walks the HEVC stream, converts DV P7 -> P8.1, writes Annex-B to /tmp/aetherctl-dovitest.hevc.
 func runDoviTest(url: URL) -> Int32 {
     let outputPath = "/tmp/aetherctl-dovitest.hevc"
     print("aetherctl dovitest: \(url.absoluteString)")
