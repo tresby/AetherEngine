@@ -10,6 +10,22 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.13.1] — 2026-06-22
+
+### Fixed
+
+- **Embedded ASS subtitle feed fell behind playback on packet-dense tracks (#56).** The embedded subtitle side reader published each decoded event through its own awaited `MainActor.run` hop. On a track that stacks many events on the same (or nearly the same) timestamp, those per-event hops serialize the demux loop against the host's on-MainActor ASS renderer, so demux throughput collapses to the MainActor scheduling rate and the published `subtitleCues` fall far behind the playhead (in the reported sample, 1534 ASS events share a single 5.207 s timestamp). Decoded events are now coalesced and flushed to the MainActor in a single hop once the batch spans a short window of source time (sparse tracks still flush per event, so there is no added latency) or reaches a count cap (the decisive throttle for a same-timestamp burst, turning that 1534-event cluster into roughly a dozen hops instead of 1534). The native `tx3g` reader (3.13.0) already wrote cues off-actor and is unaffected.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.1))
+
+## [3.13.0] — 2026-06-22
+
+### Added
+
+- **Native subtitle tracks for Picture-in-Picture, AirPlay, and external display (#55).** All embedded and sidecar text subtitle tracks can be muxed into the fragmented-MP4 stream as native language-tagged `tx3g` (mov_text) tracks, so AVPlayer renders them itself and they survive PiP, AirPlay, and external-display playback, where a host-drawn overlay is never composited. AVPlayer's stock legible menu enumerates every language for selection. This rides the existing `media.m3u8` path with no master playlist, so SDR / HDR10 / HLG / Dolby Vision (including Profile 5) routing is byte-identical to before. Opt-in via `LoadOptions.prepareNativeSubtitles`; tracks are exposed as `nativeSubtitleTracks` with `setNativeSubtitleSelected(track:)`.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.0))
+
 ## [3.12.0] — 2026-06-21
 
 ### Added
