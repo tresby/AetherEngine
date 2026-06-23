@@ -154,7 +154,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public private(set) var firstKeyframeSeconds: Double = 0
 
     /// Result of the stream-copy / FLAC-bridge / video-only cascade. Possible values:
-    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"FLAC bridge ← <CODEC>"`.
+    /// `"Stream-copy (EAC3+JOC Atmos)"`, `"Stream-copy (<CODEC>)"`, `"<CODEC> → FLAC bridge"`.
     /// nil when no audio pipeline is live.
     public internal(set) var audioPipelineDescription: String?
 

@@ -184,10 +184,10 @@ extension HLSVideoEngine {
                         switch audioBridgeMode {
                         case .surroundCompat:
                             hlsCodec = "ec-3"
-                            pipelineLabel = "EAC3 5.1 bridge ← \(sourceCodecLabel)"
+                            pipelineLabel = "\(sourceCodecLabel) → EAC3 5.1 bridge"
                         case .lossless:
                             hlsCodec = "fLaC"
-                            pipelineLabel = "FLAC bridge ← \(sourceCodecLabel)"
+                            pipelineLabel = "\(sourceCodecLabel) → FLAC bridge"
                         }
                         audioHLSCodecs = hlsCodec
                         self.audioPipelineDescription = pipelineLabel
