@@ -172,12 +172,27 @@ extension AetherEngine {
         session.onPlaylistShiftChanged = { [weak self] seconds in
             Task { @MainActor in
                 guard let self = self else { return }
+                let prevShift = self.playlistShiftSeconds
+                let delta = seconds - prevShift
                 self.playlistShiftSeconds = seconds
                 // Seed seam history: activateAt=-.infinity covers the full output timeline from the start.
                 self.liveShiftSeams = [(activateAt: -.infinity, shift: seconds)]
                 // Re-fold immediately so currentTime (source PTS) doesn't lag the next periodic tick.
                 self.clock.currentTime = self.nativeClockSeconds + seconds
                 // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
+                // #65 diag: every VOD producer (re)start collapses the seam history to one entry here. If `delta`
+                // is non-zero while AVPlayer still holds old-epoch buffer (avBufAhead > 0), the buffered bytes
+                // keep folding with the NEW shift, so the picture leads the folded clock by ~delta. A burst that
+                // logs two distinct shift= values confirms the cross-epoch divergence (Root A); an invariant
+                // shift across the burst points at the orthogonal playlist-startSeconds-vs-tfdt root (Root B).
+                EngineLog.emit(
+                    "[AetherEngine] #65 VOD shift published: \(String(format: "%.3f", seconds))s "
+                    + "(prev \(String(format: "%.3f", prevShift))s, delta \(String(format: "%.3f", delta))s, "
+                    + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) seams->1 "
+                    + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
+                    + "avBufAhead=\(String(format: "%.2f", self.avPlayerBufferAheadSeconds()))s",
+                    category: .session
+                )
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in

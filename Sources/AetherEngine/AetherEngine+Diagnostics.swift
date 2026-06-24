@@ -4,6 +4,23 @@ import AVFoundation
 
 extension AetherEngine {
 
+    // MARK: - Buffer probe
+
+    /// Seconds of AVPlayer buffer ahead of the current playhead (sum of loadedTimeRanges beyond now). 0 on SW path / pre-start.
+    /// Surfaced in the 30 s memprobe and the #65 VOD shift-publish diagnostic so a stale cross-epoch buffer is visible.
+    func avPlayerBufferAheadSeconds() -> Double {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return 0 }
+        let now = item.currentTime().seconds
+        var ahead = 0.0
+        for value in item.loadedTimeRanges {
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = (range.start + range.duration).seconds
+            if end > now { ahead += end - max(start, now) }
+        }
+        return ahead
+    }
+
     // MARK: - Memory diagnostic
 
     /// Cancel any prior probe, then emit one EngineLog line every 30 s under `.engine`. Line shape is documented on `memoryProbeTask`.
@@ -88,7 +105,14 @@ extension AetherEngine {
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
                     + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
-                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s"
+                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s "
+                    // #65 shift-coherence: frameAhead/prodShift/hostShift all 0 while avBufAhead holds
+                    // multiple seconds is the bidirectional-seek-burst signature (presented frame ahead of
+                    // the folded clock). seams=1 is the degenerate VOD seam history (no positional fold).
+                    + "frameAhead=\(String(format: "%.2f", self.frameAhead))s "
+                    + "prodShift=\(String(format: "%.2f", self.activeProducerShiftSeconds))s "
+                    + "hostShift=\(String(format: "%.2f", self.playlistShiftSeconds))s "
+                    + "seams=\(self.liveShiftSeams.count)"
 
                 EngineLog.emit(line, category: .engine)
             }

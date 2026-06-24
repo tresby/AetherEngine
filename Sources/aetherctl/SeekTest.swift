@@ -8,7 +8,19 @@ import AetherEngine
 private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double) async -> Int32 {
     // Tally log lines distinguishing cascade (pre-#35) vs. RestartCoalescer behavior (post-#35).
     let tally = UncheckedBox<[String: Int]>([:])
-    EngineLog.handler = { line in
+    // #65 discriminator: collect the sequence of published host shifts (one per producer restart) and the raw
+    // producer gate-open shifts. Two distinct values across a burst => cross-epoch shift divergence (Root A).
+    let publishedShifts = UncheckedBox<[Double]>([])
+    let gateOpenShifts = UncheckedBox<[Int]>([])
+    // EngineLog.handler fires from many threads concurrently (demuxer, producer, server, audio). Serialize the
+    // whole body: unsynchronized append to the Swift arrays below corrupts the heap (SIGTRAP) under load.
+    let handlerLock = NSLock()
+    // @Sendable so the closure is NOT inferred @MainActor from this @MainActor function: EngineLog invokes it
+    // synchronously from the HLSSegmentProducer.pump thread, and a MainActor-isolated body traps in Swift 6's
+    // executor check (_dispatch_assert_queue_fail) the moment it makes an isolation-crossing call (prefix(while:)).
+    EngineLog.handler = { @Sendable line in
+        handlerLock.lock()
+        defer { handlerLock.unlock() }
         let t = ISO8601DateFormatter.string(
             from: Date(), timeZone: .current,
             formatOptions: [.withTime, .withFractionalSeconds]
@@ -21,6 +33,19 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         bump("coalesced",     "coalesced behind in-flight")
         bump("settleAdvance", "advancing to settled target")
         bump("abandon",       "abandoning it")
+        // "[AetherEngine] #65 VOD shift published: <X>s (prev ...". Parse the published seconds value.
+        if let r = line.range(of: "#65 VOD shift published: ") {
+            let tail = line[r.upperBound...]
+            if let sEnd = tail.range(of: "s "), let v = Double(tail[tail.startIndex..<sEnd.lowerBound]) {
+                publishedShifts.value.append(v)
+            }
+        }
+        // "[HLSSegmentProducer] video gate open: ... shift=<int>". Parse the raw producer shift (source ticks).
+        if let r = line.range(of: "shift="), line.contains("video gate open") {
+            let tail = line[r.upperBound...]
+            let digits = tail.prefix { $0 == "-" || $0.isNumber }
+            if let v = Int(digits) { gateOpenShifts.value.append(v) }
+        }
     }
 
     print("")
@@ -196,6 +221,32 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print("  INTERPRETATION: a high 'full restarts' with ZERO 'coalesced' is the")
     print("  pre-#35 cascade. Post-#35 should show 'coalesced' > 0 and far fewer")
     print("  full restarts for the same burst; 'abandoned' should trend to 0.")
+
+    // #65 discriminator: did the producer shift VARY across the burst's restart epochs?
+    let pubShifts = publishedShifts.value
+    let rawShifts = gateOpenShifts.value
+    let distinctPub = Set(pubShifts.map { ($0 * 1000).rounded() / 1000 })
+    let distinctRaw = Set(rawShifts)
+    print("")
+    print("  --- #65 cross-epoch shift discriminator ---")
+    print("  producer gate-open shifts (raw ticks) = \(rawShifts)  distinct=\(distinctRaw.count)")
+    print(String(format: "  host shifts published (seconds)       = %@  distinct=%d",
+                 "[" + pubShifts.map { String(format: "%.3f", $0) }.joined(separator: ", ") + "]",
+                 distinctPub.count))
+    print("  clockLead settle = \(String(format: "%.2f", settleClockLead))s  (headless ~0 by design; #65 is presented-vs-clock, invisible to ct-src)")
+    if fullRestart == 0 {
+        print("  >> INCONCLUSIVE: 0 producer restarts. The file was fully produced before the burst, so")
+        print("     every seek hit the cache and the cross-epoch cascade never fired. Re-run with a LONGER")
+        print("     file (seek targets must land beyond the producer write head) to exercise #65.")
+    } else if distinctRaw.count > 1 || distinctPub.count > 1 {
+        print("  >> ROOT A (cross-epoch shift divergence): the producer published MORE THAN ONE shift across")
+        print("     the burst. Buffered bytes from a superseded epoch fold with the latest scalar -> picture")
+        print("     leads the clock. The live seam-history port is the fix.")
+    } else {
+        print("  >> ROOT B suspected: producer shift was INVARIANT across all restarts, so the seam collapse")
+        print("     is harmless. A ~6s divergence would then come from playlist startSeconds vs bytes' tfdt,")
+        print("     which needs a buffer flush / URL re-key, not a seam port.")
+    }
     print("")
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")
     return 0
