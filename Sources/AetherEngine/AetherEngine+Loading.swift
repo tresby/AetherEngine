@@ -514,6 +514,9 @@ extension AetherEngine {
         // so the Home badge + remote commands stay bound across a pause.
         host.becomeActiveNowPlaying()
         host.setExternalMetadata(pendingExternalMetadata)
+        #if os(iOS) || os(tvOS)
+        host.setNowPlayingInfo(pendingAudioNowPlayingInfo)
+        #endif
 
         audioNativeCancellables.removeAll()
         host.$currentTime

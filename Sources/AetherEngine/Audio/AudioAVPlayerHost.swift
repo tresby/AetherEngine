@@ -53,8 +53,16 @@ final class AudioAVPlayerHost {
     private var pendingSeek: Double?
 
     /// Now-playing metadata applied to each loaded item's externalMetadata so it survives a back-to-back swap.
-    /// The host app additionally publishes Now-Playing through the session's nowPlayingInfoCenter.
+    /// externalMetadata feeds AVKit's on-screen info pane; on a bare AVPlayer (no AVPlayerViewController) it does
+    /// NOT surface in system Now-Playing. The Now-Playing channel is `nowPlayingInfo` below.
     private var pendingExternalMetadata: [AVMetadataItem] = []
+
+    /// Per-item Now-Playing dictionary (MPMediaItemProperty / MPNowPlayingInfoProperty keys) the auto-publishing
+    /// MPNowPlayingSession reads. This is the documented channel for a bare AVPlayer; externalMetadata is not.
+    /// Stashed so a back-to-back item swap (replaceCurrentItem) replays it.
+    #if os(iOS) || os(tvOS)
+    private var pendingNowPlayingInfo: [String: Any] = [:]
+    #endif
 
     // MARK: - Init
 
@@ -94,6 +102,10 @@ final class AudioAVPlayerHost {
         // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
+        #endif
+        // nowPlayingInfo is the channel the auto-publishing MPNowPlayingSession reads (iOS/tvOS 16+, not macOS/watchOS).
+        #if os(iOS) || os(tvOS)
+        item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         #endif
         playerItem = item
 
@@ -219,6 +231,17 @@ final class AudioAVPlayerHost {
         playerItem?.externalMetadata = items
         #endif
     }
+
+    /// Set the per-item Now-Playing dictionary (current and subsequent items). The auto-publishing session merges
+    /// these keys with the player's elapsed/rate/duration. Pass an empty dict to clear. This is the queue-safe
+    /// channel: the property write stays on the caller's actor and the session publishes on its own queue, so no
+    /// manual MPNowPlayingInfoCenter write races MediaPlayer's serial queue (the tvOS 26 assertion crash).
+    #if os(iOS) || os(tvOS)
+    func setNowPlayingInfo(_ info: [String: Any]) {
+        pendingNowPlayingInfo = info
+        playerItem?.nowPlayingInfo = info.isEmpty ? nil : info
+    }
+    #endif
 
     func play() {
         avPlayer.play()

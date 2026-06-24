@@ -1327,14 +1327,30 @@ public final class AetherEngine: ObservableObject {
     /// loads so audio-track-switch and background reopen replays the metadata.
     var pendingExternalMetadata: [AVMetadataItem] = []
 
-    /// Stage Now Playing metadata. Prefer this over writing to MPNowPlayingInfoCenter.nowPlayingInfo: AVKit /
-    /// MPNowPlayingSession reads AVPlayerItem.externalMetadata, and manual writes race its internal serial queue
-    /// on tvOS 26 and trip an assertion. Safe to call before load(); items are replayed at host creation.
+    /// Stage AVKit externalMetadata for the on-screen info pane (video path / AVPlayerViewController). On the video
+    /// path AVKit also republishes it as Now-Playing Info. The bare-AVPlayer audio path has no AVPlayerViewController,
+    /// so for system Now-Playing on that path use `setAudioNowPlayingInfo` instead. Safe to call before load();
+    /// items are replayed at host creation.
     public func setExternalMetadata(_ items: [AVMetadataItem]) {
         pendingExternalMetadata = items
         nativeHost?.setExternalMetadata(items)
         audioAVPlayerHost?.setExternalMetadata(items)
     }
+
+    #if os(iOS) || os(tvOS)
+    /// Staged per-item Now-Playing dictionary for the audio AVPlayer path. Replayed at host creation.
+    var pendingAudioNowPlayingInfo: [String: Any] = [:]
+
+    /// Stage the system Now-Playing dictionary for the audio AVPlayer path (MPMediaItemProperty /
+    /// MPNowPlayingInfoProperty keys). With `automaticallyPublishesNowPlayingInfo` enabled on the audio session, the
+    /// system merges these keys with the player's elapsed/rate/duration. This writes the queue-safe per-item channel
+    /// (AVPlayerItem.nowPlayingInfo), NOT MPNowPlayingInfoCenter, so it can't race MediaPlayer's serial queue (the
+    /// tvOS 26 assertion crash). Pass an empty dict to clear. Safe before load(); replayed at host creation.
+    public func setAudioNowPlayingInfo(_ info: [String: Any]) {
+        pendingAudioNowPlayingInfo = info
+        audioAVPlayerHost?.setNowPlayingInfo(info)
+    }
+    #endif
 
     /// Playback volume (0.0-1.0). Routes to the active host only; writing all hosts changed subsequent music
     /// sessions. Remembered by `desiredVolume` so a pre-session write (e.g. app-init restore) isn't a no-op.
