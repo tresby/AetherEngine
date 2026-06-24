@@ -10,6 +10,12 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.0.1] — 2026-06-24
+
+### Fixed
+
+- **DTS-HD Master Audio still failed to bridge after the 3.13.4 core-only attempt (#64).** 3.13.4 opened the `dca` decoder with `core_only=1` to skip the lossless XLL extension, but on Blu-ray the DTS core is carried as an asset inside the extension substream (EXSS), not as a standalone core sync, so `core_only` made libavcodec report "No valid DCA sub-stream found" and emit no audio (it even printed "Consider disabling 'core_only'"). The bridge now runs DTS through the `dca_core` bitstream filter, which strips each DTS-HD (MA / HRA) packet to its mandatory core at the bitstream level, so the decoder only ever sees full-rate 5.1/7.1 core PCM and never attempts the XLL reconstruction that residual-codes channels without a usable core. Falls back gracefully to the full decode path (with single-packet EINVAL skipping) if a build lacks the filter. Requires FFmpegBuild 1.0.2 (which enables `dca_core`).
+
 ## [4.0.0] — 2026-06-24
 
 ### Added
