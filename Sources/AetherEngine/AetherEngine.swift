@@ -1342,11 +1342,11 @@ public final class AetherEngine: ObservableObject {
     var pendingAudioNowPlayingInfo: [String: Any] = [:]
 
     /// Stage the system Now-Playing dictionary for the audio AVPlayer path (MPMediaItemProperty /
-    /// MPNowPlayingInfoProperty keys, including the host's already-force-decoded MPMediaItemArtwork). The host owns
-    /// the AVPlayer session with auto-publish OFF and publishes this to the session's own center, appending the
-    /// player-derived elapsed/rate/duration. Auto-publish is off deliberately: enabled, the session harvests and
-    /// decodes the asset's OWN embedded cover, crashing on a corrupt one (see AudioAVPlayerHost). Pass an empty dict
-    /// to clear. Safe before load(); replayed at host creation.
+    /// MPNowPlayingInfoProperty keys, including the host's already-force-decoded, @Sendable-wrapped MPMediaItemArtwork).
+    /// The host owns the AVPlayer session with auto-publish ON; this is written to the per-item
+    /// AVPlayerItem.nowPlayingInfo (the documented, queue-safe channel) and the session merges in the player-derived
+    /// elapsed/rate/duration. Supplying a valid artwork keeps the system from falling back to the asset's embedded
+    /// cover. Pass an empty dict to clear. Safe before load(); replayed at host creation.
     public func setAudioNowPlayingInfo(_ info: [String: Any]) {
         pendingAudioNowPlayingInfo = info
         audioAVPlayerHost?.setNowPlayingInfo(info)

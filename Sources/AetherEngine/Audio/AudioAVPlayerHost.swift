@@ -52,19 +52,13 @@ final class AudioAVPlayerHost {
     /// Start-position seconds stashed at load(); performed once readyToPlay, then cleared.
     private var pendingSeek: Double?
 
-    /// Bumped on each load() entry. load() now awaits async asset-track loading (audio-only composition), so a
-    /// superseding load() can start mid-await; after the await we bail if this generation is stale, so a superseded
-    /// load never replaceCurrentItems onto the shared player after its successor (the reorder the engine warns about).
-    private var loadGeneration: UInt64 = 0
-
-    /// Now-playing metadata applied to each loaded item's externalMetadata so it survives a back-to-back swap.
-    /// externalMetadata feeds AVKit's on-screen info pane; on a bare AVPlayer (no AVPlayerViewController) it does
-    /// NOT surface in system Now-Playing. The Now-Playing channel is `nowPlayingInfo` below.
+    /// Now-playing externalMetadata. externalMetadata feeds AVKit's on-screen info pane; on a bare AVPlayer (no
+    /// AVPlayerViewController) it does NOT surface in system Now-Playing. The Now-Playing channel is `nowPlayingInfo`.
     private var pendingExternalMetadata: [AVMetadataItem] = []
 
-    /// Now-Playing metadata (MPMediaItemProperty keys + the host's already-force-decoded MPMediaItemArtwork) the
-    /// host stages via setNowPlayingInfo. We publish it manually to the session's OWN center (see publishNowPlaying);
-    /// stashed so a back-to-back item swap (replaceCurrentItem) and the 4 Hz elapsed/rate refresh can replay it.
+    /// Per-item Now-Playing dictionary (MPMediaItemProperty keys + the host's force-decoded, @Sendable-wrapped
+    /// MPMediaItemArtwork) that the auto-publishing MPNowPlayingSession reads from AVPlayerItem.nowPlayingInfo.
+    /// Stashed so a back-to-back item swap (replaceCurrentItem) replays it onto the new item.
     #if os(iOS) || os(tvOS)
     private var pendingNowPlayingInfo: [String: Any] = [:]
     #endif
@@ -74,16 +68,14 @@ final class AudioAVPlayerHost {
     init() {
         #if os(tvOS) || os(iOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
-        // Do NOT auto-publish. With automaticallyPublishesNowPlayingInfo = true the session harvests Now-Playing
-        // from the asset's OWN contained metadata (AVKit AVPlayerItem.h externalMetadata: "Supplements metadata
-        // contained in the asset ... will also be published as Now Playing Info"). For a Jellyfin FLAC/MP3 with an
-        // embedded cover that means decoding the embedded picture as a still image; a corrupt/truncated one
-        // ("Error -17102 decompressing image -- possibly corrupt") is then decoded on MediaPlayer's serial queue at
-        // item-bind time (replaceCurrentItem -> dispatch_barrier_async) and trips dispatch_assert_queue_fail.
-        // Instead we publish manually to the session's own center (publishNowPlaying), carrying only the host's
-        // force-decoded artwork, so the embedded asset cover is never decoded. Writing the session's OWN center
-        // (not MPNowPlayingInfoCenter.default()) from the MainActor is the sanctioned manual channel when off.
-        nowPlayingSession.automaticallyPublishesNowPlayingInfo = false
+        // Apple's documented path for a bare AVPlayer (WWDC22 110338, MPNowPlayingSession.h): the session
+        // auto-publishes Now-Playing from the player (elapsed/rate/state/duration) merged with the per-item
+        // AVPlayerItem.nowPlayingInfo we stamp. With YES, nowPlayingInfoCenter must NOT be written (we never do).
+        // The host supplies a guaranteed-valid, force-decoded, @Sendable-wrapped artwork so the system never has to
+        // fall back to (and decode) the asset's own embedded cover, which crashes on a corrupt one. This replaced a
+        // manual-publish design whose MPMediaItemArtwork closure was non-@Sendable and tripped
+        // dispatch_assert_queue_fail when MediaPlayer requested the bitmap off-actor.
+        nowPlayingSession.automaticallyPublishesNowPlayingInfo = true
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
@@ -101,8 +93,6 @@ final class AudioAVPlayerHost {
     func load(url: URL, startPosition: Double?, httpHeaders: [String: String]) async throws {
         // Clean prior observers before swapping in a new item so a back-to-back load() doesn't leak or double-fire.
         teardownObservers()
-        loadGeneration &+= 1
-        let myGeneration = loadGeneration
 
         let asset: AVURLAsset
         if httpHeaders.isEmpty {
@@ -110,24 +100,14 @@ final class AudioAVPlayerHost {
         } else {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
-        // Play through an audio-only AVMutableComposition, not the raw asset. The composition carries NO metadata,
-        // so neither AVPlayer nor MediaPlayer's now-playing machinery can reach the asset's embedded cover art. A
-        // Jellyfin FLAC/MP3 with a corrupt embedded picture (FLAC METADATA_BLOCK_PICTURE, surfaced as common
-        // metadata, not a track) otherwise gets harvested + decoded as a still image when we set nowPlayingInfo,
-        // which decodes the corrupt PNG ("Error -17102") on MediaPlayer's serial queue and trips
-        // dispatch_assert_queue_fail. The composition references the remote audio track and streams it; we supply
-        // title/artist/album/artwork ourselves via setNowPlayingInfo. Falls back to the raw asset if the audio
-        // track can't be resolved (e.g. an indefinite/live source), preserving prior behavior.
-        let item = await makeAudioOnlyItem(from: asset) ?? AVPlayerItem(asset: asset)
-        // A newer load() may have started during the async track load above; if so, abandon this one before it
-        // touches the shared AVPlayer, so it can't clobber its successor's item.
-        guard myGeneration == loadGeneration else {
-            EngineLog.emit("[AudioAVPlayerHost] load superseded mid-build (gen \(myGeneration) != \(loadGeneration)), abandoning", category: .swPlayback)
-            return
-        }
+        let item = AVPlayerItem(asset: asset)
         // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
+        #endif
+        // Stamp the per-item Now-Playing dict the auto-publishing session reads (iOS/tvOS 16+). Replays across swaps.
+        #if os(iOS) || os(tvOS)
+        item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         #endif
         playerItem = item
 
@@ -168,13 +148,10 @@ final class AudioAVPlayerHost {
                     }
                     self.duration = resolved
                     self.isReady = true
-                    // Belt-and-suspenders: if a container exposes the embedded cover as a still-image VIDEO track
-                    // (some MP4/M4A), disable it so nothing decodes it on the audio path. FLAC/MP3 embedded pictures
-                    // usually arrive as common metadata (no track here), which auto-publish-off already covers.
+                    // Belt-and-suspenders for the M4A/MP4 shape that exposes the cover as a still-image VIDEO track:
+                    // disable it so AVPlayer never decodes it. FLAC/MP3 embedded pictures arrive as common metadata
+                    // (no track here, tracks=1) and are handled by supplying our own artwork on item.nowPlayingInfo.
                     self.disableEmbeddedImageTracks(on: item)
-                    // Now that the item is bound + ready, publish the staged Now-Playing entry (writes were gated
-                    // off during the swap to avoid the MediaPlayer serial-queue assertion).
-                    self.publishNowPlaying()
                     if let seek = self.pendingSeek {
                         self.pendingSeek = nil
                         await self.avPlayer.seek(
@@ -210,7 +187,8 @@ final class AudioAVPlayerHost {
             }
         }
 
-        // currentTime mirror at 4 Hz (matches AudioPlaybackHost's 250 ms).
+        // currentTime mirror at 4 Hz (matches AudioPlaybackHost's 250 ms). The auto-publishing session derives the
+        // system scrubber/elapsed from the player itself, so we only mirror our own published clock here.
         timeObserver = avPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
@@ -218,10 +196,7 @@ final class AudioAVPlayerHost {
             let seconds = CMTimeGetSeconds(time)
             guard seconds.isFinite, seconds >= 0 else { return }
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.currentTime = seconds
-                // Auto-publish is off: keep the system scrubber live ourselves (light patch, no artwork re-ship).
-                self.refreshNowPlayingTiming()
+                self?.currentTime = seconds
             }
         }
 
@@ -250,36 +225,8 @@ final class AudioAVPlayerHost {
         }
 
         avPlayer.replaceCurrentItem(with: item)
-        // Do NOT publish Now-Playing here: the item is still binding and not yet ready, and writing the session
-        // center mid-swap trips dispatch_assert_queue_fail. The readyToPlay edge publishes the first entry.
         // No auto-play: the engine calls play() after load(), mirroring
         // AudioPlaybackHost.
-    }
-
-    /// Build an audio-only AVPlayerItem from a composition containing just the asset's audio track, so the played
-    /// item carries no embedded artwork for the now-playing machinery to harvest/decode. Returns nil (caller falls
-    /// back to the raw asset) if no audio track or a usable duration can be resolved.
-    private func makeAudioOnlyItem(from asset: AVURLAsset) async -> AVPlayerItem? {
-        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
-              let duration = try? await asset.load(.duration),
-              duration.isNumeric, duration.seconds > 0 else {
-            EngineLog.emit("[AudioAVPlayerHost] audio-only item: no audio track / duration, using raw asset", category: .swPlayback)
-            return nil
-        }
-        let composition = AVMutableComposition()
-        guard let compTrack = composition.addMutableTrack(
-            withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else {
-            return nil
-        }
-        do {
-            try compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: audioTrack, at: .zero)
-        } catch {
-            EngineLog.emit("[AudioAVPlayerHost] audio-only item: insert failed (\(error.localizedDescription)), using raw asset", category: .swPlayback)
-            return nil
-        }
-        EngineLog.emit("[AudioAVPlayerHost] audio-only item built (stripped embedded artwork), dur=\(String(format: "%.1fs", duration.seconds))", category: .swPlayback)
-        return AVPlayerItem(asset: composition)
     }
 
     /// Disable any embedded still-image presented as a video track (e.g. MP4/M4A cover art), so the audio path never
@@ -292,7 +239,7 @@ final class AudioAVPlayerHost {
             disabled += 1
         }
         EngineLog.emit(
-            "[AudioAVPlayerHost] tracks=\(item.tracks.count) disabledImageTracks=\(disabled) autoPublish=off",
+            "[AudioAVPlayerHost] tracks=\(item.tracks.count) disabledImageTracks=\(disabled) autoPublish=on",
             category: .swPlayback
         )
         #endif
@@ -308,52 +255,15 @@ final class AudioAVPlayerHost {
         #endif
     }
 
-    /// Stage the Now-Playing metadata (title/artist/album + the host's force-decoded artwork) and publish it. The
-    /// host supplies it; we append the player-derived elapsed/rate/duration in publishNowPlaying. Pass an empty
-    /// dict to clear. Auto-publish is off (see init), so we write the session's OWN center, never the shared default.
+    /// Stage the per-item Now-Playing dictionary (current and subsequent items). The auto-publishing session merges
+    /// these keys with the player's elapsed/rate/duration. Pass an empty dict to clear. Writing the per-item
+    /// AVPlayerItem.nowPlayingInfo property is the documented, queue-safe channel (no MPNowPlayingInfoCenter write).
     #if os(iOS) || os(tvOS)
     func setNowPlayingInfo(_ info: [String: Any]) {
         pendingNowPlayingInfo = info
-        publishNowPlaying()
+        playerItem?.nowPlayingInfo = info.isEmpty ? nil : info
     }
     #endif
-
-    /// Publish the full Now-Playing entry (metadata + current elapsed/rate/duration) to the session's own center.
-    /// MainActor-pinned (the host is @MainActor); never touches MPNowPlayingInfoCenter.default(). Clears on empty.
-    ///
-    /// Gated on `isReady`: writing the center while replaceCurrentItem is still binding the new item (the window
-    /// that widens on a slow/remote source, e.g. a second track from an external server) trips
-    /// dispatch_assert_queue_fail in MediaPlayer's setter. So all writes wait until the item is bound + ready; the
-    /// readyToPlay edge fires the first publish, and play/pause/seek/periodic refresh follow once ready. An empty
-    /// dict (clear) always goes through, even pre-ready, since clearing the entry can't collide with item binding.
-    private func publishNowPlaying() {
-        #if os(iOS) || os(tvOS)
-        guard !pendingNowPlayingInfo.isEmpty else {
-            nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = nil
-            return
-        }
-        guard isReady else { return }
-        var info = pendingNowPlayingInfo
-        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
-        info[MPNowPlayingInfoPropertyPlaybackRate] = rate
-        nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = info
-        #endif
-    }
-
-    /// Light refresh: patch only elapsed/rate/duration on the existing entry (no artwork re-ship). Driven by the
-    /// 4 Hz time observer so the scrubber moves and a pause publishes rate 0. No-op until the first full publish
-    /// (and pre-ready, matching publishNowPlaying's gate).
-    private func refreshNowPlayingTiming() {
-        #if os(iOS) || os(tvOS)
-        guard isReady, !pendingNowPlayingInfo.isEmpty,
-              var info = nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo else { return }
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
-        info[MPNowPlayingInfoPropertyPlaybackRate] = rate
-        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
-        nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = info
-        #endif
-    }
 
     func play() {
         avPlayer.play()
@@ -362,14 +272,11 @@ final class AudioAVPlayerHost {
             avPlayer.rate = lastRate
         }
         rate = lastRate
-        // Auto-publish is off: publish the rate change so the play button / scrubber reflect it (esp. on resume).
-        publishNowPlaying()
     }
 
     func pause() {
         avPlayer.pause()
         rate = 0
-        publishNowPlaying()
     }
 
     func setRate(_ newRate: Float) {
@@ -378,7 +285,6 @@ final class AudioAVPlayerHost {
             avPlayer.rate = newRate
         }
         rate = newRate
-        publishNowPlaying()
     }
 
     func seek(to seconds: Double) async {
@@ -388,7 +294,6 @@ final class AudioAVPlayerHost {
             toleranceAfter: .zero
         )
         currentTime = seconds
-        publishNowPlaying()
     }
 
     func stop() {
@@ -397,12 +302,10 @@ final class AudioAVPlayerHost {
         avPlayer.replaceCurrentItem(with: nil)
         isReady = false
         playerItem = nil
-        // Auto-publish is off, so the system no longer clears the entry on item teardown: do it explicitly here, or
-        // the Home / Control-Center Now-Playing card lingers after stop. (Self-contained: the host's clearNowPlayingInfo
-        // can't reach the session center once audioAVPlayerActive has flipped to false.)
+        // Clear the staged dict so the next track starts clean; the auto-publishing session drops the Now-Playing
+        // entry when the player has no current item.
         #if os(iOS) || os(tvOS)
         pendingNowPlayingInfo = [:]
-        nowPlayingSession.nowPlayingInfoCenter.nowPlayingInfo = nil
         #endif
         // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before
         // host.load) don't replay them: stale didReachEnd=true fired .idle mid-load (double-skip on auto-advance
