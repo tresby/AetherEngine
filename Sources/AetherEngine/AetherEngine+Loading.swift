@@ -120,7 +120,10 @@ extension AetherEngine {
                   startPosition: nil,
                   perFrameHDR: true,
                   skipInitialSeek: true,
-                  forwardBufferDuration: 0)
+                  forwardBufferDuration: 0,
+                  // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
+                  // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
+                  surfaceEndFailures: true)
 
         // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.

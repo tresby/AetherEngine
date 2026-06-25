@@ -62,6 +62,14 @@ final class NativeAVPlayerHost {
     private var notificationObservers: [NSObjectProtocol] = []
     private var accessLogCount = 0
 
+    /// When true, AVPlayer's `failedToPlayToEndTime` (it gave up: rate 0, no more data) routes into the
+    /// deferred-failure confirmation instead of being log-only. Set only on the lean remote-HLS live path,
+    /// which has no loopback live-reopen / readiness watchdog to recover or surface a dead upstream. Reported
+    /// live-IPTV death: segments started 404ing after the initial buffer, AVPlayer fired failedToPlayToEnd and
+    /// parked at rate 0, but `item.status` stayed `readyToPlay`, so the `.failed` KVO never fired and the host
+    /// never learned playback died. The loopback/VOD path keeps log-only (it owns its own reopen machinery).
+    private var surfaceEndFailures = false
+
     /// Monotonic counter tags every load() invocation so multi-attempt sessions produce distinguishable log lines.
     private static var nextSessionID: Int = 0
     private var sessionID: Int = 0
@@ -85,9 +93,10 @@ final class NativeAVPlayerHost {
     // MARK: - Lifecycle
 
     /// Load the loopback HLS-fMP4 URL into AVPlayer. DisplayCriteriaController.apply must run first so the HDR pipeline is configured before the first segment fetch.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false) {
         unloadCurrentItem()
 
+        self.surfaceEndFailures = surfaceEndFailures
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -288,10 +297,25 @@ final class NativeAVPlayerHost {
             forName: AVPlayerItem.failedToPlayToEndTimeNotification,
             object: item,
             queue: .main
-        ) { notification in
+        ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
             let suffix = err.map { " \($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) failedToPlayToEndTime\(suffix)", category: .engine)
+            // Capture only Sendable values (sid: Int, desc: String) across the actor hop; reach the item via
+            // self.playerItem on the main actor (the notification/item are non-Sendable). The sid==sessionID
+            // guard rejects a stale notification from a since-replaced session.
+            let desc = err?.localizedDescription
+                ?? "The live stream stopped (the source could not continue)."
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                guard let self = self, self.surfaceEndFailures, self.sessionID == sid,
+                      let current = self.playerItem else { return }
+                // AVPlayer gave up on this item (rate 0, no more segments) and `.failed` may never fire
+                // (item.status can stay readyToPlay). Route into the same deferred confirmation as a .failed
+                // KVO: a transient that resumes within the window self-clears; a dead upstream (live IPTV
+                // token expiry, persistent segment 404) surfaces .error so the host can retune / show it.
+                self.handleItemFailed(desc, item: current)
+            }
         }
         notificationObservers.append(failedToEndObs)
 
@@ -376,6 +400,18 @@ final class NativeAVPlayerHost {
 
     // MARK: - Failure handling
 
+    /// Shared deferred-failure resolution: after the confirm window, surface a terminal failure only if the
+    /// player neither resumed playing nor advanced the clock past `threshold`. Pure so the `.failed` KVO and
+    /// the live `failedToPlayToEndTime` routing share one recovery contract (a self-healing transient that
+    /// resumes within the window must never surface, a frozen player must).
+    nonisolated static func shouldSurfaceDeferredFailure(
+        isPlaying: Bool, clockAtFailure: Double, clockNow: Double, threshold: Double = 0.5
+    ) -> Bool {
+        if isPlaying { return false }
+        if clockNow > clockAtFailure + threshold { return false }
+        return true
+    }
+
     /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
     /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
     /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
@@ -406,14 +442,11 @@ final class NativeAVPlayerHost {
                   self.failureConfirmToken == token,
                   self.playerItem === item else { return }
             let advanced = self.renderedTime > clockAtFailure + 0.5
-            if self.avPlayer.timeControlStatus == .playing || advanced {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
-                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
-                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
-                    category: .engine
-                )
-            } else {
+            if Self.shouldSurfaceDeferredFailure(
+                isPlaying: self.avPlayer.timeControlStatus == .playing,
+                clockAtFailure: clockAtFailure,
+                clockNow: self.renderedTime
+            ) {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: player stopped "
                     + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
@@ -421,6 +454,13 @@ final class NativeAVPlayerHost {
                     category: .engine
                 )
                 self.failureMessage = desc
+            } else {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
+                    category: .engine
+                )
             }
         }
     }
