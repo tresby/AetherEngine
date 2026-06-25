@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.0.6] — 2026-06-25
+
+### Fixed
+
+- **DTS-HD Master Audio on a Blu-ray (MPEG-TS / M2TS) played silent (#64).** The bundled FFmpeg build (FFmpegBuild) enables a minimal parser allow-list, and it was missing the `dca` parser. On a byte-stream container the demuxer needs a codec's parser to assemble a complete frame; without `dca`, the MPEG-TS demuxer handed the decoder the DTS core (`0x7FFE8001`) and the following DTS-HD extension substream (`0x64582025`) as two separate packets, so every extension frame was rejected with "Residual encoded channels are present without core" and the track was silent. Matroska was unaffected because its blocks are already whole frames (only the `.m2ts` path was silent), which is why the same disc remuxed to MKV, or its audio extracted with `ffmpeg -c copy`, decoded fine. Fixed by bumping to FFmpegBuild 1.0.3, which enables `dca` and, in the same pass, the other parsers missing for already-bundled decoders: `mlp` (TrueHD/MLP), `vc1` (VC-1 video), and `dvbsub` / `dvdsub` (DVB and DVD bitmap subtitles), so the same framing class cannot bite TrueHD or VC-1 on M2TS either. No engine code change.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.6))
+
 ## [4.0.5] — 2026-06-25
 
 ### Fixed
