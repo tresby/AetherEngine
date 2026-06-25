@@ -9,8 +9,10 @@ final class DiscReaderTests: XCTestCase {
             .init(name: "VTS_01_1.VOB", length: 2048),          // main title, 1 sector filled
         ])
         let wrapped = try DiscReader.wrap(DataIOReader(data: data))
-        let (reader, hint) = try XCTUnwrap(wrapped)
-        XCTAssertEqual(hint, "mpeg")
+        let info = try XCTUnwrap(wrapped)
+        let reader = info.reader
+        XCTAssertEqual(info.formatHint, "mpeg")
+        XCTAssertEqual(info.titles.count, 1)  // DVD: one title until IFO enumeration lands
         // First bytes must be the MPEG-PS pack-start code 00 00 01 BA written by the fixture.
         var buf = [UInt8](repeating: 0, count: 4)
         let n = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 4) }

@@ -23,10 +23,12 @@ final class BDDiscReaderTests: XCTestCase {
     }
 
     func test_wrapReturnsMpegtsConcatForBD() throws {
-        let (reader, hint) = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage())))
-        XCTAssertEqual(hint, "mpegts")
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage())))
+        XCTAssertEqual(info.formatHint, "mpegts")
+        XCTAssertEqual(info.titles.count, 1)  // single-playlist fixture -> one title
+        XCTAssertEqual(info.selectedTitleIndex, 0)
         var buf = [UInt8](repeating: 0, count: 5)
-        _ = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 5) }
+        _ = buf.withUnsafeMutableBufferPointer { info.reader.read($0.baseAddress, size: 5) }
         XCTAssertEqual(buf, [0x00,0x00,0x00,0x00,0x47])
     }
 

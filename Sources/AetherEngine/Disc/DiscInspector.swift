@@ -122,9 +122,9 @@ enum DiscInspector {
         }()
 
         // What the real playback path decides for the same image.
-        if let (_, hint) = (try? DiscReader.wrap(reader)) ?? nil {
+        if let discInfo = (try? DiscReader.wrap(reader)) ?? nil {
             d.wrapRecognized = true
-            d.wrapFormatHint = hint
+            d.wrapFormatHint = discInfo.formatHint
         }
         return d
     }

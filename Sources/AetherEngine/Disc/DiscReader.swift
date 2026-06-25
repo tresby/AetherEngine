@@ -24,11 +24,12 @@ enum DiscReader {
         return n == 2 && (Int(buf[0]) | (Int(buf[1]) << 8)) == 2
     }
 
-    /// Blu-ray: UDF filesystem with a BDMV directory. Returns (concatReader, "mpegts").
+    /// Blu-ray: UDF filesystem with a BDMV directory. Enumerates every playlist as a selectable
+    /// title and builds the concat reader for the chosen one (`selectTitleID`, default = main).
     /// Emits `.demux` diagnostics once the UDF anchor is confirmed so a disc image
     /// that fails recognition is debuggable (it would otherwise fall back to a raw
     /// FFmpeg open that reports a bare INVALIDDATA). Non-disc sources stay silent.
-    static func wrapBluRay(_ reader: IOReader) throws -> (IOReader, String)? {
+    static func wrapBluRay(_ reader: IOReader, selectTitleID: Int? = nil) throws -> DiscInfo? {
         guard looksLikeUDF(reader) else { return nil }
         EngineLog.emit("[disc] UDF anchor present; attempting Blu-ray BDMV", category: .demux)
         let udf: UDFReader
@@ -51,24 +52,28 @@ enum DiscReader {
             let bytes = readAll(reader, exts)
             if let pl = MPLSParser.parse(bytes) { parsed.append(pl) }
         }
-        guard let title = BDTitleSelector.selectMainTitle(parsed) else {
+        let titles = BDTitleSelector.enumerateTitles(parsed)
+        guard !titles.isEmpty else {
             EngineLog.emit("[disc] BDMV present but no parseable .mpls (\(playlistDir.count) PLAYLIST entries, \(parsed.count) parsed); cannot select a title", category: .demux)
             return nil
         }
+        let selectedIndex = selectTitleID.flatMap { titles.indices.contains($0) ? $0 : nil } ?? 0
+        let selected = titles[selectedIndex]
         let streamDir = (try? udf.list(path: ["BDMV", "STREAM"])) ?? []
         var allExtents: [(offset: Int64, length: Int64)] = []
-        for clip in title.clipIDs {
+        for clip in selected.bdClipIDs ?? [] {
             guard let e = streamDir.first(where: { $0.name == "\(clip).m2ts" }),
                   let exts = try? udf.extents(of: e) else { continue }
             allExtents += exts
         }
         guard !allExtents.isEmpty else {
-            EngineLog.emit("[disc] selected title clips=\(title.clipIDs) but resolved no m2ts extents in BDMV/STREAM (\(streamDir.count) entries); cannot build stream", category: .demux)
+            EngineLog.emit("[disc] selected title \(selectedIndex) clips=\(selected.bdClipIDs ?? []) but resolved no m2ts extents in BDMV/STREAM (\(streamDir.count) entries); cannot build stream", category: .demux)
             return nil
         }
         let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
-        EngineLog.emit("[disc] Blu-ray recognized: title clips=\(title.clipIDs) m2ts-extents=\(allExtents.count) bytes=\(totalBytes)", category: .demux)
-        return (ConcatIOReader(base: reader, extents: allExtents), "mpegts")
+        EngineLog.emit("[disc] Blu-ray recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) m2ts-extents=\(allExtents.count) bytes=\(totalBytes)", category: .demux)
+        return DiscInfo(reader: ConcatIOReader(base: reader, extents: allExtents),
+                        formatHint: "mpegts", titles: titles, selectedTitleIndex: selectedIndex)
     }
 
     /// Read all bytes of an extent list into memory (small files only: mpls).
@@ -92,26 +97,31 @@ enum DiscReader {
         return out
     }
 
-    /// Returns `(syntheticReader, formatHint)` for a DVD or Blu-ray ISO, else nil.
-    static func wrap(_ reader: IOReader) throws -> (IOReader, String)? {
-        guard looksLikeISO9660(reader) else { return try wrapBluRay(reader) }
+    /// Returns a `DiscInfo` (selected-title reader + format hint + the full title list) for a DVD or
+    /// Blu-ray ISO, else nil. `selectTitleID` chooses the title (default = main). DVD title
+    /// enumeration is the VOB-size heuristic for now (one title); IFO-based enumeration is a follow-up.
+    static func wrap(_ reader: IOReader, selectTitleID: Int? = nil) throws -> DiscInfo? {
+        guard looksLikeISO9660(reader) else { return try wrapBluRay(reader, selectTitleID: selectTitleID) }
         let iso: ISO9660Reader
         do {
             iso = try ISO9660Reader(reader: reader)
         } catch DiscError.notISO9660 {
-            return try wrapBluRay(reader)
+            return try wrapBluRay(reader, selectTitleID: selectTitleID)
         }
         let files: [DiscFile]
         do {
             files = try iso.list(directory: "VIDEO_TS")
         } catch DiscError.directoryNotFound {
-            return try wrapBluRay(reader)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
+            return try wrapBluRay(reader, selectTitleID: selectTitleID)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
         }
         let titleVOBs = DVDTitleSelector.selectMainTitleVOBs(files)
-        guard !titleVOBs.isEmpty else { return try wrapBluRay(reader) }
+        guard !titleVOBs.isEmpty else { return try wrapBluRay(reader, selectTitleID: selectTitleID) }
         let extents = titleVOBs.map {
             (offset: Int64($0.startSector * iso.sectorSize), length: Int64($0.length))
         }
-        return (ConcatIOReader(base: reader, extents: extents), "mpeg")
+        // One DVD title for now (duration unknown without IFO; filled by the IFO follow-up).
+        let titles = [DiscTitle(id: 0, durationTicks: 0)]
+        return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
+                        formatHint: "mpeg", titles: titles, selectedTitleIndex: 0)
     }
 }

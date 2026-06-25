@@ -69,23 +69,43 @@ public final class Demuxer: @unchecked Sendable {
         (avioProvider as? AVIOReader)?.lastUnplannedReconnectAt
     }
 
+    // MARK: - Disc titles / chapters (#67)
+
+    private(set) var discTitles: [DiscTitle] = []
+    private(set) var selectedDiscTitleIndex: Int = 0
+
+    private func adoptDiscInfo(_ info: DiscInfo) {
+        discTitles = info.titles
+        selectedDiscTitleIndex = info.selectedTitleIndex
+    }
+
+    /// The disc's titles mapped to the public model (empty for non-disc sources).
+    func discTitleInfos() -> [TitleInfo] { discTitles.map { $0.titleInfo() } }
+    /// Chapters of the currently selected title (empty until BD/DVD chapters are populated).
+    func discChapterInfos() -> [ChapterInfo] { discTitles.chapterInfos(selectedIndex: selectedDiscTitleIndex) }
+    /// The id of the selected title, or nil for a non-disc source.
+    var selectedDiscTitleID: Int? {
+        discTitles.indices.contains(selectedDiscTitleIndex) ? discTitles[selectedDiscTitleIndex].id : nil
+    }
+
     /// Open a media URL and probe its streams.
     /// - Parameters:
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
     ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
+    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
+            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive, selectTitleID: selectTitleID)
         } else {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
             if url.isFileURL, let fileReader = FileIOReader(url: url),
-               let (discReader, discHint) = try DiscReader.wrap(fileReader) {
-                let bridge = CustomIOReaderBridge(reader: discReader)
-                let inputFormat = av_find_input_format(discHint)
+               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID) {
+                adoptDiscInfo(discInfo)
+                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
                 return
             }
@@ -119,11 +139,12 @@ public final class Demuxer: @unchecked Sendable {
     /// no filename is available. `isLive` suppresses SEEK_END that latches EOF
     /// on forward-only readers (38ad60b). AetherEngine#36: DiscReader adapts
     /// DVD/BD ISOs to VOB/MPEGTS concat streams.
-    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
+    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
-        if let (discReader, discHint) = try DiscReader.wrap(reader) {
-            let bridge = CustomIOReaderBridge(reader: discReader)
-            let inputFormat = av_find_input_format(discHint)
+        if let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID) {
+            adoptDiscInfo(discInfo)
+            let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+            let inputFormat = av_find_input_format(discInfo.formatHint)
             try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
             return
         }
@@ -138,16 +159,17 @@ public final class Demuxer: @unchecked Sendable {
         ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
     }
 
-    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false) throws {
+    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false, selectTitleID: Int? = nil) throws {
         // A remote disc image goes through the same disc adapter as a local ISO (a raw .iso handed
         // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url),
            let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
-            if let (wrapped, discHint) = try DiscReader.wrap(discReader) {
-                let bridge = CustomIOReaderBridge(reader: wrapped)
-                let inputFormat = av_find_input_format(discHint)
+            if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID) {
+                adoptDiscInfo(discInfo)
+                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
                 return
             }
