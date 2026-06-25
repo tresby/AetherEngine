@@ -98,8 +98,8 @@ enum DiscReader {
     }
 
     /// Returns a `DiscInfo` (selected-title reader + format hint + the full title list) for a DVD or
-    /// Blu-ray ISO, else nil. `selectTitleID` chooses the title (default = main). DVD title
-    /// enumeration is the VOB-size heuristic for now (one title); IFO-based enumeration is a follow-up.
+    /// Blu-ray ISO, else nil. `selectTitleID` chooses the title (default = main). DVD titles are the
+    /// per-VTS VOB groups, filtered by the VMGI TT_SRPT title list (whole-VTS; per-cell splitting deferred).
     static func wrap(_ reader: IOReader, selectTitleID: Int? = nil) throws -> DiscInfo? {
         guard looksLikeISO9660(reader) else { return try wrapBluRay(reader, selectTitleID: selectTitleID) }
         let iso: ISO9660Reader
@@ -114,14 +114,31 @@ enum DiscReader {
         } catch DiscError.directoryNotFound {
             return try wrapBluRay(reader, selectTitleID: selectTitleID)  // ISO9660 but not a DVD-Video disc (Blu-ray / data disc)
         }
-        let titleVOBs = DVDTitleSelector.selectMainTitleVOBs(files)
-        guard !titleVOBs.isEmpty else { return try wrapBluRay(reader, selectTitleID: selectTitleID) }
-        let extents = titleVOBs.map {
+        let groups = DVDTitleSelector.enumerateTitleVOBGroups(files)
+        guard !groups.isEmpty else { return try wrapBluRay(reader, selectTitleID: selectTitleID) }
+        // VIDEO_TS.IFO's TT_SRPT names which title sets are real titles; filter the VOB groups to those so
+        // incidental content VTS are excluded. Any parse failure (or a filter that would empty the list)
+        // falls back to the full VOB-grouped set, so a disc with an unreadable VMGI still plays multi-title.
+        var orderedGroups = groups
+        if let ifoFile = files.first(where: { $0.name.uppercased() == "VIDEO_TS.IFO" }) {
+            let ifoBytes = readAll(reader, [(offset: Int64(ifoFile.startSector * iso.sectorSize),
+                                             length: Int64(ifoFile.length))])
+            if let ifoTitles = DVDIFOParser.parseTitles(ifoBytes) {
+                let titleVTSNs = Set(ifoTitles.map(\.vtsn))
+                let filtered = groups.filter { titleVTSNs.contains($0.vtsn) }
+                if !filtered.isEmpty { orderedGroups = filtered }
+            }
+        }
+        let selectedIndex = selectTitleID.flatMap { orderedGroups.indices.contains($0) ? $0 : nil } ?? 0
+        let extents = orderedGroups[selectedIndex].vobs.map {
             (offset: Int64($0.startSector * iso.sectorSize), length: Int64($0.length))
         }
-        // One DVD title for now (duration unknown without IFO; filled by the IFO follow-up).
-        let titles = [DiscTitle(id: 0, durationTicks: 0)]
+        // Whole-VTS titles; duration is unknown without PGC parsing (a follow-up). dvdVTSN keeps the
+        // title -> title-set mapping for that later chapter/duration work.
+        let titles = orderedGroups.enumerated().map { idx, g in
+            DiscTitle(id: idx, durationTicks: 0, dvdVTSN: g.vtsn)
+        }
         return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
-                        formatHint: "mpeg", titles: titles, selectedTitleIndex: 0)
+                        formatHint: "mpeg", titles: titles, selectedTitleIndex: selectedIndex)
     }
 }

@@ -1,22 +1,31 @@
 import Foundation
 
-/// Selects DVD-Video main title without IFO parsing. VTS_nn_0.VOB = menus;
-/// VTS_nn_1..9.VOB = content. Main title = largest total content VOB size.
+/// Groups DVD-Video content VOBs into per-title-set (VTS) titles without needing IFO parsing.
+/// VTS_nn_0.VOB = menus; VTS_nn_1..9.VOB = content. Titles are ordered largest-first (total content
+/// VOB size, a proxy for duration) so id 0 is the main feature, matching the Blu-ray convention.
 enum DVDTitleSelector {
-    static func selectMainTitleVOBs(_ files: [DiscFile]) -> [DiscFile] {
+    /// One selectable title = one VTS's content VOBs (whole-VTS resolution; per-cell/episodic splitting
+    /// is deferred). VOBs within a title are ordered by part; titles are ordered by total size, largest first.
+    static func enumerateTitleVOBGroups(_ files: [DiscFile]) -> [(vtsn: Int, vobs: [DiscFile])] {
         struct Part { let title: Int; let part: Int; let file: DiscFile }
         var parts: [Part] = []
         for f in files {
             guard let (title, part) = parseVOBName(f.name), part >= 1 else { continue }
             parts.append(Part(title: title, part: part, file: f))
         }
-        guard !parts.isEmpty else { return [] }
         let byTitle = Dictionary(grouping: parts, by: \.title)
-        let winner = byTitle.max { a, b in
-            a.value.reduce(0) { $0 + $1.file.length } < b.value.reduce(0) { $0 + $1.file.length }
-        }
-        guard let parts = winner?.value else { return [] }
-        return parts.sorted { $0.part < $1.part }.map(\.file)
+        return byTitle
+            .map { vtsn, ps in (vtsn: vtsn, vobs: ps.sorted { $0.part < $1.part }.map(\.file)) }
+            .sorted { a, b in
+                let sa = a.vobs.reduce(0) { $0 + $1.length }
+                let sb = b.vobs.reduce(0) { $0 + $1.length }
+                // Tie-break on VTS number so the order is deterministic for equal-size groups.
+                return sa != sb ? sa > sb : a.vtsn < b.vtsn
+            }
+    }
+
+    static func selectMainTitleVOBs(_ files: [DiscFile]) -> [DiscFile] {
+        enumerateTitleVOBGroups(files).first?.vobs ?? []
     }
 
     /// Parse "VTS_NN_P.VOB" -> (title NN, part P). Case-insensitive.
