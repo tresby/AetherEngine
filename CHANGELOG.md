@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.4.0] — 2026-06-26
+
+### Added
+
+- **First-frame subtitle selection by language preference (#73).** A host with a saved subtitle-language preference had to read the post-load `subtitleTracks` and language-match `selectSubtitleTrack` itself. New `LoadOptions.preferredSubtitleLanguages` (ordered; ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`; default empty) lets the engine activate the first subtitle track whose language matches a preference (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms) at the end of a successful load, mirroring the audio twin (`preferredAudioLanguages`, #72). No match leaves subtitles off (the default). The host-overlay path is used (equivalent to a `selectSubtitleTrack` call), the resolved track is published via the new `activeSubtitleTrackIndex` (parity with `activeAudioTrackIndex` so a picker reflects it), and the side demuxer is anchored at the resume position (clamped to the probe duration) instead of byte 0. Unlike `preferredAudioLanguages` (whose track is muxed into the loopback HLS at the first frame, so a late pick forces a pre-probe or reload), this is pure convenience: subtitles are activated post-load by a side demuxer at no reload or pre-probe cost, so it only spares a host from language-matching `subtitleTracks` itself. Independent of `prepareNativeSubtitles`, whose default selection stays host-driven via `setNativeSubtitleSelected`. Empty preferences is a behavioral no-op, so nothing changes until a host opts in. The audio half of #73 already shipped in 4.3.0. Thanks to reckloon for the request.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.4.0))
+
 ## [4.3.0] — 2026-06-26
 
 ### Added
