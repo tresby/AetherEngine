@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.2.3] — 2026-06-26
+
+### Fixed
+
+- **Redundant open-time size probe on remote HTTP sources (#70).** `AVIOReader.open()` fired a dedicated `probeFileSize()` round-trip (a `Range: bytes=0-0` GET, falling back to HEAD) before opening the real data connection, even though that connection's own `Range: bytes=0-` request returns a 206 whose `Content-Range` already carries the total. On origins that omit a length for `bytes=0-0` the probe also paid a second HEAD round-trip, and that HEAD was the request some origins rate-limited (429), dropping an otherwise-fine source into seekless streaming mode. The playback path now derives the size from the first data connection's response (206 `Content-Range`, or `Content-Length` on a from-0 2xx), so the common case skips the probe entirely; live skips it too (its result was discarded anyway and it burned the Range timeout on transcode endpoints that reject Range). When the data connection resolves no size (a genuinely length-less origin, a transient 429, slow response headers, or a length only reachable via HEAD), the open falls back to the exact prior probe path on a separate connection and budget, so seekability is preserved whenever a size is reachable and only a truly length-less source streams. The size is now folded in under the connection's existing lock, and the remaining still-extraction probe switches `bytes=0-0` to `bytes=0-` for the same one-shot win. Thanks to reckloon for the diagnosis and the confirmed `bytes=0-` probe shape.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.3))
+
 ## [4.2.2] — 2026-06-26
 
 ### Fixed
