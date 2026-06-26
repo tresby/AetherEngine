@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.2.2] — 2026-06-26
+
+### Fixed
+
+- **Loopback-HLS VOD scrub-burst livelock (#65).** A sustained bidirectional scrub burst on the native (loopback-HLS) direct-play path could deadlock playback: the engine clock latched at an optimistic seek target AVPlayer never physically reached, while the segment producer parked on backpressure with no VOD watchdog. The two halves waited on each other with no recovery floor, so the picture froze 30 to 40 seconds behind the reported clock and never recovered. Two coupled fixes give the path a recovery floor. The native VOD seek await is now bounded by a cadence budget: when a seek does not land and AVPlayer is genuinely starved (no forward buffer), the engine reconciles its clock to AVPlayer's real rendered position instead of the unreachable target and re-anchors the producer there, while a slow-but-buffering seek still awaits its real landing unchanged. And the VOD backpressure park now has the watchdog the live paths always had: a consumer fetch target frozen past a threshold breaks the park and re-anchors the producer on AVPlayer's real position (a slow-but-advancing consumer never trips it, and a storm guard bounds re-anchors if AVPlayer never resumes). Thanks to rrgomes for the frame-exact trace that pinned the root cause.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.2))
+
 ## [4.2.1] — 2026-06-26
 
 ### Fixed
