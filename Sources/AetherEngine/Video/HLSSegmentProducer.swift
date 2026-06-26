@@ -301,6 +301,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private static let liveAudioGateTimeoutSeconds: TimeInterval = 5
     private var pregateAudioDropCount: Int = 0
 
+    /// #74: head-of-stream audio that arrives before the first video packet, buffered (in read order)
+    /// while the video gate is still waiting, then replayed in DTS order once it opens. Each entry owns
+    /// its AVPacket. Without this the gate dropped the entire leading second of a wide-interleave source
+    /// (audio muxed ahead of video), leaving a constant ~1 s A/V desync. Bounded by a byte cap; above it
+    /// the original drop resumes.
+    private var pregateAudioBuffer: [(UnsafeMutablePointer<AVPacket>, PacketOrigin)] = []
+    private var pregateAudioBufferBytes: Int = 0
+    private var pregateAudioReplaySorted = false
+    private var pregateAudioOverflowLogged = false
+    private static let maxPregateAudioBufferBytes = 8 * 1024 * 1024
+
     /// Wall-clock of last finalized live segment; drives no-cut stall watchdog.
     private var lastLiveSegmentFinalizeAt: Date?
     /// Cutter-wedge timeout: pump reads at full rate but finalizes no segment (hostile SSAI ad pod).
@@ -1078,6 +1089,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return packet.pointee.pts
     }
 
+    /// #74: whether a pre-video-gate audio packet should be buffered for in-DTS-order replay (instead of
+    /// dropped). Only at head-of-stream, only while the gate is still waiting, only audio, only under the
+    /// byte cap. Restart/seek producers (not head-of-stream) keep the drop: their post-gate shift-snap
+    /// already anchors the surviving audio to the video tfdt, so there is no leading-second to preserve.
+    static func shouldBufferPregateAudio(
+        isAudioPkt: Bool,
+        audioWaitForVideo: Bool,
+        isHeadOfStream: Bool,
+        bufferedBytes: Int,
+        packetSize: Int,
+        capBytes: Int
+    ) -> Bool {
+        guard isAudioPkt, audioWaitForVideo, isHeadOfStream else { return false }
+        return bufferedBytes + max(packetSize, 0) <= capBytes
+    }
+
     /// Overwrite packed side-audio timestamps with the synthesized program clock.
     /// KNOWN LIMITATION: free-running clock does NOT follow a live video rebase; A/V sync is lost from that boundary on.
     private func stampPackedSideAudio(_ packet: UnsafeMutablePointer<AVPacket>) {
@@ -1172,10 +1199,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
 
-                guard let (packet, origin) = try readNextSourcePacket() else {
-                    break readLoop
+                let packet: UnsafeMutablePointer<AVPacket>
+                let origin: PacketOrigin
+                if !audioWaitForVideo, !pregateAudioBuffer.isEmpty {
+                    // #74: once the video gate opens, drain the buffered head-of-stream audio in DTS
+                    // order before reading further source packets. These were already counted in
+                    // packetsRead when first read, so do not re-count them here.
+                    if !pregateAudioReplaySorted {
+                        pregateAudioBuffer.sort { Self.mergeOrderingTicks($0.0) < Self.mergeOrderingTicks($1.0) }
+                        pregateAudioReplaySorted = true
+                    }
+                    let entry = pregateAudioBuffer.removeFirst()
+                    packet = entry.0
+                    origin = entry.1
+                    pregateAudioBufferBytes -= Int(packet.pointee.size)
+                } else {
+                    guard let read = try readNextSourcePacket() else {
+                        break readLoop
+                    }
+                    packet = read.packet
+                    origin = read.origin
+                    packetsRead += 1
                 }
-                packetsRead += 1
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&pktPtr) }
 
@@ -1259,6 +1304,36 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             packet.pointee.pts = packet.pointee.dts
                         }
                     }
+                }
+
+                // #74: buffer head-of-stream audio that arrives before the first video packet, for
+                // in-DTS-order replay once the video gate opens (drained at the loop top), instead of
+                // dropping it at the audio gate. On wide-interleave sources the old drop discarded the
+                // entire leading second of real audio, leaving a constant ~1 s A/V desync. Bounded by a
+                // byte cap; over the cap the original gate drop below resumes. Scoped to head-of-stream
+                // (restartTargetVideoDts == min); restart producers keep the drop (post-gate shift-snap
+                // already anchors their surviving audio to the video tfdt).
+                if Self.shouldBufferPregateAudio(
+                    isAudioPkt: isAudioPkt,
+                    audioWaitForVideo: audioWaitForVideo,
+                    isHeadOfStream: restartTargetVideoDts == Int64.min,
+                    bufferedBytes: pregateAudioBufferBytes,
+                    packetSize: Int(packet.pointee.size),
+                    capBytes: Self.maxPregateAudioBufferBytes
+                ) {
+                    pregateAudioBuffer.append((packet, origin))
+                    pregateAudioBufferBytes += Int(packet.pointee.size)
+                    pktPtr = nil  // ownership moves to the buffer; freed on replay or teardown
+                    continue
+                } else if isAudioPkt, audioWaitForVideo, restartTargetVideoDts == Int64.min,
+                          !pregateAudioOverflowLogged {
+                    pregateAudioOverflowLogged = true
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] pre-gate audio buffer hit the "
+                        + "\(Self.maxPregateAudioBufferBytes)-byte cap; dropping further leading audio "
+                        + "(wide interleave beyond cap)",
+                        category: .session
+                    )
                 }
                 // Live timeline rebase: a program boundary resets source dts to a small value.
                 // Per-frame monotonic gate would bump to lastValid+1, exceed reset pts, and DROP every subsequent packet.
@@ -1965,6 +2040,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
 
         freeMergeLookaheads()
+
+        // #74: free any head-of-stream audio still buffered (e.g. the video gate never opened on a
+        // corrupt or aborted source); replayed entries were already drained at the loop top.
+        for entry in pregateAudioBuffer {
+            var pkt: UnsafeMutablePointer<AVPacket>? = entry.0
+            trackedPacketFree(&pkt)
+        }
+        pregateAudioBuffer.removeAll()
+        pregateAudioBufferBytes = 0
 
         // Flush look-behind; fallback duration produces tail-correct trun for the final fragment.
         if let prev = pendingVideoPkt {
