@@ -487,6 +487,9 @@ public final class AetherEngine: ObservableObject {
     var secondaryEmbeddedSubtitleTask: Task<Void, Never>?
     var activeSecondaryEmbeddedSubtitleStreamIndex: Int32 = -1
     var secondarySubtitleSideDemuxer: Demuxer?
+    /// Identity ("url#titleID") of the retained secondary side demuxer, so a same-source track switch
+    /// reuses it instead of re-opening (#76 part 2). nil when none is retained.
+    var secondarySubtitleSideDemuxerKey: String?
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
@@ -508,6 +511,10 @@ public final class AetherEngine: ObservableObject {
     /// Active embedded subtitle side demuxer. Registered so cancel sites can markClosed(): Task cancellation
     /// alone is only observed between readPacket calls, so a blocked AVIO reconnect would otherwise survive stop().
     var activeSubtitleSideDemuxer: Demuxer?
+    /// Identity ("url#titleID") of the retained primary side demuxer. A subtitle track switch or a seek on
+    /// the same source reuses the open demuxer (skipping the network open + find_stream_info) when this
+    /// matches the request; a new load / title switch / clear tears it down and clears the key (#76 part 2).
+    var activeSubtitleSideDemuxerKey: String?
 
     /// One entry per native mov_text track in muxer-declaration order (#55). Built from probed subtitleTracks
     /// (non-bitmap, source order) at load; sidecar entries appended at runtime. sourceStreamIndex is nil for sidecars;
@@ -1389,8 +1396,9 @@ public final class AetherEngine: ObservableObject {
                 ccCueSnapshot = []
                 closedCaptionTap?.requestReset()
             } else {
-                cancelEmbeddedSubtitleReader()
                 subtitleCues = []
+                // startEmbeddedSubtitleTask cancels + drains the prior reader, then reuses the open side demuxer
+                // and just re-seeks it to the new playhead (URL sources); no re-open on a seek (#76 part 2).
                 // Custom sources: clone the reader; skip re-arm if the reader can't produce a clone (forward-only).
                 if isCustomSource {
                     if let clone = customReader?.makeIndependentReader() {
@@ -1405,7 +1413,6 @@ public final class AetherEngine: ObservableObject {
         // Re-arm the secondary embedded subtitle track (#47).
         if activeSecondaryEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeSecondaryEmbeddedSubtitleStreamIndex
-            cancelEmbeddedSubtitleReader(channel: .secondary)
             secondarySubtitleCues = []
             if isCustomSource {
                 if let clone = customReader?.makeIndependentReader() {
