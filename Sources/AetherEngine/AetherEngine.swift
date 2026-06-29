@@ -1250,7 +1250,7 @@ public final class AetherEngine: ObservableObject {
         #if os(iOS)
         // Paused while backgrounded with no PiP: the app will idle-suspend, so release the video pipeline
         // now (wedge-safe, mirrors the unconditional background teardown). Audio backends are already spared.
-        if isBackgrounded && !pictureInPictureActive && !audioAVPlayerActive && audioHost == nil {
+        if isBackgrounded && !pictureInPictureActive && !audioAVPlayerActive && audioHost == nil && softwareHost == nil {
             Task { @MainActor in await self.teardownVideoForBackground() }
         }
         #endif
@@ -1934,18 +1934,28 @@ public final class AetherEngine: ObservableObject {
                 guard let self = self else { return }
                 #if os(iOS)
                 self.isBackgrounded = true
-                #endif
-                if self.audioAVPlayerActive || self.audioHost != nil { return }
-                #if os(iOS)
                 // Keep the video pipeline alive for PiP / background audio while the app stays running.
                 // Wedge-safe: a pause while backgrounded tears down via pause() below, so nothing crosses
                 // an idle suspension. tvOS keeps the unconditional teardown.
-                if Self.shouldKeepVideoAlive(enabled: self.backgroundPlaybackEnabled,
-                                             pipActive: self.pictureInPictureActive,
-                                             state: self.state) { return }
+                let keepAlive = Self.shouldKeepVideoAlive(enabled: self.backgroundPlaybackEnabled,
+                                                          pipActive: self.pictureInPictureActive,
+                                                          state: self.state)
+                #else
+                let keepAlive = false  // tvOS: wedge-safe unconditional teardown
                 #endif
-                guard self.state == .playing || self.state == .paused else { return }
-                await self.teardownVideoForBackground()
+                switch Self.backgroundAction(
+                    isAudioBackend: self.audioAVPlayerActive || self.audioHost != nil,
+                    hasSoftwareHost: self.softwareHost != nil,
+                    keepVideoAlive: keepAlive,
+                    state: self.state
+                ) {
+                case .doNothing:
+                    return
+                case .enterSoftwareAudioOnly:
+                    self.softwareHost?.enterBackgroundAudioOnly()
+                case .teardownVideo:
+                    await self.teardownVideoForBackground()
+                }
             }
         }
         lifecycleObservers.append(bgObserver)
@@ -1954,7 +1964,11 @@ public final class AetherEngine: ObservableObject {
             forName: UIApplication.didBecomeActiveNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.isBackgrounded = false }
+            Task { @MainActor in
+                guard let self else { return }
+                self.softwareHost?.exitBackgroundAudioOnly()
+                self.isBackgrounded = false
+            }
         }
         lifecycleObservers.append(fgObserver)
         #endif
