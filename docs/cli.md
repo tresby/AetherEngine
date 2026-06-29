@@ -10,6 +10,7 @@ swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N p
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
 swift run aetherctl audio [--seconds N] <url>   # audio-only pipeline smoke test (default 10 s)
+swift run aetherctl bgaudio <url>        # SW-path background-audio keepalive probe (iOS background behavior)
 swift run aetherctl customio <path>      # exercise the custom IOReader path end-to-end
 swift run aetherctl disc-inspect <path>  # walk a local DVD / Blu-ray ISO: titles, chapters, recognition stages
 swift run aetherctl live                 # live MPEG-TS session against the built-in fixture
@@ -21,7 +22,7 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Sixteen subcommands plus the bare-URL `serve` alias.
+Seventeen subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -81,6 +82,10 @@ leaks --atExit -- .build/debug/aetherctl extract --loops 8 <url>   # leak sweep
 ## audio
 
 Plays a source through the audio-only pipeline (default ten seconds, `--seconds N` to override) and reports which host took it (bare AVPlayer vs the FFmpeg renderer path), exercising the same dispatch a music host sees.
+
+## bgaudio
+
+Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `UIApplication` background lifecycle that normally drives it does not exist. Loads a software-routed source through the full engine, plays a foreground baseline, toggles the SW host into background-audio-only (`--fg N` foreground seconds, `--bg N` background seconds; defaults 3 / 6), then returns to foreground. Reports per-tick the audio clock, the SW video-frame count, and the process memory footprint, and a verdict. A healthy run shows the clock advancing through the background phase (audio alive), the video-frame count flat (video dropped), the footprint roughly flat (the loop paces on the audio renderer rather than buffering the rest of the file), and the video-frame count rising again on foreground return (resync at the next keyframe). The flag and counters are exposed through DEBUG-only engine hooks, so this command is unavailable in a Release build. Generate a quick software-path clip with `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`.
 
 ## customio
 
