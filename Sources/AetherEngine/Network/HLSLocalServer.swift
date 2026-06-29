@@ -912,6 +912,19 @@ final class HLSLocalServer: @unchecked Sendable {
         if let cc = provider.masterClosedCaptions {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
+        // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
+        // non-conformant for HLS). DEFAULT/AUTOSELECT=NO so the host overlay stays in fullscreen and the
+        // native track is selected only in PiP. Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        let subRenditions = provider.nativeSubtitleRenditions
+        for r in subRenditions {
+            var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
+            if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
+            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO", "URI=\"subs_\(r.ordinal).m3u8\""])
+            lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
+        }
+        if !subRenditions.isEmpty {
+            streamInfAttrs.append("SUBTITLES=\"subs\"")
+        }
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
         return lines.joined(separator: "\n") + "\n"

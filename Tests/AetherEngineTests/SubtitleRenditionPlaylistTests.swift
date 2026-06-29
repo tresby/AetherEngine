@@ -1,5 +1,19 @@
 import Testing
+import Foundation
 @testable import AetherEngine
+
+private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable {
+    let renditions: [(ordinal: Int, language: String?, name: String)]
+    init(renditions: [(ordinal: Int, language: String?, name: String)]) { self.renditions = renditions }
+    func initSegment() -> Data? { Data([0x00]) }
+    func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
+    var segmentCount: Int { 1 }
+    func segmentDuration(at index: Int) -> Double { 4.0 }
+    var playlistType: HLSPlaylistType { .vod }
+    var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
+    var masterVideoRange: HLSVideoRange? { .sdr }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { renditions }
+}
 
 struct SubtitleRenditionPlaylistTests {
     @Test("VOD subtitle media playlist is single-segment with ENDLIST")
@@ -24,5 +38,23 @@ struct SubtitleRenditionPlaylistTests {
         #expect(HLSLocalServer.parseSubsOrdinal("/subs_2.vtt") == 2)
         #expect(HLSLocalServer.parseSubsOrdinal("/subs_11.m3u8") == 11)
         #expect(HLSLocalServer.parseSubsOrdinal("/garbage") == 0)
+    }
+
+    @Test("master declares SUBTITLES rendition + group when native subs present")
+    func masterHasSubtitleRendition() {
+        let provider = MasterMockProvider(renditions: [(0, "eng", "English")])
+        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(m.contains("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\""))
+        #expect(m.contains("LANGUAGE=\"eng\""))
+        #expect(m.contains("URI=\"subs_0.m3u8\""))
+        #expect(m.contains("SUBTITLES=\"subs\""))
+    }
+
+    @Test("master omits SUBTITLES when no native subs")
+    func masterNoSubtitleRendition() {
+        let provider = MasterMockProvider(renditions: [])
+        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(!m.contains("EXT-X-MEDIA:TYPE=SUBTITLES"))
+        #expect(!m.contains("SUBTITLES=\"subs\""))
     }
 }

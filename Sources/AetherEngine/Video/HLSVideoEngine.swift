@@ -923,9 +923,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
         let panelReadyForHDR = panelIsInHDRMode
         let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
+        // #15: a SUBTITLES rendition lives only in a master. Force the master for routing-safe subtitled
+        // sources (SDR any panel, or HDR/DV on an HDR/DV panel where a master is already used) so PiP can show
+        // subtitles. HDR-on-SDR-panel and DV5-on-non-DV-panel stay media-direct (no PiP subs) to avoid
+        // -11848 / -11868; the subtitle rendition is orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
+        let routingSafeForMaster = !sourceIsHDR || panelReadyForHDR
         let useMasterPlaylist: Bool
         if dv5OnNonDVPanel {
             useMasterPlaylist = false
+        } else if hasNativeSubs && routingSafeForMaster {
+            useMasterPlaylist = true
         } else {
             useMasterPlaylist = sourceIsHDR && panelReadyForHDR
         }
