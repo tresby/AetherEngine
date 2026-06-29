@@ -539,13 +539,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
-    func nativeSubtitleVTT(ordinal: Int) -> String? {
+    /// WebVTT for one subtitle segment: the cues overlapping video segment `segmentIndex`'s [start, end) on
+    /// the AVPlayer timeline. `segments[i].startSeconds` is the absolute output-axis start (correct for both
+    /// VOD and the live sliding window, where a cumulative EXTINF sum from firstVisible would not be), so the
+    /// window is read straight off the segment plan rather than recomputed.
+    func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < nativeSubStores.count else { return nil }
-        return WebVTTBuilder.body(cues: nativeSubStores[ordinal].allCues())
-    }
-
-    func nativeSubtitleProgramDuration(ordinal: Int) -> Double {
-        guard ordinal >= 0, ordinal < nativeSubStores.count else { return 1.0 }
-        return max(1.0, nativeSubStores[ordinal].allCues().last?.end ?? 1.0)
+        stateLock.lock()
+        guard segmentIndex >= 0, segmentIndex < segments.count else {
+            stateLock.unlock()
+            return nil
+        }
+        let start = segments[segmentIndex].startSeconds
+        let end = start + segments[segmentIndex].durationSeconds
+        stateLock.unlock()
+        let cues = nativeSubStores[ordinal].cuesInWindow(start: start, end: end)
+        // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
+        // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
+        return WebVTTBuilder.segment(cues: cues, segmentStart: start)
     }
 }
