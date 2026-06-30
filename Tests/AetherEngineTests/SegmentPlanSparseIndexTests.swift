@@ -18,6 +18,9 @@ struct SegmentPlanSparseIndexTests {
     /// MPEG-TS 90 kHz video time base.
     private let ts90k = AVRational(num: 1, den: 90_000)
 
+    /// Matroska 1 kHz (millisecond) video time base.
+    private let mkvMs = AVRational(num: 1, den: 1_000)
+
     /// The reported #64 case: one keyframe at 11.609 s, nine clustered ~0.5 s apart past the 3299.8 s
     /// mid-file seek point. duration 6599 s.
     private func clusteredTSIndex() -> [Int64] {
@@ -48,6 +51,51 @@ struct SegmentPlanSparseIndexTests {
         )
         #expect(plan.first != nil)
         #expect((plan.first?.durationSeconds ?? 0) > 3000)
+    }
+
+    /// The reported #91 case: a ~64 GB remote MKV whose Cues tail read fails, so the cue prewarm
+    /// never loads the seek index. libavformat is left with only the keyframes scanned at open, all
+    /// bunched within the first few seconds. Duration 6843.872 s (#EXTINF in the field report).
+    private func bunchedMKVIndex() -> [Int64] {
+        [0, 1_000, 2_000, 3_000, 3_500]  // ms: five IRAPs inside the first 3.5 s
+    }
+
+    @Test("An MKV index bunched in the first few seconds is not trustworthy (#91)")
+    func bunchedIndexRejected() {
+        // The gaps between these keyframes are all tiny, so the inter-keyframe gap check passes; the
+        // index is still useless because it spans under one targetSegmentDuration. Coverage must reject it.
+        #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
+            keyframes: bunchedMKVIndex(),
+            videoTimeBase: mkvMs,
+            sourceDurationSeconds: 6843.872
+        ) == false)
+    }
+
+    @Test("Trusting the bunched index would have produced a single whole-file segment (#91)")
+    func bunchedIndexProducesWholeFileSegment() {
+        // Documents the exact bug the coverage guard prevents: no keyframe reaches the first 4 s segment
+        // boundary, so buildKeyframeSegmentPlan degenerates to one segment spanning the whole title, from
+        // which AVPlayer loads zero tracks (kFigAssetError_TrackNotFound).
+        let plan = HLSVideoEngine.buildKeyframeSegmentPlan(
+            keyframes: bunchedMKVIndex(),
+            videoTimeBase: mkvMs,
+            sourceDurationSeconds: 6843.872
+        )
+        #expect(plan.count == 1)
+        #expect((plan.first?.durationSeconds ?? 0) > 6000)
+    }
+
+    @Test("The minimum-coverage threshold is one targetSegmentDuration (boundary)")
+    func minimumCoverageBoundary() {
+        // Span exactly one segment is trustworthy (seg 0 can be cut); span just under is not (seg 0
+        // degenerates to the whole file). Both have a single sub-cap inter-keyframe gap, so only the
+        // coverage check decides. Pins the threshold to targetSegmentDuration (4.0 s).
+        let exactlyOneSegment: [Int64] = [0, 4_000]   // ms: 4.000 s span
+        let justUnderOneSegment: [Int64] = [0, 3_999] // ms: 3.999 s span
+        #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
+            keyframes: exactlyOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872) == true)
+        #expect(HLSVideoEngine.keyframeIndexIsTrustworthy(
+            keyframes: justUnderOneSegment, videoTimeBase: mkvMs, sourceDurationSeconds: 6843.872) == false)
     }
 
     @Test("A dense 4 s-GOP index across the whole title is trustworthy")

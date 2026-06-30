@@ -17,7 +17,7 @@ extension HLSVideoEngine {
 
     // MARK: - Segment planning
 
-    /// True when the indexed keyframe list is dense enough to trust for a keyframe-aligned plan (#64).
+    /// True when the indexed keyframe list is dense enough AND wide enough to trust for a keyframe-aligned plan (#64, #91).
     ///
     /// MPEG-TS / M2TS have no upfront keyframe table the way MKV Cues / MP4 stss do: the libavformat
     /// index holds only what `avformat_find_stream_info` plus the mid-file cue-prewarm seek happened to
@@ -25,20 +25,37 @@ extension HLSVideoEngine {
     /// handful near the seek point). `buildKeyframeSegmentPlan` would then emit a single multi-thousand-
     /// second first segment, and the `frag_custom` muxer buffers that whole span in libavformat's
     /// interleaver before its first flush, which on a 110 min Blu-ray climbed to ~13 GB of RAM and
-    /// swapped until the device disk filled. The witness is the largest gap between consecutive
-    /// keyframes: a real index never gaps more than a few GOPs (well under the cap), a clustered TS
-    /// index gaps by thousands of seconds. Such an index is routed to the uniform-stride fallback.
+    /// swapped until the device disk filled.
+    ///
+    /// Two witnesses, both required:
+    ///
+    /// - **Gap (#64)**: the largest gap between consecutive keyframes. A real index never gaps more than
+    ///   a few GOPs (well under the cap); a clustered TS index gaps by thousands of seconds.
+    /// - **Coverage (#91)**: the span from the first to the last indexed keyframe. When a remote MKV's
+    ///   Cues tail read fails, the prewarm seek loads nothing and only the open-time keyframes survive,
+    ///   all bunched within the first few seconds. Their gaps are tiny so the gap check passes, but the
+    ///   index spans almost none of the title. The keyframe planner cuts segment 0 at the first keyframe
+    ///   at-or-after `targetSegmentDuration`; with no keyframe that far out the plan degenerates to one
+    ///   whole-file segment, from which AVPlayer loads zero tracks. Below one segment of coverage the
+    ///   keyframe planner cannot make even the first cut, so such an index is rejected here.
+    ///
+    /// Coverage is the span between keyframes, never reaching to EOF, so a dense index that stops early
+    /// (the trailing-gap-not-counted case) is unaffected: its span already exceeds one segment.
+    /// An index failing either witness is routed to the uniform-stride fallback.
     static func keyframeIndexIsTrustworthy(
         keyframes: [Int64],
         videoTimeBase: AVRational,
         sourceDurationSeconds: Double,
-        maxTrustedGapSeconds: Double = Swift.max(HLSVideoEngine.targetSegmentDuration * 4, 30)
+        maxTrustedGapSeconds: Double = Swift.max(HLSVideoEngine.targetSegmentDuration * 4, 30),
+        minCoverageSeconds: Double = HLSVideoEngine.targetSegmentDuration
     ) -> Bool {
         guard keyframes.count >= 2,
               sourceDurationSeconds > 0,
               videoTimeBase.num > 0, videoTimeBase.den > 0 else { return false }
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         let sorted = keyframes.sorted()
+        let coverageSeconds = Double(sorted[sorted.count - 1] - sorted[0]) * tb
+        guard coverageSeconds >= minCoverageSeconds else { return false }
         var largestGapSeconds = 0.0
         for i in 1..<sorted.count {
             let gapSeconds = Double(sorted[i] - sorted[i - 1]) * tb

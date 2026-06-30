@@ -511,7 +511,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self.firstKeyframeSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
                 // A sparse/clustered index (MPEG-TS / M2TS: no Cues, only what find_stream_info + the
                 // mid-file seek scanned) would otherwise build a multi-thousand-second first segment that
-                // the frag_custom muxer buffers whole in RAM (#64). Report the witness gap.
+                // the frag_custom muxer buffers whole in RAM (#64). A bunched index (remote MKV whose Cues
+                // tail read failed: only open-time keyframes, all within the first few seconds) would build
+                // a single whole-file segment AVPlayer loads zero tracks from (#91). Report both witnesses.
                 let tb = (videoTimeBase.num > 0 && videoTimeBase.den > 0)
                     ? Double(videoTimeBase.num) / Double(videoTimeBase.den) : 0
                 var largestGapSeconds = 0.0
@@ -521,9 +523,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         if g > largestGapSeconds { largestGapSeconds = g }
                     }
                 }
+                let coverageSeconds = (tb > 0 && sorted.count >= 2)
+                    ? Double(sorted[sorted.count - 1] - sorted[0]) * tb : 0
                 let reason = keyframes.count < 2
                     ? "\(keyframes.count) IRAPs in index, need >=2"
-                    : "index too sparse (\(keyframes.count) IRAPs, largestGap=\(String(format: "%.1f", largestGapSeconds))s)"
+                    : "index unusable (\(keyframes.count) IRAPs, coverage=\(String(format: "%.1f", coverageSeconds))s, largestGap=\(String(format: "%.1f", largestGapSeconds))s)"
                 EngineLog.emit(
                     "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts))",
                     category: .session
