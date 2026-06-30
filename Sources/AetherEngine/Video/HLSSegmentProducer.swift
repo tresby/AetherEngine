@@ -245,6 +245,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingVideoSegIndex: Int = 0
     private var pendingAudioSegIndex: Int = 0
 
+    /// VOD keyframe-gated cutter: opens each segment at the IRAP that reaches its plan boundary (#92).
+    private var vodCutter: VODSegmentCutter
+
     private var loggedFirstVideoPktInfo = false
     private var loggedP7ConversionFailure = false
     /// Latched false at SSAI program switch (ad creatives are H.264; mirrors muxer's isReinit ? false : videoConfig.convertP7ToProfile81).
@@ -313,14 +316,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
         dbg92SegsSeen += 1
         if HEVCAccessUnitProbe.isIDR(dbg92CurKfType) { dbg92IdrSegs += 1 }
         if HEVCAccessUnitProbe.isCRA(dbg92CurKfType) { dbg92CraSegs += 1 }
-        let nonIndependent = dbg92LeadingInSeg > 0
-        if nonIndependent { dbg92NonIndependentSegs += 1 }
-        if dbg92SegsSeen <= 5 || nonIndependent {
+        // A segment is independently decodable iff its FIRST sample is an IRAP. Open-GOP RASL that follow
+        // the IRAP in the same segment are fine (a fresh decode discards them via NoRaslOutputFlag); only
+        // a segment that starts on a non-IRAP (the pre-fix mid-GOP cut) is dependent on its predecessor.
+        let startsAtIRAP = HEVCAccessUnitProbe.isIRAP(dbg92CurKfType)
+        if !startsAtIRAP { dbg92NonIndependentSegs += 1 }
+        if dbg92SegsSeen <= 5 || !startsAtIRAP {
             EngineLog.emit(
                 "[HLSSegmentProducer] #92 seg-\(dbg92CurSeg) "
                 + "keyframe=\(HEVCAccessUnitProbe.label(forSliceType: dbg92CurKfType)) "
                 + "frames=\(dbg92FramesInSeg) leadingRASL=\(dbg92LeadingInSeg) "
-                + "independent=\(nonIndependent ? "NO" : "yes")",
+                + "independent=\(startsAtIRAP ? "yes" : "NO")",
                 category: .session
             )
         }
@@ -589,6 +595,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.sourceVideoTimeBase = video.timeBase
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
+        self.vodCutter = VODSegmentCutter(boundaries: segmentBoundaries, baseIndex: baseIndex)
         self.isLive = isLive
         // #92: open-GOP witness only matters for the VOD keyframe-plan path on HEVC sources.
         self.dbg92Enabled = !isLive && video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
@@ -1937,17 +1944,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                     // Live: keyframe cutter uses shifted pts. VOD: unused; routing uses prev.dts at look-behind site.
+                    let isVideoKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                    // VOD now cuts keyframe-gated like live (and like FFmpeg's hls muxer): a segment opens
+                    // at the IRAP that reaches its plan boundary, so the IRAP is the segment's first sample
+                    // and its open-GOP RASL leading pictures stay with it (#92). Routing by DTS against PTS
+                    // boundaries used to drop the IRAP (dts < pts) into the previous segment.
                     let thisVideoSeg = isLive
-                        ? liveVideoSegmentIndex(
-                            pts: packet.pointee.pts,
-                            isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                          )
-                        : 0
+                        ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
+                        : vodCutter.index(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
                     if let prev = pendingVideoPkt {
-                        // VOD: use DTS (not PTS) because HEVC open-GOP CRA leading B-frames have PTS in the previous segment.
-                        let prevSeg = isLive
-                            ? pendingVideoSegIndex
-                            : segmentIndex(forSourcePts: prev.pointee.dts)
+                        let prevSeg = pendingVideoSegIndex
                         // #65 ledger: at each VOD segment open, map the segment's item-axis start (what AVPlayer and
                         // currentTime see) to the TRUE source content muxed there. drift = actual source - planned
                         // source for this index; non-zero means the presented frame leads the clock (Root B positively
@@ -2010,7 +2016,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                     pendingVideoPkt = packet
-                    if isLive { pendingVideoSegIndex = thisVideoSeg }
+                    pendingVideoSegIndex = thisVideoSeg   // live: liveVideoSegmentIndex; VOD: keyframe-gated cutter
                     pktPtr = nil  // ownership transferred to pendingVideoPkt
                     continue
                 }
@@ -2129,9 +2135,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         // Flush look-behind; fallback duration produces tail-correct trun for the final fragment.
         if let prev = pendingVideoPkt {
-            let prevSeg = isLive
-                ? pendingVideoSegIndex
-                : segmentIndex(forSourcePts: prev.pointee.dts)
+            let prevSeg = pendingVideoSegIndex   // unified: live + VOD both carry the routed index
             if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                 finalizeAndWriteVideo(prev, nextDts: nil, muxer: muxer)
                 bumpPacketsWritten()
