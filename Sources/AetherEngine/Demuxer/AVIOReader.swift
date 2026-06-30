@@ -264,6 +264,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let chunkRequestTimeout: TimeInterval
     private let chunkMaxRetries: Int
 
+    /// TEST-ONLY slow-CDN throttle (kbit/s, 0 = unlimited), captured once from the static hook at init.
+    private let throttleKbps: Int
+    private var throttleVClockNs: UInt64 = 0
+    private let throttleLock = NSLock()
+
     init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3) {
         self.url = url
         self.extraHeaders = extraHeaders
@@ -272,6 +277,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.isLive = isLive
         self.chunkRequestTimeout = chunkRequestTimeout
         self.chunkMaxRetries = max(1, chunkMaxRetries)
+        self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
+    }
+
+    /// Slow-CDN simulation: hold delivered bytes to `throttleKbps` by sleeping the demux thread before the
+    /// bytes reach the demuxer. No-op unless the test hook is set. Lock-guarded: prefetch and demux paths
+    /// can both deliver. Sleeping here is consistent with the existing reconnect backoff on this thread.
+    private func applyThrottle(deliveredBytes: Int) {
+        guard throttleKbps > 0, deliveredBytes > 0 else { return }
+        throttleLock.lock()
+        let sleepNs = SourceThrottle.advance(
+            vclockNs: &throttleVClockNs,
+            nowNs: DispatchTime.now().uptimeNanoseconds,
+            deliveredBytes: deliveredBytes,
+            kbps: throttleKbps
+        )
+        throttleLock.unlock()
+        if sleepNs > 0 { Thread.sleep(forTimeInterval: Double(sleepNs) / 1_000_000_000) }
     }
 
     private func applyExtraHeaders(_ request: inout URLRequest) {
@@ -524,9 +546,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if isPastReadDeadline { readDeadlineFired = true; return -1 }
         // Check usePersistentReader before isStreaming: live feeds without
         // Content-Length must use the reconnect-capable persistent path.
-        if usePersistentReader { return readPersistent(into: buf, size: size) }
-        if isStreaming { return readStreaming(into: buf, size: size) }
-        return readSeekable(into: buf, size: size)
+        let n: Int32
+        if usePersistentReader { n = readPersistent(into: buf, size: size) }
+        else if isStreaming { n = readStreaming(into: buf, size: size) }
+        else { n = readSeekable(into: buf, size: size) }
+        if n > 0 { applyThrottle(deliveredBytes: Int(n)) }
+        return n
     }
 
     // MARK: - Seekable Read (Range-based)

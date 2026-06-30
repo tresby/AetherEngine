@@ -322,6 +322,16 @@ public final class AetherEngine: ObservableObject {
         forceSoftwarePathForTesting = on
     }
 
+    /// TEST-ONLY: throttle source IO to simulate a slow CDN/origin (kbit/s; 0 = unlimited). Read once by
+    /// each `AVIOReader` at init, so set it before `load`/`start`. Used by `aetherctl --throttle-kbps` to
+    /// starve the producer below real-time and provoke AVPlayer rebuffers (e.g. the #92 open-GOP repro).
+    nonisolated(unsafe) static var sourceThrottleKbpsForTesting = 0
+
+    /// TEST-ONLY. Set the source-IO throttle for the `aetherctl --throttle-kbps` harness; not for app use.
+    public nonisolated static func setSourceThrottleKbpsForTesting(_ kbps: Int) {
+        sourceThrottleKbpsForTesting = max(0, kbps)
+    }
+
     /// Reads `AVPlayer.eligibleForHDRPlayback` and `AVPlayer.availableHDRModes` at call time.
     /// macOS reports the built-in display only and may under-report external displays.
     public static var displayCapabilities: DisplayCapabilities {

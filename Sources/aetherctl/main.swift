@@ -89,6 +89,13 @@ func printUsage() {
                      non-DV TV / on macOS (where displayCapabilities
                      reports supportsDolbyVision=false anyway).
 
+    Flags (serve / seektest / audio / extract):
+      --throttle-kbps N
+                     TEST-ONLY slow-CDN simulation: cap source-IO
+                     delivery to N kbit/s. Set below the stream bitrate
+                     to starve the producer below real-time and provoke
+                     AVPlayer rebuffers (e.g. the #92 open-GOP repro).
+
     Flags (swdecode only):
       --frames N     Max packets to read / frames to wait for.
                      Default 100.
@@ -231,12 +238,17 @@ if first == "seektest" {
     let seeks   = takeIntFlag("--seeks", from: &rest) ?? 40
     let gapMs   = takeIntFlag("--gap-ms", from: &rest) ?? 60
     let settle  = takeDoubleFlag("--settle", from: &rest) ?? 5.0
+    let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: seektest requires a <url> argument")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "seektest")
+    if let throttleKbps {
+        AetherEngine.setSourceThrottleKbpsForTesting(throttleKbps)
+        print("[aetherctl] source throttle: \(throttleKbps) kbit/s (slow-CDN simulation)")
+    }
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
 }
 
@@ -384,6 +396,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let audioSeconds = takeDoubleFlag("--seconds", from: &rest) ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
+    // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
+    let throttleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -393,6 +407,10 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     }
     let url = parseSourceURL(urlArg)
     let dvModeAvailable = !noDV
+    if let throttleKbps {
+        AetherEngine.setSourceThrottleKbpsForTesting(throttleKbps)
+        print("[aetherctl] source throttle: \(throttleKbps) kbit/s (slow-CDN simulation)")
+    }
     switch first {
     case "probe":
         exit(runProbe(url: url))
