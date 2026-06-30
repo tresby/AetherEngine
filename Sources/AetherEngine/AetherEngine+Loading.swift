@@ -259,8 +259,19 @@ extension AetherEngine {
         // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
         // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
         // Exclude in-band CEA-608/708 (#77): no demuxable packets to mux into mov_text; served by the CC tap.
-        let textTracks = subtitleTracks.filter {
+        var textTracks = subtitleTracks.filter {
             !Self.isBitmapSubtitleCodec($0.codec) && !Self.isEmbeddedClosedCaptionCodec($0.codec)
+        }
+        // Sodalite#32: AVKit reliably renders only the FIRST native subtitle rendition (ordinal 0 / subs_0);
+        // device-confirmed that a programmatic selection of a later rendition is fetched then dropped after one
+        // segment. So move the preferred-language track to ordinal 0 and have the host select ordinal 0.
+        if !loadedOptions.nativeSubtitlePreferredLanguages.isEmpty {
+            for pref in loadedOptions.nativeSubtitlePreferredLanguages {
+                if let idx = textTracks.firstIndex(where: { AetherEngine.languageMatches($0.language, pref) }) {
+                    if idx != 0 { textTracks.insert(textTracks.remove(at: idx), at: 0) }
+                    break
+                }
+            }
         }
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
