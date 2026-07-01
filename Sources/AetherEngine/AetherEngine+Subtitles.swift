@@ -801,7 +801,9 @@ extension AetherEngine {
             demuxer.seek(to: duration * 0.5)
         }
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }
-        let effectiveStart = max(startAt, freshPlayhead ?? startAt)
+        // Sodalite#32: a whole-program read must start at `startAt` (0) regardless of the playhead; the usual
+        // max-with-playhead (so the PiP reader doesn't start behind the playhead) would drop all cues before it.
+        let effectiveStart = readToEOF ? startAt : max(startAt, freshPlayhead ?? startAt)
         let seekTo = max(0, effectiveStart - 2.0)
         demuxer.seek(to: seekTo)
 
