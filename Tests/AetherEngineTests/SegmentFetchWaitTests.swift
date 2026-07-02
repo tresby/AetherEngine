@@ -69,17 +69,37 @@ struct SegmentFetchWaitTests {
         for i in range { cache.store(index: i, data: Data(repeating: 0xEE, count: 8)) }
     }
 
+    /// Thread-safe poll counter for activity closures that trigger a side effect on the Nth poll.
+    private final class PollCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
+    }
+
     @Test("a fetch rides an in-flight restart to a late segment instead of 503ing")
     func ridesInFlightRestart() {
         let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
         defer { cache.close() }
         let recorder = Recorder()
-        let provider = makeProvider(cache: cache, recorder: recorder, activity: .always())
-        // The in-flight restart delivers the segment after ~6 wait slices, well past the old
-        // fixed 3-attempt budget.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
-            cache.store(index: 40, data: Data(repeating: 0xAB, count: 8))
-        }
+        // The in-flight restart delivers the segment on the ride loop's own 3rd activity poll,
+        // well past the old fixed 3-attempt budget. Poll-driven, not a wall-clock timer: a loaded
+        // CI runner delayed an asyncAfter past the 5 s ride cap and flaked this test.
+        let polls = PollCounter()
+        let provider = VideoSegmentProvider(
+            cache: cache, segments: segments(60), codecsString: "hvc1", supplementalCodecs: nil,
+            resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
+            sourceBitrate: 8_000_000,
+            restartHandler: { idx in recorder.record(idx) },
+            restartActivity: { [weak cache] in
+                if polls.increment() == 3 {
+                    cache?.store(index: 40, data: Data(repeating: 0xAB, count: 8))
+                }
+                return true
+            },
+            initialRestartIndex: 0,
+            repositionWaitSlice: 0.05,
+            repositionRideCapSeconds: 5.0
+        )
         let served = provider.mediaSegment(at: 40)
         #expect(served != nil)
         #expect(recorder.all.isEmpty)
