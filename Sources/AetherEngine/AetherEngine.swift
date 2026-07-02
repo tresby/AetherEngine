@@ -624,6 +624,16 @@ public final class AetherEngine: ObservableObject {
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
 
+    /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
+    /// readers' side demuxer competed with the restart for the starved link. Cancelled by
+    /// cancelNativeSubtitleReaders (deselect / clear / stop / load).
+    var nativeSubtitleReaderDeferralTask: Task<Void, Never>? = nil
+
+    #if DEBUG
+    /// Test-only override for the session's restart-in-flight signal (#93 residual deferral tests).
+    var testHookRestartInFlightOverride: Bool? = nil
+    #endif
+
     #if DEBUG
     /// Test-only store override for the external instant-backfill path (#88); production reads the
     /// live session's stores.
