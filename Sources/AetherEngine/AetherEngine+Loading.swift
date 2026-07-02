@@ -358,21 +358,23 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 nativeSubtitleReaderParams = (url: url, stores: stores)
-                // Sodalite#32 probe: when the host lets AVKit own the legible selection (DEFAULT=YES rendition,
-                // no host `setNativeSubtitleSelected`), nothing would start the lazy readers, so the .vtt would be
-                // empty when AVKit fetches it. Start them eagerly here so the cue stores fill from load, the way a
-                // static VOD subtitle file is fully present up front.
-                if loadedOptions.eagerNativeSubtitleReaders {
-                    // Sodalite#32: anchor at the SESSION START POSITION (resume), not 0, and read straight to
-                    // EOF (no read-ahead parking). A from-0 read behind a resume position spent the whole
-                    // session catching up over a remote link and never covered the playhead (device: readMax
-                    // 48s vs playhead 304s, every .vtt served empty). Coverage is [startPosition..EOF]; a
-                    // backward seek below the resume point has no native cues until the reader design moves
-                    // to a cheap whole-track source.
+                // Sodalite#32: the producer's pump tap fills these stores for the whole produced region at
+                // zero side-channel bandwidth, so the eager at-load readers (which competed with playback
+                // for the remote link at startup) are only a fallback for sessions whose tap could not arm
+                // (no demuxable stream indices, e.g. all-sidecar). The lazy reader on PiP selection stays:
+                // it covers AVKit's ~240s forward .vtt prefetch burst beyond the produced region.
+                let tapArmed = session.nativeSubtitleSourceStreamIndicesForSession.contains { $0 != nil }
+                if loadedOptions.eagerNativeSubtitleReaders && !tapArmed {
+                    // Anchor at the SESSION START POSITION (resume), not 0, and read straight to EOF (no
+                    // read-ahead parking). A from-0 read behind a resume position spent the whole session
+                    // catching up over a remote link and never covered the playhead (device: readMax 48s vs
+                    // playhead 304s, every .vtt served empty).
                     let readEOF = !loadedOptions.isLive
                     startNativeSubtitleReaders(url: url, stores: stores,
                                                readToEOF: readEOF, startAtSeconds: startPosition ?? 0)
                     EngineLog.emit("[PiPDiag] eager readers started: stores=\(stores.count) readToEOF=\(readEOF) startAt=\(String(format: "%.1f", startPosition ?? 0))", category: .engine)
+                } else if tapArmed {
+                    EngineLog.emit("[PiPDiag] pump tap active; eager readers skipped (lazy reader covers the select burst)", category: .engine)
                 }
             }
         }
