@@ -1134,21 +1134,26 @@ extension AetherEngine {
                 item.select(nil, in: group)
                 return
             }
-            // Rank-based selection: a naive .first { hasPrefix(lang) } always returns the first same-language option regardless of requested ordinal. Compute the rank within same-language tracks and pick the matching AVFoundation option.
+            // Rank-based selection through the ISO-synonym matcher: AVFoundation normalizes HLS
+            // LANGUAGE tags (matroska "ger" reads back as extendedLanguageTag "de"), so the old
+            // prefix compare found nothing and its positional fallback selected a WRONG-LANGUAGE
+            // option (device: the second German track rendered the English rendition in PiP).
+            // Language-tagged tracks now select nothing on a failed match; only language-less
+            // tracks keep the positional fallback.
             var selected: AVMediaSelectionOption?
             if ordinal < tracks.count, let lang = tracks[ordinal].language {
                 let rank = NativeSubtitleTrack.sameLanguageRank(of: ordinal, in: tracks)
-                let sameLangOptions = group.options.filter {
-                    $0.extendedLanguageTag?.hasPrefix(lang) == true
+                let tags = group.options.map { $0.extendedLanguageTag }
+                if let idx = Self.nativeOptionIndex(forLanguage: lang, rank: rank, optionLanguageTags: tags) {
+                    selected = group.options[idx]
                 }
-                if rank < sameLangOptions.count {
-                    selected = sameLangOptions[rank]
-                }
-            }
-            if selected == nil, ordinal < group.options.count {
+            } else if ordinal < group.options.count {
                 selected = group.options[ordinal]
             }
-            guard let option = selected else { return }
+            guard let option = selected else {
+                EngineLog.emit("[AetherEngine] native subtitle select: no matching option for ordinal=\(ordinal) lang=\(ordinal < tracks.count ? (tracks[ordinal].language ?? "nil") : "?") groupOpts=\(group.options.count)", category: .engine)
+                return
+            }
             // #15: pre-fill BEFORE selecting, so AVPlayer fetches a populated rendition instead of racing the
             // reader (empty .vtt). Done here (off the loopback connection) rather than blocking the .vtt handler,
             // which serializes the connection and stalls the legible pipeline.
@@ -1210,6 +1215,47 @@ extension AetherEngine {
     /// sourceStreamIndex, external ids match externalID.
     static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
         table.firstIndex { $0.sourceStreamIndex == id || $0.externalID == id }
+    }
+
+    /// Rendition metadata for the master's EXT-X-MEDIA tags. HLS requires NAME to be unique within
+    /// a group; duplicate names made AVFoundation collapse same-language renditions into ONE
+    /// legible option (device: three declared, groupOpts=2, and the second German track ended up
+    /// selecting the English option through the old positional fallback). Same-language duplicates
+    /// get a numbered suffix; the forced disposition is carried for FORCED=YES.
+    nonisolated static func nativeSubtitleRenditionInfos(
+        for entries: [NativeSubtitleTrackEntry]
+    ) -> [NativeSubtitleRenditionInfo] {
+        var counts: [String: Int] = [:]
+        return entries.enumerated().map { i, entry in
+            let base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+                ?? "Subtitle \(i + 1)"
+            let n = (counts[base] ?? 0) + 1
+            counts[base] = n
+            return NativeSubtitleRenditionInfo(
+                language: entry.language,
+                name: n == 1 ? base : "\(base) \(n)",
+                isForced: entry.isForced
+            )
+        }
+    }
+
+    /// Index of the legible option backing (track language, same-language rank). AVFoundation
+    /// normalizes HLS LANGUAGE tags (matroska "ger" reads back as extendedLanguageTag "de", often
+    /// with a region subtag), so matching goes through the ISO-synonym table on the primary
+    /// subtag, not a prefix compare. Deliberately NO cross-language fallback: selecting a
+    /// wrong-language option is worse than selecting nothing (device: German pick rendered the
+    /// English rendition in PiP).
+    nonisolated static func nativeOptionIndex(
+        forLanguage language: String?, rank: Int, optionLanguageTags: [String?]
+    ) -> Int? {
+        guard let language, rank >= 0 else { return nil }
+        let matching = optionLanguageTags.indices.filter { idx in
+            guard let tag = optionLanguageTags[idx],
+                  let primary = tag.split(separator: "-").first else { return false }
+            return languageMatches(String(primary), language)
+        }
+        guard rank < matching.count else { return nil }
+        return matching[rank]
     }
 
     /// #15: select the native track matching the currently-active subtitle so AVKit renders it inside

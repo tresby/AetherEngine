@@ -117,6 +117,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// nil entry = no language box for that track.
     var nativeSubtitleLanguagesForSession: [String?] = []
 
+    /// Per-rendition master metadata parallel to the stores (unique NAMEs + FORCED dispositions);
+    /// empty falls back to per-ordinal locale names, which collapse in AVFoundation when a
+    /// language repeats. Built by `AetherEngine.nativeSubtitleRenditionInfos(for:)` at load.
+    var nativeSubtitleRenditionInfosForSession: [NativeSubtitleRenditionInfo] = []
+
     /// #77: in-band CC stream index + observer, re-threaded onto every producer so the tap survives
     /// seek/reload/wedge. Set before start(). -1 / nil = no CC tap.
     var closedCaptionStreamIndexForSession: Int32 = -1
@@ -1049,6 +1054,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
+            nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
             nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
             nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,

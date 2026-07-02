@@ -279,18 +279,15 @@ extension AetherEngine {
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
                                      externalID: track.isExternal ? track.id : nil,
-                                     language: track.language)
+                                     language: track.language,
+                                     isForced: track.isForced)
         }
-        // displayName = locale's language name or "Subtitle <n>" (1-based). Uses Locale.current like AVKit's built-in labels.
-        nativeSubtitleTracks = nativeSubtitleTrackTable.enumerated().map { ordinal, entry in
-            let name: String
-            if let lang = entry.language,
-               let localizedName = Locale.current.localizedString(forIdentifier: lang) {
-                name = localizedName
-            } else {
-                name = "Subtitle \(ordinal + 1)"
-            }
-            return NativeSubtitleTrack(ordinal: ordinal, language: entry.language, displayName: name)
+        // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
+        // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
+        // legible options (device: 3 declared renditions, 2 options, wrong-language selection).
+        let renditionInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable)
+        nativeSubtitleTracks = renditionInfos.enumerated().map { ordinal, info in
+            NativeSubtitleTrack(ordinal: ordinal, language: info.language, displayName: info.name)
         }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
@@ -309,6 +306,7 @@ extension AetherEngine {
         if session.enableNativeSubtitleTrackForSession, !nativeSubtitleTrackTable.isEmpty {
             session.nativeSubtitleCueStoresForSession = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
             session.nativeSubtitleLanguagesForSession = nativeSubtitleTrackTable.map { $0.language }
+            session.nativeSubtitleRenditionInfosForSession = renditionInfos
             // Sodalite#32: stream indices arm the producer's subtitle pump tap, which harvests cue packets
             // from the main pump's existing read (no side-channel bandwidth) for the produced region.
             session.nativeSubtitleSourceStreamIndicesForSession = nativeSubtitleTrackTable.map { $0.sourceStreamIndex.map(Int32.init) }
