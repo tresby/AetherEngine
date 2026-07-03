@@ -85,6 +85,10 @@ extension AetherEngine {
 
     @MainActor
     private func installSoftwareTapSink(controller: AudioTapController) {
-        // Filled in with the SW-path converter (Task 6).
+        guard let host = softwareHost, let yield = controller.makeYield() else { return }
+        let converter = AudioTapPCMConverter()
+        host.audioTapSink = { sample in
+            for buf in converter.convert(sample) { yield(buf) }
+        }
     }
 }
