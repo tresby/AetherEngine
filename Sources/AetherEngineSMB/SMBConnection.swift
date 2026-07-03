@@ -46,23 +46,38 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
         // An empty username means "no explicit account": try guest first, then
         // fall back to a fully anonymous NTLM session if the server rejects it.
         // This mirrors the guest/anonymous behaviour of the previous backend.
+        // The fallback is scoped to the no-account case (`account == nil`): when
+        // an explicit username was supplied, a login failure is a real auth
+        // error and must propagate rather than silently downgrading to an
+        // anonymous session. Callers signal "no account" with an empty username
+        // (see `SMBURL`, which leaves an omitted user empty rather than
+        // substituting "guest" — otherwise this fallback could never fire).
         let account = user.isEmpty ? nil : user
         let secret = password.isEmpty ? nil : password
         let realm = domain.isEmpty ? nil : domain
+
+        // `login` negotiates and opens the NWConnection before it can throw, so
+        // any failure past this point leaves a live socket. Tear it down before
+        // rethrowing so failed connects don't leak a connection until dealloc.
         do {
-            try await client.login(username: account ?? "guest", password: secret, domain: realm)
+            do {
+                try await client.login(username: account ?? "guest", password: secret, domain: realm)
+            } catch where account == nil {
+                try await client.login(username: nil, password: nil)
+            }
+
+            try await client.connectShare(share)
+
+            let reader = client.fileReader(path: path)
+            let size = try await reader.fileSize
+            guard size > 0 else {
+                throw SMBError(message: "SMB file has zero size or could not be stat'd: \(path)")
+            }
+            return SMBConnection(client: client, reader: reader, byteSize: Int64(size))
         } catch {
-            try await client.login(username: nil, password: nil)
+            client.session.disconnect()
+            throw error
         }
-
-        try await client.connectShare(share)
-
-        let reader = client.fileReader(path: path)
-        let size = try await reader.fileSize
-        guard size > 0 else {
-            throw SMBError(message: "SMB file has zero size or could not be stat'd: \(path)")
-        }
-        return SMBConnection(client: client, reader: reader, byteSize: Int64(size))
     }
 
     public func read(at offset: Int64, length: Int) async throws -> Data {
@@ -79,6 +94,9 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
         Task {
             try? await reader.close()
             try? await client.logoff()
+            // logoff() only ends the SMB session; tear down the underlying TCP
+            // connection too so the socket doesn't linger until dealloc.
+            client.session.disconnect()
         }
     }
 }
