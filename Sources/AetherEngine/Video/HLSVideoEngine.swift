@@ -92,8 +92,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
-    /// When true, `makeProducer` sets `enableNativeSubtitleTrack` on every producer so the
-    /// init moov always declares the mov_text track (#55). Set before `start()`.
+    /// When true, the session exposes the native subtitle WebVTT rendition (separate from the A/V
+    /// variant, served by HLSLocalServer) and arms its cue readers on track selection (#15 / Sodalite#32).
+    /// Set before `start()`.
     var enableNativeSubtitleTrackForSession: Bool = false
 
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
@@ -191,8 +192,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prod = producer
         restartLock.unlock()
         rebuildSubtitleTapRoutes()
-        prod?.subtitleCueStores = stores
-        prod?.nativeSubtitleLanguages = langs
         armSubtitleTap(on: prod)
     }
 
@@ -478,7 +477,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sourceReopenableByURL: Bool = true,
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
-        maxAnalyzeDuration: Int64? = nil
+        maxAnalyzeDuration: Int64? = nil,
+        forwardBufferSegments: Int? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -505,6 +505,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.preopenedDemuxer = preopenedDemuxer
         self.sourceReopenableByURL = sourceReopenableByURL
         self.companionAudioReader = companionAudioReader
+        self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+    }
+
+    /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
+    /// (`HLSSegmentProducer.bufferAheadSegments`) and the cache's forward window
+    /// (`SegmentCache.forwardWindow`); the two MUST stay identical (a drift is exactly what stalls
+    /// AVPlayer, see `SegmentCache`). From `LoadOptions.forwardBufferSegments`; nil -> historical 10.
+    let forwardWindowSegments: Int
+
+    /// Clamp for `forwardWindowSegments`: below 4 the window would undercut AVPlayer's own ~5-7-segment
+    /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`); above 150 (~10 min at 4 s
+    /// segments, ~1.5 GB disk for 4K HEVC) the disk and ahead-of-time demux cost stops being worth it.
+    /// nil keeps the historical default of 10.
+    static func clampedForwardWindow(_ requested: Int?) -> Int {
+        min(max(requested ?? 10, 4), 150)
     }
 
     /// When true, `start()` skips the VOD duration guard / cue prewarm / precomputed plan and
@@ -763,7 +778,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let retentionBudget = isLiveSession
             ? 0
             : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes)
-        let segmentCache = SegmentCache(retentionBudgetBytes: retentionBudget)
+        let segmentCache = SegmentCache(forwardWindow: forwardWindowSegments,
+                                        retentionBudgetBytes: retentionBudget)
         self.cache = segmentCache
         EngineLog.emit(
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
@@ -1488,7 +1504,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentBoundaries: segmentBoundaries,
             isLive: isLiveSession,
             packedSideAudioStartPts: packedSideAudioStartPts,
-            packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts
+            packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
+            bufferAheadSegments: forwardWindowSegments
         )
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
@@ -1510,12 +1527,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #93 retest: the rendered clock feeds the wedge detector's fast path (park + both signals
         // frozen -> single-digit detection). Threaded onto every producer like the play-intent guard.
         prod.playbackPositionProvider = currentPlaybackPositionProvider
-        // Thread native subtitle state onto every producer (initial + restart) so the init moov is
-        // consistent and per-segment cue drain survives seek/audio-switch (#55). Set unconditionally:
-        // empty set keeps byte-identical output and clears stale stores after clearSubtitle.
-        prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
-        prod.subtitleCueStores = nativeSubtitleCueStoresForSession
-        prod.nativeSubtitleLanguages = nativeSubtitleLanguagesForSession
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.

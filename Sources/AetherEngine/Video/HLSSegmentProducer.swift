@@ -343,8 +343,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var videoShiftPts: Int64 = Int64.min
     private var audioShiftPts: Int64 = Int64.min
 
-    /// Max segments ahead of AVPlayer's highest fetched segment (cut from 20 to 10; 4K HEVC ~10 MB/seg = 200 MB old buffer).
-    private static let bufferAheadSegments = 10
+    /// Max segments ahead of AVPlayer's highest fetched segment. Historically a constant (cut from 20 to
+    /// 10; 4K HEVC ~10 MB/seg = 200 MB old buffer); now per session from `LoadOptions.forwardBufferSegments`
+    /// via `HLSVideoEngine.forwardWindowSegments`. MUST equal the SegmentCache's forwardWindow so the muxer
+    /// never writes past the cache's forward edge (a drift is exactly what stalls AVPlayer).
+    private let bufferAheadSegments: Int
 
     /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
@@ -474,12 +477,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// detection instead of the 24 s counter). nil (tests, live) keeps the fast path inert.
     var playbackPositionProvider: (@Sendable () -> Double?)?
 
-    /// Ordinal-indexed cue stores for native mov_text subtitle tracks (#55). Empty = disabled.
-    var subtitleCueStores: [NativeSubtitleCueStore] = []
-
-    /// BCP-47 language tags parallel to subtitleCueStores; nil entry = no language box.
-    var nativeSubtitleLanguages: [String?] = []
-
     /// #77: in-band CC tap. When `closedCaptionStreamIndex >= 0` that source stream is kept (not
     /// discarded) and each of its packets is handed to `closedCaptionObserver` (read-only) then dropped —
     /// never muxed (output byte-identical). Set via init so it's in the keep-set; observer attached after.
@@ -498,31 +495,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var subtitleTapObserver: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?
     private var subtitleTapTimeBases: [Int32: AVRational] = [:]
     private var closedCaptionStreamTimeBase = AVRational(num: 1, den: 1)
-
-    /// Must be set before first allocateMuxer call. Enables mov_text track declaration in init moov (#55).
-    var enableNativeSubtitleTrack: Bool = false
-
-    /// Build a contiguous mov_text sample plan (gaps filled with empty samples) for the given window.
-    static func movTextSamples(
-        forWindow window: (start: Double, end: Double),
-        cues: [(start: Double, end: Double, text: String)]
-    ) -> [(payload: Data, pts: Double, duration: Double)] {
-        var out: [(payload: Data, pts: Double, duration: Double)] = []
-        var cursor = window.start
-        for c in cues {
-            let cs = max(c.start, window.start)
-            let ce = min(c.end, window.end)
-            if cs > cursor {
-                out.append((MovTextSampleBuilder.emptySample(), cursor, cs - cursor))
-            }
-            out.append((MovTextSampleBuilder.sample(text: c.text), cs, max(0, ce - cs)))
-            cursor = ce
-        }
-        if cursor < window.end {
-            out.append((MovTextSampleBuilder.emptySample(), cursor, window.end - cursor))
-        }
-        return out
-    }
 
     /// Set by engine live-reopen path so the fresh producer marks its first segment with #EXT-X-DISCONTINUITY.
     var firstSegmentDiscontinuous = false
@@ -572,8 +544,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         segmentBoundaries: [Int64],
         isLive: Bool = false,
         packedSideAudioStartPts: Int64? = nil,
-        packedSideAudioFallbackDurationPts: Int64 = 0
+        packedSideAudioFallbackDurationPts: Int64 = 0,
+        bufferAheadSegments: Int = 10
     ) throws {
+        self.bufferAheadSegments = bufferAheadSegments
         self.demuxer = demuxer
         self.sideAudioDemuxer = sideAudioDemuxer
         // Packed side audio: synthesize timestamps from ID3 PRIV anchor; TS-side sessions use real timestamps.
@@ -855,7 +829,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // or is about to (anchored start). seg0 sessions are unaffected (their target is negative
         // and releases immediately).
         if initialSegmentIndex != baseIndex {
-            let backpressureTarget = initialSegmentIndex - Self.bufferAheadSegments
+            let backpressureTarget = initialSegmentIndex - bufferAheadSegments
             if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         }
         if checkShouldStop() { return nil }
@@ -902,14 +876,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         do {
             // #15: subtitles ship as a separate WebVTT rendition (HLSLocalServer), NOT muxed into the A/V
             // fMP4. In-band timed text is non-conformant for HLS and fails the AVPlayer open (RFC 8216 §3.1,
-            // empirically -11829/-12848). Never re-feed the muxer subtitles; the cue stores feed the WebVTT.
-            let muxerSubtitles: [MP4SegmentMuxer.SubtitleConfig] = []
+            // empirically -11829/-12848). The muxer carries no subtitle streams; the cue stores feed the WebVTT.
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
-                subtitles: muxerSubtitles,
                 // Cap the muxer's in-RAM interleaver at ~2 segments so a long/degenerate segment or an
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
                 maxBufferedFragmentSeconds: 2 * targetSegmentDurationSeconds,
@@ -1002,7 +974,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         }
         currentMuxerSegmentIndex = newIdx
-        let backpressureTarget = newIdx - Self.bufferAheadSegments
+        let backpressureTarget = newIdx - bufferAheadSegments
         if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
         if checkShouldStop() { return nil }
 
