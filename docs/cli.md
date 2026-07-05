@@ -1,6 +1,6 @@
 # aetherctl
 
-A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, and `hlsfixture` run against built-in synthetic fixtures.
+A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
 
 ```bash
 swift run aetherctl probe <url>          # dump container + streams + duration, exit
@@ -9,9 +9,11 @@ swift run aetherctl validate <url>       # serve + run mediastreamvalidator, exi
 swift run aetherctl segverify <url>      # SW-decode each loopback segment in isolation; report independence (#92)
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
+swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
 swift run aetherctl audio [--seconds N] <url>   # audio-only pipeline smoke test (default 10 s)
+swift run aetherctl audiotap <url>       # decode the PCM audio tap headless, write mono 48 kHz WAV (#95)
 swift run aetherctl bgaudio <url>        # SW-path background-audio keepalive probe (iOS background behavior)
 swift run aetherctl customio <path>      # exercise the custom IOReader path end-to-end
 swift run aetherctl disc-inspect <path>  # walk a local DVD / Blu-ray ISO: titles, chapters, recognition stages
@@ -24,7 +26,7 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Eighteen subcommands plus the bare-URL `serve` alias.
+Twenty subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -146,7 +148,7 @@ Replays a synthetic SSAI ad-pod feed through the live-direct-play path to repro 
 
 ## smbtest
 
-Connects to an SMB2/3 share with `SMBConnection` (AMSMB2 backend), wraps the file in `SMBIOReader`, and runs a sequential-throughput pass plus a random-seek consistency check. macOS-only; needs the optional `AetherEngineSMB` product (`swift build --product aetherctl` pulls it in). Validates the SMB byte source without a device:
+Connects to an SMB2/3 share with `SMBConnection` (SMBClient backend), wraps the file in `SMBIOReader`, and runs a sequential-throughput pass plus a random-seek consistency check. macOS-only; needs the optional `AetherEngineSMB` product (`swift build --product aetherctl` pulls it in). Validates the SMB byte source without a device:
 
 ```bash
 swift run aetherctl smbtest "smb://user:pass@host/share/path/to/file.mkv" --reads 128

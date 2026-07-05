@@ -129,6 +129,8 @@ Sources/AetherEngine/
 ├── AetherEngine+ClosedCaptions.swift        In-band CEA-608 closed captions: ClosedCaptionTap (read-only producer observer) + cue mirroring (#77)
 ├── AetherEngine+Live.swift                  Live window publishing, edge snap, resume clamp, scrub thumbnails
 ├── AetherEngine+Diagnostics.swift           Memory probe + live-telemetry bridge
+├── AetherEngine+AudioTap.swift              Opt-in decoded PCM audio tap (#95): installAudioTap() vends the AsyncStream, dispatches native-loopback vs SW-mirror
+├── AetherEngine+BackgroundAudioTestHooks.swift DEBUG-only hooks letting aetherctl bgaudio toggle the SW background-audio keepalive without a UIApplication lifecycle (never shipped)
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, bufferedPosition, progress, live-edge fields) as a separate ObservableObject
 ├── PlayerState.swift                        PlaybackState, PlaybackPhase, VideoFormat, PlaybackBackend, LoadOptions, SourceProbe, TrackInfo, FontAttachment, MediaMetadata, SubtitleCue, SubtitleImage
 ├── LiveReloadPolicy.swift                   Pure decision functions for live reloads: rejoin at the live edge (no stale resume position), skip the pre-readiness zero seek
@@ -137,9 +139,16 @@ Sources/AetherEngine/
 ├── Audio/
 │   ├── AudioAVPlayerHost.swift              Audio-only path: bare AVPlayer host for whitelisted codecs, owns the persistent per-player MPNowPlayingSession (tvOS / iOS)
 │   ├── AudioBridge.swift                    Native path: decode + re-encode per `AudioBridgeMode` (EAC3 5.1 default or lossless FLAC opt-in) for source codecs that can't stream-copy into fMP4
+│   ├── AudioClockAnchor.swift               SW path: sample-count PTS anchor so consecutive buffers abut exactly; re-anchors on >100 ms drift (AVSampleBufferAudioRenderer crackle, #89)
 │   ├── AudioDecoder.swift                   SW path: libavcodec → PCM → CMSampleBuffer with channel-layout tagging
 │   ├── AudioOutput.swift                    SW path: AVSampleBufferAudioRenderer + Synchronizer (master clock)
-│   └── AudioPlaybackHost.swift              Audio-only path: FFmpeg demux + decode into AVSampleBufferAudioRenderer for codecs off the whitelist
+│   ├── AudioPlaybackHost.swift              Audio-only path: FFmpeg demux + decode into AVSampleBufferAudioRenderer for codecs off the whitelist
+│   └── Tap/
+│       ├── AudioTapController.swift         Lifecycle owner for one tap: owns the AsyncStream continuation + (native path) the LoopbackAudioReader; one per engine, re-install replaces it (#95)
+│       ├── AudioTapDecoder.swift            FFmpeg decode of tap packets into mono Float32 48 kHz AVAudioPCMBuffers (lazy resampler, own lock discipline)
+│       ├── AudioTapPCMConverter.swift       SW path: AVAudioConverter sink mirroring AudioDecoder PCM into the tap's mono 48 kHz format
+│       ├── AudioTapTypes.swift              AudioTapBuffer value type (single-consumer @unchecked Sendable) + pure loopback pacing decision
+│       └── LoopbackAudioReader.swift        Native-path tap worker: pulls fMP4 segments from SegmentCache near the playhead, decodes their audio out-of-band on a utility thread (cannot stall playback)
 ├── Decoder/
 │   ├── CCDataParser.swift                   Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77)
 │   ├── CEA608Decoder.swift                  In-house CEA-608 line-21 decoder (field-1 / CC1), validated against FFmpeg ccaption_dec.c (#77)
@@ -153,7 +162,9 @@ Sources/AetherEngine/
 │   ├── AVIOProvider.swift                   Internal seam over a custom-AVIO byte source; AVIOReader and CustomIOReaderBridge both plug into the Demuxer through it
 │   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context, three modes: persistent forward-streaming connection with reconnect-on-drop (playback, incl. live), discrete Range chunks (still extraction), single sequential GET with backpressure (non-live sources without Content-Length). Optional read deadline bounds a degenerate matroska Cues seek
 │   ├── CustomIOReaderBridge.swift           Bridges a host-supplied IOReader into avio_alloc_context read / seek callbacks
-│   └── Demuxer.swift                        libavformat wrapper; seek + bounded seek (deadline-capped); per-open `DemuxerOpenProfile` budgets `find_stream_info` (probesize / max_analyze_duration), caller-overridable on the main playback open via `LoadOptions.probesize` / `maxAnalyzeDuration`. The subtitle side demuxer sets `skipStreamInfo` to drop the `find_stream_info` pass entirely (codec_id / codec_type come from the container header / PMT at open), so a PGS / bitmap track no longer chases the probe cap as a flat ~5 s startup stall on a remote URL source; the reader runs a bounded `resolveStreamInfo()` on demand only if its target stream's codec is genuinely unresolved at open (#87)
+│   ├── Demuxer.swift                        libavformat wrapper; seek + bounded seek (deadline-capped); per-open `DemuxerOpenProfile` budgets `find_stream_info` (probesize / max_analyze_duration), caller-overridable on the main playback open via `LoadOptions.probesize` / `maxAnalyzeDuration`. The subtitle side demuxer sets `skipStreamInfo` to drop the `find_stream_info` pass entirely (codec_id / codec_type come from the container header / PMT at open), so a PGS / bitmap track no longer chases the probe cap as a flat ~5 s startup stall on a remote URL source; the reader runs a bounded `resolveStreamInfo()` on demand only if its target stream's codec is genuinely unresolved at open (#87)
+│   ├── SlowReadDiagnostics.swift            One-shot localization of a pathologically slow AVIOReader.read() (detour fetch / connStall / reconnect / backoff / dropped-generation bytes), #93 restart latency
+│   └── SourceThrottle.swift                 Pure virtual-clock leaky-bucket rate limiter on the source read path (slow-CDN simulation for aetherctl --throttle); unit-testable without sleeping
 ├── Diagnostics/
 │   ├── EngineDiagnostics.swift              engine.diagnostics: timer-sampled values (liveTelemetry) as a separate ObservableObject
 │   ├── EngineLog.swift                      Gated OSLog emission with severity levels (.verbose suppressed from default + host handler)
@@ -161,7 +172,9 @@ Sources/AetherEngine/
 │   ├── LiveTelemetry.swift                  Value type emitted at 1 Hz: instant / avg bitrate, buffer, network, dropped frames, observed FPS, A/V sync gap, plus subsystem byte counters
 │   ├── FourCC.swift                         Printable FourCC rendering for codec-tag diagnostics
 │   ├── LiveTelemetrySampler.swift           @MainActor 1 Hz sampler that reads existing subsystem counters and assembles LiveTelemetry snapshots
-│   └── PacketBalanceTracker.swift           Process-wide AVPacket alloc/free balance counter for leak diagnostics
+│   ├── PacketBalanceTracker.swift           Process-wide AVPacket alloc/free balance counter for leak diagnostics
+│   ├── PacketTimingProbe.swift              Offline differential probe (#93 judder): raw demuxer packet timing per open profile, before NOPTS repair / muxing; backs aetherctl pktdump
+│   └── AudioTapProbe.swift                  Headless native-session tap verification (#95): LoopbackAudioReader decode to mono 48 kHz WAV; backs aetherctl audiotap
 ├── Disc/
 │   ├── DiscReader.swift                     Disc detection + routing: local `.iso` URLs and custom ISO readers into the demux path; enumerates titles and threads the selected one (DVD vs Blu-ray)
 │   ├── DiscMetadata.swift                   Public `TitleInfo` / `ChapterInfo` plus the internal disc title + chapter model (45 kHz ticks, extent keys)
@@ -179,6 +192,7 @@ Sources/AetherEngine/
 │   └── FrameRateSnap.swift                  Snap to standard rates (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
 ├── FrameExtractor/
 │   ├── AetherEngine+FrameExtractor.swift    makeFrameExtractor() convenience for the currently loaded URL
+│   ├── DolbyVisionStillConverter.swift      Applies the RPU-carried DV colour transform to a DV P5 / P10.0 base-layer frame (IPT-PQ-C2, not YCbCr) so scrub stills lose the green + magenta cast (#103)
 │   ├── FrameExtractor.swift                 Off-playback still extraction actor: serial decode queue, cancel-supersede, idle-close
 │   ├── FrameDecodeContext.swift             Isolated FFmpeg demux + decode + sws_scale → CGImage (thumbnail / snapshot)
 │   ├── FrameCache.swift                     Bounded LRU: mode-isolated stores, second-bucketed thumbnails
@@ -200,6 +214,7 @@ Sources/AetherEngine/
 │       └── LiveIngestSourceInfo.swift       Internal seam: upstream segment cadence (shapes TARGETDURATION + blocking-reload eligibility) and DualSourceMergeOrder for the dual-source DTS merge
 ├── Native/
 │   ├── Issue93ItemDeathRevive.swift         Bounded revive budget (`ItemDeathReviveGate`) for items killed by accumulated -12889 media timeouts (`failedToPlayToEndTime`, #93 round 3)
+│   ├── MasterFallbackDecision.swift         Pure master → media playlist fallback decision (#98): maps a display-incompatibility item failure (-11868 external-SDR, -11848 HDR-on-SDR) to a reactive re-serve
 │   ├── NativeAVPlayerHost.swift             Native path: AVPlayer host bound to the loopback HLS-fMP4 URL; awaits real seek landing, suppresses stale clock during in-flight seek
 │   └── SoftwarePlaybackHost.swift           SW path: demux loop + decoders + renderer + synchronizer orchestration
 ├── Network/
@@ -212,7 +227,8 @@ Sources/AetherEngine/
 │   ├── Issue100PGSStaleArrival.swift        Holdback (`PGSStaleArrivalGate`) for PGS cues arriving behind the playhead: catch-up bursts resolve via their successor's trim instead of flashing open-ended placeholder windows through the overlay (#100)
 │   ├── MovTextSampleBuilder.swift           Stateless tx3g (mov_text) sample builder for the native legible-subtitle injection path (LoadOptions.prepareNativeSubtitles, #55)
 │   ├── NativeSubtitleCueStore.swift         Owns the decoded-cue array behind a native WebVTT subtitle rendition + the overlay tap feed; deduped, filled by the pump tap (embedded) or one whole-file decode (load-declared external, #88) (#55, Sodalite#32)
-│   └── SubtitleRectText.swift               Plain-text + raw ASS event-line extraction from subtitle rects, shared by the inline and sidecar decoders
+│   ├── SubtitleRectText.swift               Plain-text + raw ASS event-line extraction from subtitle rects, shared by the inline and sidecar decoders
+│   └── WebVTTBuilder.swift                  Builds a plain-text WebVTT body (ASS markup stripped) on the AVPlayer timeline for the separate HLS SUBTITLES rendition so AVKit renders subs in PiP (#15, #55)
 ├── Video/
 │   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
 │   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> FLAC-bridge -> video-only audio cascade
@@ -222,6 +238,7 @@ Sources/AetherEngine/
 │   ├── DoviRpuConverter.swift               Native path: per-packet DV Profile 7 → 8.1 RPU conversion via libdovi (NAL surgery: convert type-62 RPU, drop type-63 EL)
 │   ├── DoviRpuConverter+Probe.swift         Diagnostic DV-conversion probe (`doviConvertProbe` / `DoviConvertProbeResult`), backs `aetherctl dovitest`
 │   ├── Issue65LivelockBreakers.swift        Pure backpressure-wedge detection (`BackpressureWedgeDetector`) breaking the VOD HLS scrub-burst livelock (#65)
+│   ├── Issue99MuxerFailureRevive.swift      Bounded revive for a VOD pump that died with `muxerFailed` (#99): the first cut firing before any bridged audio reached the muxer (dec3 box) no longer ends the session
 │   ├── SlowServeSignal.swift                One-shot slow-serve timer arming the server's early chunked header (keeps TTFB under AVPlayer's ~3.5 s -12889 window, #93 round 3)
 │   ├── VideoSegmentProvider.swift           Native path: playlist-facing segment provider (live sliding window, restart heuristics)
 │   ├── HLSSegmentProducer.swift             Native path: pump loop reading from Demuxer, feeding MP4SegmentMuxer, cutting fragments keyframe-gated in decode order so the IRAP opens its segment (#92); SSAI program-switch detection + no-cut watchdog
@@ -239,13 +256,13 @@ Sources/AetherEngine/
     └── AetherPlayerView.swift               Polymorphic surface: hosts either AVPlayerLayer (native) or AVSampleBufferDisplayLayer (SW)
 ```
 
-The `AetherEngineSMB` product is a separate, opt-in target so its AMSMB2 (LGPL-2.1) dependency never enters the core engine binary. Hosts that need LAN-share playback link it and hand the engine an `smb://` source via the standard `IOReader` seam:
+The `AetherEngineSMB` product is a separate, opt-in target so its SMBClient (MIT) dependency never enters the core engine binary. Hosts that need LAN-share playback link it and hand the engine an `smb://` source via the standard `IOReader` seam:
 
 ```
 Sources/AetherEngineSMB/
-├── AetherEngineSMB.swift                    Product entry point: opt-in SMB2/3 byte source, depends on AMSMB2 (libsmb2); never linked by the core engine
+├── AetherEngineSMB.swift                    Product entry point: opt-in SMB2/3 byte source, depends on SMBClient (pure-Swift, NWConnection); never linked by the core engine
 ├── SMBURL.swift                             Parses smb://[user[:password]@]host[:port]/share/path URLs (missing credentials default to guest)
-├── SMBConnection.swift                      Read-only SMB2/3 byte source over one share + path via AMSMB2 (per-read open/seek/close, no persistent handle)
+├── SMBConnection.swift                      Read-only SMB byte source over one share + path via SMBClient (persistent connection + FileReader; NTLMv2 / guest, SMB 2.0.2 / 2.1 only)
 ├── ByteRangeSource.swift                    Random-access read-only byte-source protocol, isolates the network backend from cursor / seek logic for testability
 └── SMBIOReader.swift                        Bridges a ByteRangeSource into the engine's IOReader (blocking read via a happens-before semaphore edge)
 ```
@@ -258,6 +275,7 @@ The `aetherctl` CLI target (`Sources/aetherctl/`) is documented separately in [d
 | --- | --- | --- |
 | [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) | LGPL-3.0 | Slim FFmpeg 8.1 (avcodec / avformat / avutil / swresample / swscale / avfilter + zimg) for demux + HLS-fMP4 mux + AudioBridge FLAC encode + SW-path dav1d decode + sws_scale YUV → NV12 / P010. avfilter ships a trimmed filter set: zscale + tonemap + colorspace (HDR → SDR still extraction), bwdif + yadif (SW-path deinterlacing) |
 | [LibDovi](https://github.com/superuser404notfound/LibDovi) | MIT / Apache-2.0 | libdovi (the `dolby_vision` crate's C API) for live Dolby Vision Profile 7 to single-layer 8.1 RPU conversion (`dovi_convert_rpu_with_mode`, mode 2), so the Apple TV engages real DV on dual-layer UHD-BD remuxes instead of plain HDR10. Prebuilt xcframework, no Rust at the consumer's build time |
+| [SMBClient](https://github.com/kishikawakatsumi/SMBClient) | MIT | Pure-Swift SMB2 client over `NWConnection`, backing the opt-in `AetherEngineSMB` product only (never linked by the core engine). NTLMv2 / guest, SMB 2.0.2 / 2.1. Replaced AMSMB2/libsmb2, which `EPERM`s on tvOS / iOS |
 | VideoToolbox | System | Native path video decode (HW where available, Apple's bundled SW dav1d on iOS / macOS) |
 | AVFoundation | System | AVPlayer + AVDisplayManager (native path); AVSampleBufferDisplayLayer + AVSampleBufferRenderSynchronizer (SW path) |
 | CoreMedia | System | Sample descriptions, format-description tagging, CMTimebase |
