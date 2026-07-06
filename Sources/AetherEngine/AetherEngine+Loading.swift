@@ -104,6 +104,9 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 self?.clock.sourceTime = value
+                // Feed the playhead mirror the remote-HLS audio tap (#95) reads off its ingest task;
+                // shift 0 on this path, so the rendered position is the source-PTS playhead.
+                self?.renderedPositionMirror.set(value)
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)

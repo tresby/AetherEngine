@@ -17,10 +17,21 @@ extension AetherEngine {
         audioTapController = controller
 
         let stream: AsyncStream<AudioTapBuffer>
-        switch playbackBackend {
-        case .native:
+        let kind = AudioTapReaderSelection.kind(
+            backend: playbackBackend,
+            hasLoopbackSession: nativeVideoSession != nil,
+            nativeRemoteHLS: loadedOptions.nativeRemoteHLS,
+            hasLoadedURL: loadedURL != nil)
+        switch kind {
+        case .loopback:
             stream = controller.makeStream { onStop in
                 guard let reader = makeNativeTapReader(controller: controller) else { return }
+                reader.start()
+                onStop { reader.stop() }
+            }
+        case .remoteHLS:
+            stream = controller.makeStream { onStop in
+                guard let reader = makeRemoteHLSTapReader(controller: controller) else { return }
                 reader.start()
                 onStop { reader.stop() }
             }
@@ -30,7 +41,7 @@ extension AetherEngine {
                 installSoftwareTapSink(controller: controller)
                 onStop { [weak self] in self?.softwareHost?.audioTapSink = nil }
             }
-        default:
+        case .none:
             stream = controller.makeStream { _ in }
         }
         // No session / no audio track / backend .none: nothing will ever yield, finish now.
@@ -100,4 +111,54 @@ extension AetherEngine {
             for buf in converter.convert(sample) { yield(buf) }
         }
     }
+
+    @MainActor
+    private func makeRemoteHLSTapReader(controller: AudioTapController) -> AudioTapHLSReader? {
+        guard let masterURL = loadedURL, let yield = controller.makeYield() else { return nil }
+        let fetcher = AudioTapHLSFetcher()
+        let decoder = AudioTapSegmentDecoder()
+        let base = AudioTapBaseBox(masterURL)
+        // renderedPositionMirror is fed by loadRemoteHLS's $currentTime sink (shift 0 here, so it
+        // equals the source-PTS playhead); AtomicDouble is safe to read off the ingest task.
+        let deps = AudioTapHLSReader.Dependencies(
+            playhead: { [mirror = renderedPositionMirror] in mirror.get() },
+            mediaURL: masterURL,
+            fetchPlaylist: { url in
+                let (playlist, finalURL) = try await fetcher.fetchPlaylist(url)
+                if let audioURI = AudioTapHLSVariantResolver.pickAudioURI(from: playlist),
+                   let audioURL = HLSPlaylistParser.resolve(uri: audioURI, against: finalURL) {
+                    let (mediaPlaylist, mediaFinal) = try await fetcher.fetchPlaylist(audioURL)
+                    base.set(mediaFinal)
+                    guard case .media(let media) = mediaPlaylist else {
+                        throw AudioTapHLSFetcher.FetchError.invalidPlaylist("expected media playlist")
+                    }
+                    return media
+                }
+                base.set(finalURL)
+                guard case .media(let media) = playlist else {
+                    throw AudioTapHLSFetcher.FetchError.invalidPlaylist("expected media playlist")
+                }
+                return media
+            },
+            fetchSegment: { uri, crypt in
+                guard let url = HLSPlaylistParser.resolve(uri: uri, against: base.get()) else {
+                    throw AudioTapHLSFetcher.FetchError.unresolvable
+                }
+                return try await fetcher.fetchSegment(url, crypt: crypt, base: base.get())
+            },
+            decodeSegment: { decoder.decode(selfContainedSegment: $0) },
+            emit: yield)
+        return AudioTapHLSReader(deps: deps)
+    }
+}
+
+/// Publishes the resolved media-playlist base URL from the async playlist resolve to the segment
+/// fetch closure. Segments are relative to the media playlist (after a master -> rendition follow),
+/// not the master URL, so the base is learned during resolution.
+final class AudioTapBaseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var url: URL
+    init(_ url: URL) { self.url = url }
+    func get() -> URL { lock.lock(); defer { lock.unlock() }; return url }
+    func set(_ u: URL) { lock.lock(); url = u; lock.unlock() }
 }
