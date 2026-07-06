@@ -15,21 +15,21 @@ extension AetherEngine {
         }
         let gen = loadGeneration
         let source = await Task.detached(priority: .userInitiated) { [session] in
-            session.liveScrubThumbnailSource(atSeconds: outputSeconds)
+            session.scrubThumbnailSource(atSeconds: outputSeconds)
         }.value
         guard let source else { return nil }
         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices collide with the next channel's.
         guard loadGeneration == gen else { return nil }
         let extractor: FrameExtractor
-        if let idx = liveThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
-            let hit = liveThumbnailExtractors.remove(at: idx)
-            liveThumbnailExtractors.append(hit)
+        if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+            let hit = scrubThumbnailExtractors.remove(at: idx)
+            scrubThumbnailExtractors.append(hit)
             extractor = hit.extractor
         } else {
             extractor = FrameExtractor(reader: DataIOReader(data: source.data), formatHint: "mp4")
-            liveThumbnailExtractors.append((source.segmentIndex, extractor))
-            while liveThumbnailExtractors.count > 2 {
-                let evicted = liveThumbnailExtractors.removeFirst()
+            scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+            while scrubThumbnailExtractors.count > 2 {
+                let evicted = scrubThumbnailExtractors.removeFirst()
                 Task { await evicted.extractor.shutdown() }
             }
         }

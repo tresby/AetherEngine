@@ -304,11 +304,12 @@ public final class AetherEngine: ObservableObject {
     /// parked the session; the host must negotiate a fresh transcode URL and call `load`. No replay; subscribe per session.
     public let liveSourceReset = PassthroughSubject<Void, Never>()
 
-    // MARK: - Live scrub thumbnails
+    // MARK: - Scrub thumbnails
 
-    /// LRU (cap 2) of FrameExtractor contexts for live scrub thumbnails. Reuses open demux/decode contexts
-    /// across scrubs within the same segment; torn down in stopInternal.
-    var liveThumbnailExtractors: [(segmentIndex: Int, extractor: FrameExtractor)] = []
+    /// LRU (cap 2) of FrameExtractor contexts for cache-backed scrub thumbnails (live and
+    /// VOD; a session is one or the other). Reuses open demux/decode contexts across scrubs
+    /// within the same segment; torn down in stopInternal.
+    var scrubThumbnailExtractors: [(segmentIndex: Int, extractor: FrameExtractor)] = []
 
     // MARK: - Output
 
@@ -2351,10 +2352,10 @@ public final class AetherEngine: ObservableObject {
         extractorYieldState.deactivate()
         setPendingRecoverySeekTarget(nil)
 
-        // Shut down live scrub-thumbnail FrameExtractors with the session.
-        let liveThumbs = liveThumbnailExtractors
-        liveThumbnailExtractors.removeAll()
-        for entry in liveThumbs {
+        // Shut down cache-backed scrub-thumbnail FrameExtractors with the session.
+        let scrubThumbs = scrubThumbnailExtractors
+        scrubThumbnailExtractors.removeAll()
+        for entry in scrubThumbs {
             Task { await entry.extractor.shutdown() }
         }
 

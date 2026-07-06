@@ -1371,13 +1371,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
     }
 
-    /// init.mp4 + segment bytes for live scrub-thumbnail (synchronous local I/O; call off-main).
-    /// Returns nil if the file was evicted between lookup and read. `segmentIndex` enables extractor reuse.
-    func liveScrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, segmentIndex: Int)? {
+    /// init.mp4 + segment bytes for a scrub thumbnail (synchronous local I/O; call off-main).
+    /// Live and VOD: reads already-produced SegmentCache bytes over the single playback
+    /// connection, never opening a second one (#106). Returns nil if there is no provider
+    /// or the file was evicted between lookup and read. `segmentIndex` enables extractor reuse.
+    func scrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, segmentIndex: Int)? {
         restartLock.lock()
         let prov = provider
         restartLock.unlock()
-        guard isLiveSession, let prov else { return nil }
+        guard let prov else { return nil }
         guard let seg = prov.thumbnailSegment(atSeconds: seconds) else { return nil }
         guard let initData = prov.peekInitSegment(),
               let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
