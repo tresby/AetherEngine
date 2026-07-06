@@ -11,6 +11,7 @@ final class AudioTapController {
     typealias StartReader = (_ onStop: (@escaping () -> Void) -> Void) -> Void
 
     private var continuation: AsyncStream<AudioTapBuffer>.Continuation?
+    private var filter: AudioTapMonotonicFilter?
     private var stopReader: (() -> Void)?
     private var torndown = false
 
@@ -20,6 +21,7 @@ final class AudioTapController {
         let (stream, cont) = AsyncStream.makeStream(of: AudioTapBuffer.self,
                                                     bufferingPolicy: .bufferingNewest(64))
         continuation = cont
+        filter = AudioTapMonotonicFilter(downstream: { buf in _ = cont.yield(buf) })
         startReader { [weak self] stop in self?.stopReader = stop }
         cont.onTermination = { _ in
             // Consumer cancelled (broke the for-await loop): tear down from the MainActor.
@@ -30,8 +32,8 @@ final class AudioTapController {
 
     /// Thread-safe delivery closure for the reader / SW sink. Nil once torn down.
     func makeYield() -> (@Sendable (AudioTapBuffer) -> Void)? {
-        guard !torndown, let cont = continuation else { return nil }
-        return { buf in _ = cont.yield(buf) }
+        guard !torndown, let filter else { return nil }
+        return { buf in filter.accept(buf) }
     }
 
     /// True when startReader registered a running delivery source. False means nothing will
@@ -45,5 +47,6 @@ final class AudioTapController {
         stopReader = nil
         continuation?.finish()
         continuation = nil
+        filter = nil
     }
 }
