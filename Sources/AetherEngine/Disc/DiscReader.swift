@@ -69,21 +69,27 @@ enum DiscReader {
         // timestamps back so it continues contiguously from clip 0 (AE#105 multi-clip position drift).
         var clipTimeline: [ClipSpan] = []
         let subTicks = selected.bdClipSubtractTicks ?? []
+        let cumBeforeTicks = selected.bdClipCumulativeBeforeTicks ?? []
         for (k, clip) in (selected.bdClipIDs ?? []).enumerated() {
             guard let e = streamDir.first(where: { $0.name == "\(clip).m2ts" }),
                   let exts = try? udf.extents(of: e) else { continue }
             let byteStart = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
-            let subSeconds = k < subTicks.count ? Double(subTicks[k]) / discTickRate : 0
-            clipTimeline.append(ClipSpan(concatByteStart: byteStart, subtractSeconds: subSeconds))
-            EngineLog.emit("[disc] AE#105 clip[\(k)] id=\(clip) subTicks=\(k < subTicks.count ? subTicks[k] : 0) subtractSec=\(String(format: "%.3f", subSeconds)) byteStart=\(byteStart)", category: .demux)
+            let predictedShift = k < subTicks.count ? Double(subTicks[k]) / discTickRate : 0
+            let cumBeforeSec = k < cumBeforeTicks.count ? Double(cumBeforeTicks[k]) / discTickRate : 0
+            clipTimeline.append(ClipSpan(concatByteStart: byteStart,
+                                         cumulativeBeforeSec: cumBeforeSec,
+                                         predictedShiftSec: predictedShift))
+            EngineLog.emit("[disc] AE#105 clip[\(k)] id=\(clip) subTicks=\(k < subTicks.count ? subTicks[k] : 0) predictedSec=\(String(format: "%.3f", predictedShift)) cumBeforeSec=\(String(format: "%.3f", cumBeforeSec)) byteStart=\(byteStart)", category: .demux)
             allExtents += exts
         }
         guard !allExtents.isEmpty else {
             EngineLog.emit("[disc] selected title \(selectedIndex) clips=\(selected.bdClipIDs ?? []) but resolved no m2ts extents in BDMV/STREAM (\(streamDir.count) entries); cannot build stream", category: .demux)
             return nil
         }
-        // Only a multi-clip title with a real (non-zero) offset needs normalization; a single clip is a no-op.
-        if clipTimeline.count < 2 || !clipTimeline.contains(where: { $0.subtractSeconds != 0 }) {
+        // A multi-clip title whose clips carry a real STC jump needs normalization; a single clip, or one
+        // whose clips are already contiguous (predicted offset 0 everywhere), is a no-op. The magnitude of
+        // the predicted offset may be wrong (wrap), but non-zero still flags "these clips jump" reliably.
+        if clipTimeline.count < 2 || !clipTimeline.contains(where: { $0.predictedShiftSec != 0 }) {
             clipTimeline = []
         }
         let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }

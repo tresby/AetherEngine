@@ -170,6 +170,18 @@ public final class Demuxer: @unchecked Sendable {
     /// Last clip index resolved from a packet byte position; reused when a packet reports pos < 0
     /// (reads are sequential, so the clip only advances). Guarded by `accessLock`.
     private var lastClipIndex: Int = 0
+    /// Clip index of the previous packet READ (not the pos<0 fallback), reset to -1 on adopt and on seek.
+    /// A clip's observed base is only trusted on a clean forward crossing (`idx == lastReadClipIdx + 1`),
+    /// so a seek landing mid-clip cannot mis-anchor that clip's fold offset. AE#105.
+    private var lastReadClipIdx: Int = -1
+    /// Observed raw STC base (seconds) of clip 0's first read packet. The fold anchors every clip to this so
+    /// the folded timeline stays in clip 0's raw domain (the producer gate then zero-bases it). NaN until the
+    /// first packet is read. Guarded by `accessLock`. AE#105.
+    private var clipBase0Sec: Double = .nan
+    /// Per-clip fold offset actually applied to packets (seconds), resolved from the clip's OBSERVED raw base
+    /// the first time it is read and cached (stable across seeks). NaN = not yet resolved. Guarded by
+    /// `accessLock`. AE#105.
+    private var clipResolvedShiftSec: [Double] = []
     /// AE#105 diag: last clip index we logged a boundary crossing for, and the last folded PTS
     /// (seconds) seen, so a crossing can print the true raw jump against the applied offset.
     private var diagLastLoggedClipIndex: Int = -1
@@ -180,16 +192,23 @@ public final class Demuxer: @unchecked Sendable {
         selectedDiscTitleIndex = info.selectedTitleIndex
         clipTimeline = info.clipTimeline
         lastClipIndex = 0
+        lastReadClipIdx = -1
+        clipBase0Sec = .nan
+        clipResolvedShiftSec = info.clipTimeline.isEmpty
+            ? []
+            : [0] + Array(repeating: Double.nan, count: info.clipTimeline.count - 1)
+        diagLastLoggedClipIndex = -1
+        diagPrevFoldedSec = .nan
     }
 
-    /// Seconds to subtract from a raw source timestamp of a packet/index entry at byte position `pos`,
-    /// attributing it to its clip via `clipTimeline`. 0 when normalization is off or `pos` is in clip 0.
-    /// Must be called under `accessLock`.
+    /// Predicted (MPLS-derived) seconds to subtract from a raw timestamp/index entry at byte position `pos`.
+    /// Used only by `normalizedTimestamp` for the keyframe-index hint; actual packet folding uses the
+    /// OBSERVED offset in `readPacket`. 0 when normalization is off or `pos` is in clip 0. Under `accessLock`.
     private func clipSubtractSeconds(forPos pos: Int64) -> Double {
         guard !clipTimeline.isEmpty else { return 0 }
         let idx = ClipSpan.index(forPos: pos, in: clipTimeline, fallback: lastClipIndex)
         lastClipIndex = idx
-        return clipTimeline[idx].subtractSeconds
+        return clipTimeline[idx].predictedShiftSec
     }
 
     /// Fold a raw timestamp onto the contiguous presentation timeline given its byte position and time base.
@@ -774,27 +793,57 @@ public final class Demuxer: @unchecked Sendable {
             if si >= 0, si < Int(ctx.pointee.nb_streams), let st = ctx.pointee.streams[si] {
                 let pos = pkt.pointee.pos
                 let idx = ClipSpan.index(forPos: pos, in: clipTimeline, fallback: lastClipIndex)
+                let cleanForward = (idx == lastReadClipIdx + 1)
                 lastClipIndex = idx
-                let sub = clipTimeline[idx].subtractSeconds
                 let tb = st.pointee.time_base
                 let tbSec = (tb.num > 0 && tb.den > 0) ? Double(tb.num) / Double(tb.den) : 0
-                let rawPts = pkt.pointee.pts
-                let rawSec = (rawPts != Int64.min && tbSec > 0) ? Double(rawPts) * tbSec : Double.nan
-                if sub != 0, tbSec > 0 {
-                    let subTicks = Int64((sub / tbSec).rounded())
+                // Reference raw timestamp for base capture / offset resolution: prefer DTS (decode order,
+                // monotonic within a clip); fall back to PTS.
+                let rawRef = pkt.pointee.dts != Int64.min ? pkt.pointee.dts : pkt.pointee.pts
+                let rawRefSec = (rawRef != Int64.min && tbSec > 0) ? Double(rawRef) * tbSec : Double.nan
+
+                // Clip 0's observed raw base anchors the whole fold (playback starts at byte 0, so the first
+                // clip-0 packet read is its true base).
+                if idx == 0, clipBase0Sec.isNaN, rawRefSec.isFinite { clipBase0Sec = rawRefSec }
+
+                // Fold offset actually applied. Clip 0 is untouched (the producer gate zero-bases it). For a
+                // later clip, resolve once from its OBSERVED raw base minus clip 0's base minus the (small,
+                // wrap-free) MPLS presentation offset. Trust the observed base only on a clean forward
+                // crossing so a mid-clip seek cannot mis-anchor it; otherwise fall back to the predicted
+                // offset without caching, so a subsequent clean crossing still resolves it correctly.
+                var shift = 0.0
+                var resolvedNow = false
+                var usedObserved = false
+                if idx > 0 {
+                    let cached = idx < clipResolvedShiftSec.count ? clipResolvedShiftSec[idx] : 0
+                    if cached.isFinite {
+                        shift = cached
+                    } else if cleanForward, clipBase0Sec.isFinite, rawRefSec.isFinite {
+                        shift = ClipFold.offsetSeconds(observedBaseSec: rawRefSec, base0Sec: clipBase0Sec,
+                                                       cumulativeBeforeSec: clipTimeline[idx].cumulativeBeforeSec)
+                        if idx < clipResolvedShiftSec.count { clipResolvedShiftSec[idx] = shift }
+                        resolvedNow = true
+                        usedObserved = true
+                    } else {
+                        shift = clipTimeline[idx].predictedShiftSec
+                    }
+                }
+                if shift != 0, tbSec > 0 {
+                    let subTicks = Int64((shift / tbSec).rounded())
                     if pkt.pointee.pts != Int64.min { pkt.pointee.pts &-= subTicks }
                     if pkt.pointee.dts != Int64.min { pkt.pointee.dts &-= subTicks }
                 }
-                // AE#105 diag: log each clip-boundary crossing so the true per-clip STC jump
-                // (rawSec vs prevFoldedSec) can be compared against the MPLS-derived offset.
-                if idx != diagLastLoggedClipIndex {
+                // AE#105 diag: print each clip-boundary crossing and each first-time offset resolution so the
+                // observed raw base can be compared against the applied offset.
+                if idx != diagLastLoggedClipIndex || resolvedNow {
                     diagLastLoggedClipIndex = idx
-                    let foldedSec = (pkt.pointee.pts != Int64.min && tbSec > 0) ? Double(pkt.pointee.pts) * tbSec : Double.nan
-                    EngineLog.emit("[Demuxer] AE#105 clip boundary -> idx=\(idx) stream=\(si) pos=\(pos) rawSec=\(String(format: "%.3f", rawSec)) subtract=\(String(format: "%.3f", sub))s foldedSec=\(String(format: "%.3f", foldedSec)) prevFoldedSec=\(String(format: "%.3f", diagPrevFoldedSec))", category: .demux)
+                    let foldedSec = (pkt.pointee.dts != Int64.min && tbSec > 0) ? Double(pkt.pointee.dts) * tbSec : Double.nan
+                    EngineLog.emit("[Demuxer] AE#105 clip -> idx=\(idx) stream=\(si) clean=\(cleanForward) rawBaseSec=\(String(format: "%.3f", rawRefSec)) base0=\(String(format: "%.3f", clipBase0Sec)) cumBefore=\(String(format: "%.3f", clipTimeline[idx].cumulativeBeforeSec)) predicted=\(String(format: "%.3f", clipTimeline[idx].predictedShiftSec)) applied=\(String(format: "%.3f", shift))s obs=\(usedObserved) foldedDts=\(String(format: "%.3f", foldedSec)) prevFolded=\(String(format: "%.3f", diagPrevFoldedSec))", category: .demux)
                 }
-                if pkt.pointee.pts != Int64.min, tbSec > 0 {
-                    diagPrevFoldedSec = Double(pkt.pointee.pts) * tbSec
+                if pkt.pointee.dts != Int64.min, tbSec > 0 {
+                    diagPrevFoldedSec = Double(pkt.pointee.dts) * tbSec
                 }
+                lastReadClipIdx = idx
             }
         }
         return packet
@@ -814,6 +863,7 @@ public final class Demuxer: @unchecked Sendable {
             #endif
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
+        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
     }
 
     /// Seek with AVIO read deadline. Returns true if completed; false if aborted.
@@ -831,6 +881,7 @@ public final class Demuxer: @unchecked Sendable {
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
+        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = reader?.readDeadlineFired ?? false

@@ -52,6 +52,10 @@ struct DiscTitle: Sendable, Equatable {
     /// that continues from clip 0 (whose offset is always 0, so the plan/anchor/seeks stay untouched). See
     /// `Demuxer.readPacket` normalization and AE#105.
     let bdClipSubtractTicks: [Int64]?
+    /// Blu-ray: per-clip presentation offset (sum of earlier clips' OUT-IN durations), 45 kHz ticks,
+    /// parallel to `bdClipIDs`. Small and wrap-free, so the demuxer folds each clip using its observed raw
+    /// STC base plus this, instead of the wrap-prone `inTime` in `bdClipSubtractTicks`. See AE#105.
+    let bdClipCumulativeBeforeTicks: [UInt64]?
     /// DVD: the title-set number whose VOBs back this title.
     let dvdVTSN: Int?
     /// DVD: the title number within its VTS.
@@ -59,12 +63,14 @@ struct DiscTitle: Sendable, Equatable {
 
     init(id: Int, durationTicks: UInt64, chapters: [DiscChapter] = [],
          bdClipIDs: [String]? = nil, bdClipSubtractTicks: [Int64]? = nil,
+         bdClipCumulativeBeforeTicks: [UInt64]? = nil,
          dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil) {
         self.id = id
         self.durationTicks = durationTicks
         self.chapters = chapters
         self.bdClipIDs = bdClipIDs
         self.bdClipSubtractTicks = bdClipSubtractTicks
+        self.bdClipCumulativeBeforeTicks = bdClipCumulativeBeforeTicks
         self.dvdVTSN = dvdVTSN
         self.dvdTitleNumber = dvdTitleNumber
     }
@@ -77,8 +83,15 @@ struct DiscTitle: Sendable, Equatable {
 struct ClipSpan: Sendable, Equatable {
     /// Byte offset in the concatenated stream where this clip's bytes begin.
     let concatByteStart: Int64
-    /// Seconds to subtract from a raw source timestamp of a packet in this clip (0 for the first clip).
-    let subtractSeconds: Double
+    /// MPLS presentation offset of this clip's start (seconds, title-relative): a sum of earlier clips'
+    /// durations, so small and wrap-free. Combined with the OBSERVED raw STC base of clip 0 and clip k at
+    /// read time, it yields the fold offset without trusting the wrap-prone `inTime` fields (AE#105).
+    let cumulativeBeforeSec: Double
+    /// Old MPLS-predicted fold offset (`inTime[k] - inTime[0] - cumulativeBefore[k]`). `inTime` is a 32-bit
+    /// 45 kHz field that wraps at ~95443 s, so this is wrong when a clip's STC base crosses the wrap point.
+    /// Kept only as the keyframe-index hint (`normalizedTimestamp`) and as a fallback used before the
+    /// observed raw base of a clip has been read.
+    let predictedShiftSec: Double
 }
 
 extension ClipSpan {
@@ -95,6 +108,16 @@ extension ClipSpan {
             if spans[mid].concatByteStart <= pos { lo = mid + 1 } else { hi = mid }
         }
         return max(0, lo - 1)
+    }
+}
+
+/// AE#105 fold arithmetic, isolated for testing. A later clip's fold offset pulls its OBSERVED raw STC base
+/// back so its content continues right after all earlier clips' presentation duration, anchored to clip 0's
+/// observed base. Using the observed (already 33-bit-unwrapped by the demuxer) base instead of the MPLS
+/// `inTime` field is what makes it correct when a clip's STC base crosses the 32-bit `inTime` wrap (~95443s).
+enum ClipFold {
+    static func offsetSeconds(observedBaseSec: Double, base0Sec: Double, cumulativeBeforeSec: Double) -> Double {
+        observedBaseSec - base0Sec - cumulativeBeforeSec
     }
 }
 

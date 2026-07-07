@@ -47,7 +47,8 @@ enum BDTitleSelector {
                 }
                 return DiscTitle(id: index, durationTicks: playlist.durationTicks,
                                  chapters: chapters, bdClipIDs: playlist.clipIDs,
-                                 bdClipSubtractTicks: clipSubtractTicks(playlist))
+                                 bdClipSubtractTicks: clipSubtractTicks(playlist),
+                                 bdClipCumulativeBeforeTicks: playlist.cumulativeBefore.count == playlist.clipIDs.count ? playlist.cumulativeBefore : nil)
             }
     }
 
