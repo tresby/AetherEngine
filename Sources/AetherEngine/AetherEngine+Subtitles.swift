@@ -243,6 +243,13 @@ extension AetherEngine {
                 window = (from, through)
             case .resetAndDecode(let from, let through):
                 subtitleDrainDecoders[channel] = nil
+                // Fresh selection or seek: the backscan decodes compositions BEHIND the
+                // playhead. Run them through the gate's reconstruction admission so the
+                // currently-active line is emitted once at the playhead instead of being
+                // held as a stale arrival until the next composition trims it (the old
+                // reader's lead-in behavior; without this, enabling subs mid-sentence
+                // shows nothing until the next line).
+                pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()].reconstructing = true
                 window = (from, through)
             }
             if subtitleDrainDecoders[channel] == nil {
