@@ -133,37 +133,6 @@ public final class Demuxer: @unchecked Sendable {
     private var avioProvider: AVIOProvider?
     private var openProfile: DemuxerOpenProfile = .playback
 
-    /// #112 round 11: mirror of `avioProvider` reachable WITHOUT `accessLock`, so a successor side
-    /// reader can abort a predecessor's wedged positioning seek (which holds `accessLock` for its whole
-    /// bounded duration). Guarded by its own lock; assigned before `avformat_open_input` so even a read
-    /// wedged inside the open/probe is abortable.
-    private let abortHandleLock = NSLock()
-    private var abortHandle: AVIOProvider?
-
-    private func setAbortHandle(_ provider: AVIOProvider?) {
-        abortHandleLock.lock()
-        abortHandle = provider
-        abortHandleLock.unlock()
-    }
-
-    /// #112 round 11: request that the provider's in-flight reads return at the next callback boundary
-    /// (latching `readDeadlineFired`, so a bounded seek reports failure) without tearing the provider
-    /// down. Callable from any thread; never takes `accessLock`. Reversible via `clearPositioningAbort`.
-    public func requestPositioningAbort() {
-        abortHandleLock.lock()
-        let provider = abortHandle
-        abortHandleLock.unlock()
-        provider?.requestReadAbort()
-    }
-
-    /// Clear a pending positioning abort so this demuxer's next owner reads normally.
-    public func clearPositioningAbort() {
-        abortHandleLock.lock()
-        let provider = abortHandle
-        abortHandleLock.unlock()
-        provider?.clearReadAbort()
-    }
-
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
     /// duration). The side reader caps the timestamp-seek attempt tight when this is true, because the
     /// verified estimate is a cheaper, bounded way to position on an index-less source.
@@ -405,7 +374,6 @@ public final class Demuxer: @unchecked Sendable {
     ) throws {
         try provider.open()
         avioProvider = provider
-        setAbortHandle(provider)
 
         guard let ctx = avformat_alloc_context() else {
             avioProvider?.close()
@@ -1194,7 +1162,6 @@ public final class Demuxer: @unchecked Sendable {
 
         avioProvider?.close()
         avioProvider = nil
-        setAbortHandle(nil)
     }
 
     deinit {
