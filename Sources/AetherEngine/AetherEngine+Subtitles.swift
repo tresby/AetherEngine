@@ -262,8 +262,10 @@ extension AetherEngine {
             // empty because the producer has not reached it yet must be rescanned next tick.
             var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
             for entry in entries {
+                // A cue-less event still matters: a PGS clear composition carries only
+                // pgsTrimAt and is what removes the line during silence.
                 if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder),
-                   !event.cues.isEmpty {
+                   !event.cues.isEmpty || event.pgsTrimAt != nil {
                     applySubtitleEvent(event, channel: channel)
                 }
                 lastDecoded = entry.ptsSeconds
