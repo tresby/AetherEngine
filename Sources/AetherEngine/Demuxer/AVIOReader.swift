@@ -496,31 +496,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         readDeadline = .distantFuture
     }
 
-    /// #112 round 11: reversible cross-thread read abort (benign-race plain Bool, same discipline as the
-    /// bridge's `isClosed`). A successor side reader sets it so a predecessor wedged inside a bounded
-    /// positioning seek returns at the next check point instead of riding out its budget; unlike
-    /// `markClosed` the reader stays usable, so the successor reuses the warm demuxer. Deliberately NOT
-    /// cleared by `beginReadDeadline` (the abort must win a disarm/re-arm race); the successor clears it
-    /// at acquisition.
-    private var readAbortRequested = false
-
-    func requestReadAbort() {
-        readAbortRequested = true
-        // Same wake set as markClosed, minus the destructive parts: nudge parked waits so the abort is
-        // observed within one poll/loop iteration instead of a full stall window.
-        prefetchReady.signal()
-        streamDataReady.signal()
-        winCond.lock()
-        winCond.broadcast()
-        winCond.unlock()
-    }
-
-    func clearReadAbort() {
-        readAbortRequested = false
-    }
-
-    /// Deadline expired or an abort was requested; both latch `readDeadlineFired` at the check sites.
-    private var readDeadlinePassedOrAborted: Bool { isPastReadDeadline || readAbortRequested }
+    /// Deadline expired; latches `readDeadlineFired` at the check sites.
+    private var readDeadlinePassedOrAborted: Bool { isPastReadDeadline }
 
     // Streaming task/session held so teardown can cancel and unblock streamDownloadSync.
     private var streamingSession: URLSession?
@@ -1693,7 +1670,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let probeBudget = min(25, chunkRequestTimeout)
         if Self.awaitSignal(semaphore, budget: probeBudget, pollInterval: 0.1,
                             shouldAbort: { [weak self] in
-                                self?.isClosed == true || self?.readAbortRequested == true
+                                self?.isClosed == true
                             }) != .signaled {
             task.cancel()
             EngineLog.emit("[AVIOReader] Range probe timed out, trying HEAD", category: .demux, level: .verbose)

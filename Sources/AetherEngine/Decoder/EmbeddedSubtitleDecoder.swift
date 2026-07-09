@@ -636,6 +636,7 @@ final class EmbeddedSubtitleDecoder {
             position = CGRect(x: 0.1, y: 0.8, width: 0.8, height: 0.15)
         }
 
-        return SubtitleImage(cgImage: cgImage, position: position)
+        return SubtitleImage(cgImage: cgImage, position: position,
+                             canvasSize: CGSize(width: Int(videoWidth), height: Int(videoHeight)))
     }
 }

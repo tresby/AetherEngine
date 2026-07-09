@@ -255,9 +255,6 @@ extension AetherEngine {
                 // a debounced re-anchor once the restart run drains; it no-ops unless the retained store fails to
                 // cover the playhead. onSeekStateChanged is emitted only from the restart path, never for an ordinary
                 // in-budget seek, so this does not disturb the normal seek re-arm.
-                if !inFlight {
-                    self.scheduleEmbeddedSubtitleReanchor()
-                }
             }
         }
         session.onNetworkPhaseChanged = { [weak self] phase in
@@ -383,9 +380,9 @@ extension AetherEngine {
         let hasCC608 = subtitleTracks.contains { Self.isEmbeddedClosedCaptionCodec($0.codec) }
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && (hasTextSubtitleTrack || hasCC608)
         // Sodalite#32 Phase 2: tap decoders honor the host's markup preference (overlay renders styled
-        // ASS; the WebVTT rendition strips at serve), and decoded tap events feed the overlay directly.
+        // ASS; the WebVTT rendition strips at serve). #112 rework: the overlay itself is fed by the
+        // packet-store drainer, not by tap-event forwarding.
         session.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
-        armSubtitleTapOverlayForwarding(on: session)
         EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
@@ -777,6 +774,14 @@ extension AetherEngine {
         }
         self.softwareHost = host
         applyDesiredVolume(to: host)
+        // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
+        // playhead-paced drainer reads it exactly like the HLS session's store.
+        let packetStore = SubtitlePacketStore()
+        self.softwareSubtitlePacketStore = packetStore
+        host.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
+        host.subtitleTapSink = { idx, pkt, tb in
+            packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
+        }
         // SW path tracks source PTS directly; no AVPlayer-clock fold needed.
         self.playlistShiftSeconds = 0
         self.liveShiftSeams.removeAll()

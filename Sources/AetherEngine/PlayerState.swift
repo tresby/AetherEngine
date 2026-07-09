@@ -516,10 +516,17 @@ extension SubtitleCue: Equatable {
 public struct SubtitleImage: @unchecked Sendable {
     public let cgImage: CGImage
     public let position: CGRect
+    /// Coded pixel size of the subtitle canvas `position` is normalized against (PGS/DVB
+    /// composition canvas, e.g. 1920x1080). A cropped-video rip can have a canvas taller
+    /// than the coded video; hosts map the canvas width-aligned and center-anchored onto
+    /// the video rect so cues land where the disc authored them (incl. the lower bar).
+    /// .zero when unknown (pre-canvas cues): hosts fall back to treating canvas == video.
+    public let canvasSize: CGSize
 
-    public init(cgImage: CGImage, position: CGRect) {
+    public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero) {
         self.cgImage = cgImage
         self.position = position
+        self.canvasSize = canvasSize
     }
 }
 

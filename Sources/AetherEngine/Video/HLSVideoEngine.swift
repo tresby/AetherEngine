@@ -150,14 +150,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var subtitleTapRoutes: [Int32: (decoder: EmbeddedSubtitleDecoder, store: NativeSubtitleCueStore)] = [:]
     private let subtitleTapLock = NSLock()
 
+    /// #112 rework: session-lifetime retention of every embedded subtitle stream's packets,
+    /// harvested by the producer pump (no second connection, no side demuxer). The MainActor
+    /// overlay drainer decodes from it near the playhead. Survives producer restarts.
+    let subtitlePacketStore = SubtitlePacketStore()
+
+    /// #112 rework: every embedded subtitle stream in the session demuxer, text AND bitmap.
+    /// These all stay in the producer keep-set so late track enables need no restart.
+    var allEmbeddedSubtitleStreamIndices: Set<Int32> {
+        Set((demuxer?.subtitleTrackInfos() ?? []).map { Int32($0.id) })
+    }
+
+    /// #112 rework: build an overlay decoder for any embedded subtitle stream (text or
+    /// bitmap), seeded exactly like the tap routes. The drainer owns the returned decoder.
+    func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+        guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
+        let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
+        let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
+        return EmbeddedSubtitleDecoder(stream: stream,
+                                       sourceVideoWidth: w > 0 ? w : 1920,
+                                       sourceVideoHeight: h > 0 ? h : 1080,
+                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+    }
+
     /// Sodalite#32 Phase 2: tap decoders honor the host's markup preference so the overlay can render
     /// styled ASS from tap-fed cues; the WebVTT rendition strips the markup at serve time instead.
     /// Set before start() (AetherEngine+Loading).
     var preserveASSMarkupForSubtitleTap = false
-
-    /// Sodalite#32 Phase 2: decoded tap events, forwarded after the store append. AetherEngine routes
-    /// the ACTIVE track's events into the host overlay (subtitleCues), replacing the side reader.
-    var onSubtitleTapEvent: (@Sendable (Int32, EmbeddedSubtitleDecoder.SubtitleEvent) -> Void)?
 
     var subtitleTapActive: Bool {
         subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
@@ -252,6 +271,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self?.handleSubtitleTapPacket(streamIndex: idx, packet: pkt, timeBase: tb)
             }
         }
+        // #112 rework: harvest every embedded subtitle stream's packets into the session
+        // store. Runs on the pump thread; the store is lock-guarded.
+        prod.subtitlePacketSink = { [subtitlePacketStore] idx, pkt, tb in
+            subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
+        }
     }
 
     /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode
@@ -265,7 +289,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if let event = route.decoder.decode(packet: packet, streamTimeBase: timeBase),
            !event.cues.isEmpty {
             route.store.appendCues(event.cues)
-            onSubtitleTapEvent?(streamIndex, event)
         }
     }
 
@@ -1545,6 +1568,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartTargetVideoDts: videoTarget,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
+            subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
             desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
