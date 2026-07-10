@@ -84,6 +84,10 @@ extension AetherEngine {
             host.setExternalMetadata(pendingExternalMetadata)
         }
         self.nativeHost = host
+        // A surface bound BEFORE load ran presentCurrentLayer() while nativeHost was still nil
+        // (no-op); without this re-present nothing ever attaches host.playerLayer and AVPlayer
+        // plays audio into a black view (#120). Mirrors loadNative's post-host call.
+        presentCurrentLayer()
         applyDesiredVolume(to: host)
         // No loopback producer; playhead is the raw AVPlayer clock. Shift stays 0.
         self.playlistShiftSeconds = 0
