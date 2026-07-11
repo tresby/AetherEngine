@@ -366,7 +366,7 @@ extension AetherEngine {
 
     @MainActor
     private func insertSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
-        Self.insertCueSorted(cue, into: &cues)
+        Self.insertCueSorted(cue, into: &cues, nextID: &nextRetainedSubtitleCueID)
     }
 
     /// #112 full umbau: sorted insert of a decoded cue into the retained store, keeping ascending start order. An
@@ -374,21 +374,50 @@ extension AetherEngine {
     /// a same-start image cue is the same line re-decoded (the audio-switch preserved placeholder vs its
     /// reconstruction), and a duplicate would render the bitmap twice until the next composition trims it. Text cues
     /// at the same start are distinct simultaneous speakers and are both kept.
-    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
-        if case .image = cue.body,
+    ///
+    /// #121: `nextID` stamps every materialized cue with a session-monotonic id and de-dupes a text cue already
+    /// present with the same window + content. On a seek the overlay decoder is rebuilt (`.resetAndDecode`) with an
+    /// empty `seenKeys` and a `nextCueID` reset to zero, so its backscan re-decodes cues still retained here; without
+    /// a store-level guard the text cues accumulate (report: 4 -> 7 -> 11) and the reset ids collide with retained
+    /// ids (`ForEach(id:)` "occurs multiple times"). The retained store is the session-wide source of truth, so the
+    /// invariant lives here, not on the ephemeral decoder.
+    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue], nextID: inout Int) {
+        // A text cue already present with the same window and content is a re-decode of a retained line, not a new
+        // one. Content (not id) is compared: two simultaneous speakers differ in text and both survive; a genuine
+        // repeat at a new time has a different window and is inserted. Deduped cues consume no id (no gap).
+        if case .text(let text) = cue.body,
+           cues.contains(where: { other in
+               other.startTime == cue.startTime
+                   && other.endTime == cue.endTime
+                   && other.text == text
+           }) {
+            return
+        }
+
+        let stamped = SubtitleCue(id: nextID, startTime: cue.startTime, endTime: cue.endTime, body: cue.body)
+        nextID += 1
+
+        if case .image = stamped.body,
            let existing = cues.firstIndex(where: { other in
-               if case .image = other.body { return other.startTime == cue.startTime }
+               if case .image = other.body { return other.startTime == stamped.startTime }
                return false
            }) {
-            cues[existing] = cue
+            cues[existing] = stamped
             return
         }
         var lo = 0, hi = cues.count
         while lo < hi {
             let mid = (lo + hi) / 2
-            if cues[mid].startTime < cue.startTime { lo = mid + 1 } else { hi = mid }
+            if cues[mid].startTime < stamped.startTime { lo = mid + 1 } else { hi = mid }
         }
-        cues.insert(cue, at: lo)
+        cues.insert(stamped, at: lo)
+    }
+
+    /// Legacy 2-arg entry that preserves the caller's cue id (test / utility use). The engine path uses the `nextID`
+    /// overload so ids stay session-monotonic across decoder rebuilds (#121).
+    nonisolated static func insertCueSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
+        var id = cue.id
+        insertCueSorted(cue, into: &cues, nextID: &id)
     }
 
     /// Prune cues whose `endTime` is older than the retention window. Uses `sourceTime` because cue.startTime/endTime are absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode).

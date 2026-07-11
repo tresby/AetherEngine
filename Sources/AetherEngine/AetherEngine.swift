@@ -276,6 +276,14 @@ public final class AetherEngine: ObservableObject {
     var softwareSubtitlePacketStore: SubtitlePacketStore?
     var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
     var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
+    /// #121: session-monotonic id source for cues entering the retained overlay stores
+    /// (`subtitleCues` / `secondarySubtitleCues`). The overlay decoder is rebuilt on every seek
+    /// (`.resetAndDecode`), restarting its own `nextCueID` at zero, so decoder-local ids cannot stay
+    /// unique across the cues that survive the seek. Stamping at the insert funnel keeps the retained
+    /// arrays collision-free (the `SubtitleCue: Equatable` / host `ForEach(id:)` contract). Never reset:
+    /// monotonic for the engine's lifetime is collision-proof and needs no coordination with the many
+    /// array-clear sites.
+    var nextRetainedSubtitleCueID: Int = 0
     nonisolated static let subtitleDrainLeadSeconds: Double = 60
     nonisolated static let subtitleDrainBackscanSeconds: Double = 15
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
