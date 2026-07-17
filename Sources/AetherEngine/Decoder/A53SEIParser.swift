@@ -140,8 +140,8 @@ enum A53SEIParser {
             while i < n, rbsp[i] == 0xFF { payloadSize += 255; i += 1 }
             guard i < n else { return }
             payloadSize += Int(rbsp[i]); i += 1
-            guard payloadSize > 0, i + payloadSize <= n else { return }
-            if payloadType == 4 {   // user_data_registered_itu_t_t35
+            guard i + payloadSize <= n else { return }
+            if payloadType == 4, payloadSize > 0 {   // user_data_registered_itu_t_t35
                 parseT35(rbsp, offset: i, size: payloadSize, into: &out)
             }
             i += payloadSize

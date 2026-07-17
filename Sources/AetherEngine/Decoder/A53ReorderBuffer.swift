@@ -32,13 +32,15 @@ struct A53ReorderBuffer {
     private(set) var overflowed = false
 
     /// Insert one packet's caption pairs; returns every group now safe to feed, in presentation order.
+    /// Equal-PTS groups drain in FIFO (insertion) order: interlaced field pairs can carry the same
+    /// PTS, and the 608 decoder is order-sensitive, so a stable insert (`<=`, not `<`) matters.
     mutating func insert(pts: Double, pairs: [Pair], dts: Double?) -> [Group] {
         if let dts, dts < maxDTS - 1.0 {
             pending.removeAll(keepingCapacity: true)
             maxDTS = -.infinity
         }
         var lo = 0, hi = pending.count
-        while lo < hi { let m = (lo + hi) / 2; if pending[m].pts < pts { lo = m + 1 } else { hi = m } }
+        while lo < hi { let m = (lo + hi) / 2; if pending[m].pts <= pts { lo = m + 1 } else { hi = m } }
         pending.insert(Group(pts: pts, pairs: pairs), at: lo)
         if let dts { maxDTS = max(maxDTS, dts) }
         var ready: [Group] = []

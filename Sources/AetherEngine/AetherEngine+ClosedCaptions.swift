@@ -117,7 +117,10 @@ final class ClosedCaptionTap: @unchecked Sendable {
     private func detectCaptionDataLocked(_ pairs: [A53ReorderBuffer.Pair]) {
         guard !a53Detected, Self.containsRealCaptionData(pairs) else { return }
         a53Detected = true
-        Task { @MainActor [weak engine] in engine?.notifyA53CaptionsDetected() }
+        Task { @MainActor [weak engine, weak self] in
+            guard let self else { return }
+            engine?.notifyA53CaptionsDetected(from: self)
+        }
     }
 
     /// #131 producer-path ingest: decode-order SEI triplet groups, reordered to presentation order
@@ -238,10 +241,21 @@ extension AetherEngine {
     /// Far above any real stream index, below `externalSubtitleTrackIDBase`.
     public static let a53ClosedCaptionTrackID = 99_608
 
+    /// First subtitle track that is a REAL demuxable in-band CC stream. Excludes the synthetic A53
+    /// entry (#131): reload paths that rebuild a session without re-probing still carry it in
+    /// `subtitleTracks`, and it has no AVStream to tap or serve; session-arming code must never
+    /// key on it (the #98 rendition and the c608 tap would bind to nonexistent stream 99608).
+    var demuxableClosedCaptionTrack: TrackInfo? {
+        subtitleTracks.first { Self.isEmbeddedClosedCaptionCodec($0.codec) && $0.id != Self.a53ClosedCaptionTrackID }
+    }
+
     /// #131: an A53-mode tap saw its first real caption data. Surface the synthetic `eia_608` track
     /// once; every existing CC selection/mirroring path (and host menus) keys off the codec + id.
     @MainActor
-    func notifyA53CaptionsDetected() {
+    func notifyA53CaptionsDetected(from tap: ClosedCaptionTap) {
+        // A stale tap's pending notify (queued before a teardown/successor session swapped
+        // `closedCaptionTap` out) must not resurrect the track on the wrong session.
+        guard closedCaptionTap === tap else { return }
         guard !subtitleTracks.contains(where: { $0.id == Self.a53ClosedCaptionTrackID }) else { return }
         subtitleTracks.append(TrackInfo(
             id: Self.a53ClosedCaptionTrackID, name: "Closed Captions", codec: "eia_608",
@@ -262,13 +276,11 @@ extension AetherEngine {
         ccCueSnapshot = []
         ccLastSnapshotSeq = 0
         ccNativeStore = nil
-        // Exclude the synthetic A53 entry: a reload that rebuilds the session without re-probing
-        // (audio switch, custom-source reload) still carries it in subtitleTracks, and it has no
-        // demuxable stream to tap; treating it as one would arm a dead observer (and the SW guard
-        // below would skip arming), silently dropping captions after the reload.
-        if let ccTrack = subtitleTracks.first(where: {
-            Self.isEmbeddedClosedCaptionCodec($0.codec) && $0.id != Self.a53ClosedCaptionTrackID
-        }) {
+        // Excludes the synthetic A53 entry via `demuxableClosedCaptionTrack` (see its doc comment):
+        // a reload that rebuilds the session without re-probing (audio switch, custom-source reload)
+        // still carries it in subtitleTracks, and treating it as a real stream would arm a dead
+        // observer, silently dropping captions after the reload.
+        if let ccTrack = demuxableClosedCaptionTrack {
             let idx = Int32(ccTrack.id)
             let tap = ClosedCaptionTap(engine: self, ccStreamIndex: idx)
             closedCaptionTap = tap
