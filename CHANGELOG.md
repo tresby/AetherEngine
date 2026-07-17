@@ -10,6 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.4.0] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.4.0))
+
+### Added
+
+- **`stop(resetDisplayCriteria:)` lets a handoff stop preserve the panel's HDMI mode (#128).** Nil-ing `preferredDisplayCriteria` during a same-mode stop()/load() handoff bounced tvOS through SDR before re-negotiating the same Dolby Vision mode. `stop(resetDisplayCriteria: false)` keeps the criteria applied so the next `load()` overwrites it in place; the plain `stop()` default is unchanged. Thanks to thatcube for the fix, verified on real hardware.
+
+### Fixed
+
+- **Back-to-back `load()` calls no longer bounce the panel through SDR (#128 follow-up).** The engine's own load-over-load seam (e.g. a next-episode handoff that reloads in place) reset the criteria the same way before `apply()` re-negotiated. The seam now preserves the criteria; audio-only sessions and suppressed (AVKit-sole-writer) hosts clear a leftover criteria at routing time instead, so music playback cannot keep the panel in DV/HDR and dual writers cannot fight.
+
 ## [5.3.1] - 2026-07-16
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.3.1))
