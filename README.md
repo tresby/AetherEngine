@@ -328,4 +328,6 @@ Big thanks to [@DrHurt](https://github.com/DrHurt) for the relentless on-device 
 
 ## License
 
-[LGPL-3.0 with Apple Store / DRM Exception](LICENSE). The exception clause grants explicit permission to distribute through application stores (Apple App Store, TestFlight, etc.) whose terms otherwise conflict with LGPL §4–6. Modifications to the engine itself still have to be released under LGPL.
+[LGPL-3.0 with Apple Store / DRM Exception](LICENSE). The exception clause grants explicit permission to distribute through application stores (Apple App Store, TestFlight, etc.) whose terms otherwise conflict with LGPL sections 4 to 6. Modifications to the engine itself still have to be released under LGPL.
+
+The exception covers AetherEngine's own code; it does not extend to FFmpeg. FFmpeg reaches your app through [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) as dynamically linked frameworks under plain LGPL-2.1-or-later (no GPL components), which keeps the relink requirement satisfiable for closed-source App Store apps. See FFmpegBuild's README for the per-component licenses and the concrete adopter steps (embed dynamically, ship the license texts, link the build's source).

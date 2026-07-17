@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.5.0] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.5.0))
+
+### Changed
+
+- **FFmpeg now ships as dynamically linked frameworks (FFmpegBuild 2.0.0).** The FFmpeg xcframeworks were static archives that SPM linked into the app binary, which left closed-source App Store adopters without a realistic LGPL compliance path. They are now dynamic frameworks that Xcode embeds and signs in the app bundle automatically; no integration changes are needed. FFmpegBuild 2.0.0 also corrects the license statement (the FFmpeg parts are LGPL-2.1-or-later, not LGPL-3.0) and excludes libzvbi's GPL-2 sources from the build, so no GPL code ships in the binaries. The README's License section now spells out that the engine's store exception does not extend to FFmpeg and what adopters have to do instead. Thanks to the adopter whose licensing review flagged the contradiction.
+
 ## [5.4.1] - 2026-07-17
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.4.1))

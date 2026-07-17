@@ -1,13 +1,13 @@
 {
-  "originHash" : "e8e51c88a81ac7ce92e945ff40a1b0f2de98fb65d0a578c782e91d26230ff49c",
+  "originHash" : "b2f1370a3a117413ee2561588c1eabae92ddf1d642111b66c416cb714e74b7f3",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/FFmpegBuild",
       "state" : {
-        "revision" : "f2d077708370f0098d73a3328cd7aea3c90291f5",
-        "version" : "1.0.5"
+        "revision" : "67f7f7bd34d8b8a40acba6e37544092c7b8a47a8",
+        "version" : "2.0.0"
       }
     },
     {
