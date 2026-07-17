@@ -68,15 +68,10 @@ final class LiveTelemetrySampler {
 
     /// Dedicated + serial: the sync XPC reads may block for seconds, which must not tie up the
     /// shared cooperative pool, and serial means a stalled tick back-pressures the next one
-    /// instead of piling up concurrent reads against an already busy media server.
-    private nonisolated static let readQueue = DispatchQueue(label: "engine.telemetry.avfread", qos: .utility)
-
-    /// AVPlayer/AVPlayerItem are not Sendable; the properties the batch reads are documented
-    /// thread-safe, so the refs ride to the read queue in an unchecked box.
-    private struct PlayerRefs: @unchecked Sendable {
-        let player: AVPlayer
-        let item: AVPlayerItem
-    }
+    /// instead of piling up concurrent reads against an already busy media server. Per instance,
+    /// not static: a wedged read from a stopped sampler must not queue ahead of the next
+    /// session's sampler (or another engine's).
+    private let readQueue = DispatchQueue(label: "engine.telemetry.avfread", qos: .utility)
 
     private var byteWindow = RollingWindow<Int64>(capacity: 10, zero: 0)   // 10-second rolling window
     private var frameWindow = RollingWindow<Int>(capacity: 10, zero: 0)
@@ -179,9 +174,12 @@ final class LiveTelemetrySampler {
             avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
             if let player = engine.currentAVPlayer, let item = player.currentItem {
                 let readings = await readNativeOffMain(player: player, item: item)
-                // stop() may have cancelled this tick while the read was in flight; publishing
-                // now would leak a stale snapshot and yield-gate tick into the next session.
-                guard !Task.isCancelled else { return }
+                // stop() may have cancelled this tick, or a reload seam may have swapped the
+                // player/item, while the read was in flight; publishing now would leak a stale
+                // snapshot and yield-gate tick into the current session.
+                guard !Task.isCancelled,
+                      engine.currentAVPlayer === player,
+                      player.currentItem === item else { return }
                 nativeReadings = readings
                 droppedFrameCount = readings.droppedFrameCount
                 networkThroughputMbps = readings.networkThroughputMbps
@@ -297,12 +295,9 @@ final class LiveTelemetrySampler {
     /// Hops the AVFoundation batch onto the dedicated read queue and back. The main actor only
     /// suspends here; a stalled mediaserverd reply parks a GCD thread, not the main thread.
     private func readNativeOffMain(player: AVPlayer, item: AVPlayerItem) async -> NativeAVFReadings {
-        let refs = PlayerRefs(player: player, item: item)
         let read = nativeRead
-        return await withCheckedContinuation { continuation in
-            Self.readQueue.async {
-                continuation.resume(returning: read(refs.player, refs.item))
-            }
+        return await AVFoundationOffMain.read((player, item), on: readQueue) { player, item in
+            read(player, item)
         }
     }
 

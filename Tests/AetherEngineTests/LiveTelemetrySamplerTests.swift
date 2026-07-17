@@ -76,18 +76,40 @@ struct LiveTelemetrySamplerTests {
         sampler.stop()
     }
 
-    @Test("stop() during a stalled read drops the in-flight snapshot")
-    func stopDuringStalledReadDropsSnapshot() async throws {
+    @Test("a player swap during a stalled read drops the in-flight snapshot")
+    func playerSwapDuringStalledReadDropsSnapshot() async throws {
         let engine = try makeNativeEngine()
-        let entered = EnteredFlag()
+        let entered = AtomicBool(false)
         let release = DispatchSemaphore(value: 0)
         let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
-            entered.set()
+            entered.set(true)
             _ = release.wait(timeout: .now() + 3)
             return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
-        let readStarted = try await waitUntil { entered.isSet }
+        let readStarted = try await waitUntil { entered.get() }
+        #expect(readStarted)
+        // Reload seam: the engine swaps in a new player while the old item's read is in flight.
+        engine.currentAVPlayer = AVPlayer(playerItem: AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent-134b.mp4")))
+        release.signal()
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(engine.diagnostics.liveTelemetry == nil)
+        #expect(engine.extractorYieldState.snapshot().consecutiveHealthyTicks == 0)
+        sampler.stop()
+    }
+
+    @Test("stop() during a stalled read drops the in-flight snapshot")
+    func stopDuringStalledReadDropsSnapshot() async throws {
+        let engine = try makeNativeEngine()
+        let entered = AtomicBool(false)
+        let release = DispatchSemaphore(value: 0)
+        let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
+            entered.set(true)
+            _ = release.wait(timeout: .now() + 3)
+            return NativeAVFReadings(forwardBufferSeconds: 12.0)
+        })
+        sampler.start()
+        let readStarted = try await waitUntil { entered.get() }
         #expect(readStarted)
         sampler.stop()
         release.signal()
@@ -108,13 +130,4 @@ struct LiveTelemetrySamplerTests {
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == nil)
         sampler.stop()
     }
-}
-
-/// Lock-guarded bool the injected read (running on the sampler's read queue) can set
-/// and the main-actor test can poll.
-private final class EnteredFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    func set() { lock.lock(); value = true; lock.unlock() }
-    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
