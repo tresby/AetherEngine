@@ -71,6 +71,12 @@ enum SubtitleRectText {
         var runs: [SubtitleTextRun] = []
         var current = ""
         var color: SubtitleColor? = nil
+        // Collapse consecutive newlines to one across the WHOLE cue (persists across colour-run
+        // flushes). libzvbi positions captions by teletext ROW, so two captions on non-adjacent
+        // rows arrive with the blank rows between them as repeated `\N`, which would render as a
+        // big vertical gap. Starting true also suppresses leading blank rows. A genuine two-line
+        // caption keeps its single `\n`.
+        var lastWasNewline = true
 
         func flush() {
             guard !current.isEmpty else { return }
@@ -88,8 +94,11 @@ enum SubtitleRectText {
             let c = chars[i]
             if c == "\\", i + 1 < chars.count {
                 let n = chars[i + 1]
-                if n == "N" || n == "n" { current += "\n"; i += 2; continue }
-                if n == "h" { current += " "; i += 2; continue }
+                if n == "N" || n == "n" {
+                    if !lastWasNewline { current += "\n"; lastWasNewline = true }
+                    i += 2; continue
+                }
+                if n == "h" { current += " "; lastWasNewline = false; i += 2; continue }
             }
             if c == "{" {
                 // Override block: colour changes start a new run.
@@ -104,6 +113,7 @@ enum SubtitleRectText {
                 continue
             }
             current.append(c)
+            lastWasNewline = false
             i += 1
         }
         flush()
