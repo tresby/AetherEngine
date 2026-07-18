@@ -258,6 +258,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private var loggedFirstVideoPktInfo = false
     private var loggedP7ConversionFailure = false
+    private var loggedEnhancementLayerType = false
     /// Latched false at SSAI program switch (ad creatives are H.264; mirrors muxer's isReinit ? false : videoConfig.convertP7ToProfile81).
     private var convertP7Active: Bool = false
     private var loggedFirstDtsBump = false
@@ -2121,11 +2122,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         )
                     }
                     if convertP7Active {
+                        // Probe the enhancement-layer type once (latching on the first RPU seen, before
+                        // conversion strips it); a FEL source loses refinement in the P8.1 conversion.
+                        if !loggedEnhancementLayerType,
+                           let elType = DoviRpuConverter.enhancementLayerType(packet) {
+                            loggedEnhancementLayerType = true
+                            if elType == "FEL" {
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] DV P7 source carries a Full Enhancement Layer (FEL); "
+                                    + "it is discarded in the P8.1 conversion, so some highlight/detail refinement "
+                                    + "is lost versus a native P7 player",
+                                    category: .session
+                                )
+                            }
+                        }
                         if !DoviRpuConverter.convertPacketToProfile81(packet) {
                             if !loggedP7ConversionFailure {
                                 loggedP7ConversionFailure = true
                                 EngineLog.emit(
-                                    "[HLSSegmentProducer] DV P7->8.1 conversion failed for a packet; muxing unconverted",
+                                    "[HLSSegmentProducer] DV P7->8.1 conversion failed for a packet; dropped the RPU, "
+                                    + "degrading affected frames to the HDR10 base",
                                     category: .session
                                 )
                             }
