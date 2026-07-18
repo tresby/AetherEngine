@@ -50,8 +50,12 @@ final class EmbeddedSubtitleDecoder {
     /// #107: explicit teletext page override (nil = libzvbi `subtitle` auto-detect).
     private let teletextPage: Int?
 
+    /// #107: decode teletext as plain text (`txt_format=text`) instead of ASS. No colour; a
+    /// compatibility lever for broadcasts the ASS path renders poorly.
+    private let teletextPlainText: Bool
+
     /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
-    init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
+    init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil, teletextPlainText: Bool = false) {
         guard let codecpar = stream.pointee.codecpar,
               codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
         else { return nil }
@@ -73,7 +77,7 @@ final class EmbeddedSubtitleDecoder {
         }
 
         var opts: OpaquePointer?
-        for (key, value) in Self.decoderOptions(for: id, teletextPage: teletextPage) {
+        for (key, value) in Self.decoderOptions(for: id, teletextPage: teletextPage, plainText: teletextPlainText) {
             av_dict_set(&opts, key, value, 0)
         }
         let openResult = avcodec_open2(ctx, codec, &opts)
@@ -91,6 +95,7 @@ final class EmbeddedSubtitleDecoder {
         self.preserveASSMarkup = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
         self.teletextPage = teletextPage
+        self.teletextPlainText = teletextPlainText
 
         // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
         stream.pointee.discard = AVDISCARD_NONE
@@ -293,13 +298,15 @@ final class EmbeddedSubtitleDecoder {
             || id == AV_CODEC_ID_XSUB
     }
 
-    /// Decoder options for a subtitle codec. DVB teletext (libzvbi_teletextdec) emits ASS so colour
-    /// override tags survive to the overlay (#107 colour); `txt_page` selects the caption page
+    /// Decoder options for a subtitle codec. DVB teletext (libzvbi_teletextdec) emits ASS by default
+    /// so colour override tags survive to the overlay (#107 colour); `plainText` switches to
+    /// `txt_format=text` (no colour) as a compatibility lever. `txt_page` selects the caption page
     /// (`subtitle` = libzvbi auto-detect; an explicit page targets channels libzvbi does not flag,
     /// e.g. AU 801). Every other codec opens with no options.
-    static func decoderOptions(for id: AVCodecID, teletextPage: Int?) -> [String: String] {
+    static func decoderOptions(for id: AVCodecID, teletextPage: Int?, plainText: Bool = false) -> [String: String] {
         guard id == AV_CODEC_ID_DVB_TELETEXT else { return [:] }
-        return ["txt_format": "ass", "txt_page": teletextPage.map(String.init) ?? "subtitle"]
+        return ["txt_format": plainText ? "text" : "ass",
+                "txt_page": teletextPage.map(String.init) ?? "subtitle"]
     }
 
     /// Issue #112: decide whether a PGS payload that decoded with gotSub==0 warrants the synthetic

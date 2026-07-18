@@ -225,6 +225,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
     public var teletextPage: Int? = nil
 
+    /// Teletext decode format: `false` (default) uses `txt_format=ass` (colour runs preserved);
+    /// `true` uses `txt_format=text` (plain text, no colour). A compatibility lever for broadcasts
+    /// where libzvbi's ASS page rendering drops lines that its plain-text path keeps. Only affects
+    /// teletext streams (#107).
+    public var teletextPlainText: Bool = false
+
     /// Deinterlacer for the software-decode path: `.auto` (default) tries the Metal/VideoToolbox
     /// hardware graph and falls back to software bwdif; `.software` forces the CPU path. See
     /// `DeinterlaceMode`.
@@ -262,6 +268,7 @@ public struct LoadOptions: Sendable, Equatable {
         forwardBufferSegments: Int? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
+        teletextPlainText: Bool = false,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field
     ) {
@@ -288,6 +295,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forwardBufferSegments = forwardBufferSegments
         self.autoplay = autoplay
         self.teletextPage = teletextPage
+        self.teletextPlainText = teletextPlainText
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
     }

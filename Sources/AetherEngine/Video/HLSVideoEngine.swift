@@ -175,7 +175,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                       teletextPage: teletextPageForSubtitleTap)
+                                       teletextPage: teletextPageForSubtitleTap,
+                                       teletextPlainText: teletextPlainTextForSubtitleTap)
     }
 
     /// Sodalite#32 Phase 2: tap decoders honor the host's markup preference so the overlay can render
@@ -183,6 +184,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Set before start() (AetherEngine+Loading).
     var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
+    var teletextPlainTextForSubtitleTap = false
 
     var subtitleTapActive: Bool {
         subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
@@ -252,7 +254,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                                         sourceVideoWidth: w > 0 ? w : 1920,
                                                         sourceVideoHeight: h > 0 ? h : 1080,
                                                         preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                                        teletextPage: teletextPageForSubtitleTap)
+                                                        teletextPage: teletextPageForSubtitleTap,
+                                                        teletextPlainText: teletextPlainTextForSubtitleTap)
             else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }

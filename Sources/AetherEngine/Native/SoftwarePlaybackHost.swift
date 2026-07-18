@@ -476,6 +476,7 @@ final class SoftwarePlaybackHost {
     /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
     var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
+    var teletextPlainTextForSubtitleTap = false
     var deinterlaceConfig = DeinterlaceConfig()
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
@@ -489,7 +490,8 @@ final class SoftwarePlaybackHost {
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
-                                       teletextPage: teletextPageForSubtitleTap)
+                                       teletextPage: teletextPageForSubtitleTap,
+                                       teletextPlainText: teletextPlainTextForSubtitleTap)
     }
 
     func pause() {
