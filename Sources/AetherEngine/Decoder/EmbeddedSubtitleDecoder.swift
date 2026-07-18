@@ -191,7 +191,14 @@ final class EmbeddedSubtitleDecoder {
                 if isTeletext, let assLine = SubtitleRectText.rawASSLine(for: rect) {
                     // Teletext decodes as ASS (txt_format=ass); parse colour runs (#107). Falls back
                     // to plain text inside teletextBody when the page carries no colour.
-                    if let body = SubtitleRectText.teletextBody(fromASSEventLine: assLine) {
+                    let body = SubtitleRectText.teletextBody(fromASSEventLine: assLine)
+                    // DIAG (positioned-caption loss): dump the raw libzvbi ASS line and whether it
+                    // parsed to a body, so we can see if positioned captions arrive as \an-only
+                    // (position dropped), parse to nil (dropped + trim the previous), or coexist.
+                    EngineLog.emit(
+                        "[TeletextDIAG] parsed=\(body != nil) raw=\(assLine.replacingOccurrences(of: "\n", with: "\\n"))",
+                        category: .swPlayback)
+                    if let body {
                         bodies.append(body)
                     }
                 } else if preserveASSMarkup, let raw = SubtitleRectText.rawASSLine(for: rect) {
