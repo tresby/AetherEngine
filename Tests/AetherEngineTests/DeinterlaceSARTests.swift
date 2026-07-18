@@ -27,6 +27,9 @@ struct DeinterlaceSARTests {
         let streamTB = AVRational(num: 1, den: 30)
 
         let filter = DeinterlaceFilter()
+        // CPU engine: the SAR regression is about the sw graph; keeps the test deterministic
+        // whether or not the linked build ships yadif_videotoolbox / has a Metal device.
+        filter.config = DeinterlaceConfig(mode: .software)
         defer { filter.teardown() }
 
         let out = av_frame_alloc()!
