@@ -32,6 +32,8 @@ public struct DoviConvertProbeResult: Sendable {
     public let failures: Int
     public let outputPath: String
     public let videoStreamFound: Bool
+    /// Enhancement-layer type of the first P7 RPU seen ("FEL"/"MEL"), or nil if not a P7 source.
+    public let enhancementLayerType: String?
 }
 
 extension AetherEngine {
@@ -52,7 +54,8 @@ extension AetherEngine {
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else {
             return DoviConvertProbeResult(
                 packetsProcessed: 0, conversions: 0, failures: 0,
-                outputPath: outputPath, videoStreamFound: false
+                outputPath: outputPath, videoStreamFound: false,
+                enhancementLayerType: nil
             )
         }
 
@@ -77,6 +80,7 @@ extension AetherEngine {
         var packetsProcessed = 0
         var conversions = 0
         var failures = 0
+        var elType: String? = nil
 
         while true {
             let maybePacket: UnsafeMutablePointer<AVPacket>?
@@ -89,8 +93,10 @@ extension AetherEngine {
 
             if packet.pointee.stream_index == videoIdx {
                 packetsProcessed += 1
-                let ok = DoviRpuConverter.convertPacketToProfile81(packet)
-                if ok {
+                if elType == nil {
+                    elType = DoviRpuConverter.enhancementLayerType(packet)
+                }
+                if DoviRpuConverter.convertPacketToProfile81(packet) {
                     conversions += 1
                 } else {
                     failures += 1
@@ -119,7 +125,8 @@ extension AetherEngine {
             conversions: conversions,
             failures: failures,
             outputPath: outputPath,
-            videoStreamFound: true
+            videoStreamFound: true,
+            enhancementLayerType: elType
         )
     }
 }

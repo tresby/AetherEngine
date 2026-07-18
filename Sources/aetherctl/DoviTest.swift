@@ -27,6 +27,7 @@ func runDoviTest(url: URL) -> Int32 {
     print("Packets processed:    \(result.packetsProcessed)")
     print("Conversions:          \(result.conversions)")
     print("Failures:             \(result.failures)")
+    print("Enhancement layer:    \(result.enhancementLayerType ?? "n/a (not profile 7)")")
     print("Output (Annex-B):     \(result.outputPath)")
     print("===========================")
     print("")
