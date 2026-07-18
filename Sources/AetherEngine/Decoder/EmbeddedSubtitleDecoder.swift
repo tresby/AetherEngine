@@ -190,15 +190,9 @@ final class EmbeddedSubtitleDecoder {
                 guard let rect = rects[i] else { continue }
                 if isTeletext, let assLine = SubtitleRectText.rawASSLine(for: rect) {
                     // Teletext decodes as ASS (txt_format=ass); parse colour runs (#107). Falls back
-                    // to plain text inside teletextBody when the page carries no colour.
-                    let body = SubtitleRectText.teletextBody(fromASSEventLine: assLine)
-                    // DIAG (positioned-caption loss): dump the raw libzvbi ASS line and whether it
-                    // parsed to a body, so we can see if positioned captions arrive as \an-only
-                    // (position dropped), parse to nil (dropped + trim the previous), or coexist.
-                    EngineLog.emit(
-                        "[TeletextDIAG] parsed=\(body != nil) raw=\(assLine.replacingOccurrences(of: "\n", with: "\\n"))",
-                        category: .swPlayback)
-                    if let body {
+                    // to plain text inside teletextBody when the page carries no colour. A page that
+                    // parses to nil (blank re-transmit) contributes no body and is dropped below.
+                    if let body = SubtitleRectText.teletextBody(fromASSEventLine: assLine) {
                         bodies.append(body)
                     }
                 } else if preserveASSMarkup, let raw = SubtitleRectText.rawASSLine(for: rect) {
@@ -226,9 +220,15 @@ final class EmbeddedSubtitleDecoder {
         let isPGS = ctx.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
         let isClearEvent = bodies.isEmpty
 
-        // A teletext page erase carries no rects but must still trim the open page cue (#107).
-        guard endTime > startTime || (isClearEvent && isTeletext) else { return nil }
-        guard !isClearEvent || isPGS || isTeletext else { return nil }
+        guard endTime > startTime else { return nil }
+        // A blank teletext page is NOT an erase. libzvbi re-transmits page 801 every cycle, and
+        // between captions it is empty — so treating each blank page as a page-erase trim wiped
+        // the current caption one frame after it appeared (captions flashing / "missing lines",
+        // confirmed via raw ASS: a real caption followed immediately by all-`\N` blank pages).
+        // Ignore blank teletext pages entirely: the caption holds until the NEXT real page
+        // replaces it (that page carries its own textTrimAt) or the 120 s cap bounds a ghost.
+        // PGS keeps its clear events (they are genuine composition ends, not idle re-transmits).
+        guard !isClearEvent || isPGS else { return nil }
 
         // Bound the dedupe set to prevent unbounded growth on long live sessions (DVB/PGS).
         // Reset only weakens dedupe (a re-emitted duplicate renders as an identical overlay), never correctness.
